@@ -1,0 +1,15 @@
+[package]
+name = "nemor-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+collector = { package = "nemor-collector", path = "../collector" }
+classifier = { package = "nemor-classifier", path = "../classifier" }
+common = { package = "nemor-common", path = "../common" }
+storage = { package = "nemor-storage", path = "../storage" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

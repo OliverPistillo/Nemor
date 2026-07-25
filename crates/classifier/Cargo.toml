@@ -1,0 +1,16 @@
+[package]
+name = "nemor-classifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+collector = { package = "nemor-collector", path = "../collector" }
+common = { package = "nemor-common", path = "../common" }
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

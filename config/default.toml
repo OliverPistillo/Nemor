@@ -1,0 +1,62 @@
+[general]
+mode = "observe"
+sample_interval_ms = 1000
+database_path = "/var/lib/nemor/nemor.db"
+allow_automatic_actions = false
+
+[telemetry]
+process_sample_interval_ms = 5000
+smaps_rollup_interval_ms = 60000
+smaps_rollup_budget = 32
+retention_days = 7
+retention_interval_ms = 3600000
+sqlite_batch_size = 512
+
+[classification]
+interval_ms = 5000
+minimum_confidence = 0.65
+confirmation_samples = 3
+browser_heavy_process_count = 8
+browser_heavy_memory_percent = 15.0
+virtualization_memory_percent = 10.0
+gaming_background_memory_percent = 20.0
+protected_executables = []
+critical_executables = []
+game_executables = []
+
+[safety]
+max_cpu_overhead_percent = 5.0
+max_io_write_mib_per_second = 100
+rollback_on_daemon_exit = true
+rollback_on_error = true
+protect_foreground = true
+
+[pressure]
+watch_available_percent = 20
+pressure_available_percent = 12
+critical_available_percent = 7
+psi_some_avg10_threshold = 10.0
+psi_full_avg10_threshold = 2.0
+state_hold_seconds = 10
+recovery_hold_seconds = 30
+
+[compression]
+backend = "detect"
+preferred_low_latency = "lz4"
+preferred_capacity = "zstd"
+
+[ksm]
+enabled = false
+profiles = ["virtualization", "browser_heavy"]
+
+[damon]
+enabled = false
+mode = "monitor_only"
+max_action_time_ms = 5
+max_action_bytes = 268435456
+
+[gaming]
+auto_detect = true
+protect_gamescope = true
+protect_steam = true
+background_reclaim = true

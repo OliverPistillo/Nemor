@@ -1,0 +1,27 @@
+[package]
+name = "nemord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+collector = { package = "nemor-collector", path = "../collector" }
+classifier = { package = "nemor-classifier", path = "../classifier" }
+common = { package = "nemor-common", path = "../common" }
+storage = { package = "nemor-storage", path = "../storage" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+nemorctl = { path = "../nemorctl" }
+serde_json.workspace = true
+test-support = { package = "nemor-test-support", path = "../test-support" }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", features = ["process", "signal"] }
+
+[lints]
+workspace = true

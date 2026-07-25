@@ -1,0 +1,18 @@
+[package]
+name = "nemorctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+common = { package = "nemor-common", path = "../common" }
+serde_json.workspace = true
+storage = { package = "nemor-storage", path = "../storage" }
+
+[dev-dependencies]
+test-support = { package = "nemor-test-support", path = "../test-support" }
+
+[lints]
+workspace = true

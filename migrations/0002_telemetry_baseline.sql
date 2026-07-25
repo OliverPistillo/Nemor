@@ -1,0 +1,10 @@
+ALTER TABLE system_samples ADD COLUMN psi_cpu_some_avg10 REAL;
+ALTER TABLE system_samples ADD COLUMN psi_cpu_full_avg10 REAL;
+ALTER TABLE system_samples ADD COLUMN swap_configuration TEXT;
+ALTER TABLE system_samples ADD COLUMN swap_entries_json TEXT;
+ALTER TABLE system_samples ADD COLUMN zram_present INTEGER;
+ALTER TABLE system_samples ADD COLUMN zram_memory_used_bytes INTEGER;
+ALTER TABLE system_samples ADD COLUMN zram_devices_json TEXT;
+ALTER TABLE system_samples ADD COLUMN zswap_present INTEGER;
+ALTER TABLE system_samples ADD COLUMN zswap_enabled INTEGER;
+ALTER TABLE system_samples ADD COLUMN capabilities_unavailable_json TEXT;
