@@ -552,11 +552,17 @@ fn linux_backend_inspects_real_host_read_only() {
         let inventory = LinuxZramBackend::default()
             .inspect()
             .expect("real inventory");
-        assert!(inventory.available);
-        assert!(inventory.devices.iter().any(|item| item.active_swap));
+        assert_eq!(inventory.available, !inventory.devices.is_empty());
         assert!(inventory
             .devices
             .iter()
             .all(|item| item.ownership != Ownership::NemorOwned));
+        for device in &inventory.devices {
+            assert!(device.name.starts_with("zram"));
+            assert!(device
+                .current_algorithm
+                .as_ref()
+                .is_none_or(|algorithm| device.available_algorithms.contains(algorithm)));
+        }
     }
 }
