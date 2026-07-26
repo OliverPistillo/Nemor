@@ -8,12 +8,12 @@ permissions:
   contents: read
 
 jobs:
-  phase-2:
-    name: Phase 2 validation
+  validation:
+    name: Build, test and Linux validation
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,8 +32,8 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features
 
-      - name: Read real Linux telemetry interfaces
-        run: cargo test -p collector system::tests::production_collectors_read_real_linux_interfaces --all-features
+      - name: Read real Nemor Linux telemetry interfaces
+        run: cargo test -p nemor-collector system::tests::production_collectors_read_real_linux_interfaces --all-features
 
-      - name: Classify real Linux process telemetry read-only
-        run: cargo test -p classifier tests::real_linux_process_identity_can_be_classified_read_only --all-features
+      - name: Classify real Nemor Linux process telemetry read-only
+        run: cargo test -p nemor-classifier tests::real_linux_process_identity_can_be_classified_read_only --all-features
