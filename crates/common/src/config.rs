@@ -15,6 +15,7 @@ pub struct Config {
     pub classification: ClassificationConfig,
     pub safety: SafetyConfig,
     pub pressure: PressureConfig,
+    pub policy: PolicyConfig,
     pub compression: CompressionConfig,
     pub ksm: KsmConfig,
     pub damon: DamonConfig,
@@ -88,10 +89,23 @@ pub struct PressureConfig {
     pub watch_available_percent: u8,
     pub pressure_available_percent: u8,
     pub critical_available_percent: u8,
+    pub emergency_available_percent: u8,
     pub psi_some_avg10_threshold: f64,
     pub psi_full_avg10_threshold: f64,
+    pub emergency_psi_full_avg10_threshold: f64,
+    pub major_fault_rate_threshold: f64,
+    pub swap_in_rate_threshold: f64,
+    pub swap_out_rate_threshold: f64,
     pub state_hold_seconds: u64,
     pub recovery_hold_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    pub enabled: bool,
+    pub evaluation_interval_ms: u64,
+    pub decision_heartbeat_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,12 +396,17 @@ impl Config {
             "pressure.critical_available_percent",
             f64::from(self.pressure.critical_available_percent),
         )?;
+        validate_percentage(
+            "pressure.emergency_available_percent",
+            f64::from(self.pressure.emergency_available_percent),
+        )?;
         if !(self.pressure.watch_available_percent > self.pressure.pressure_available_percent
-            && self.pressure.pressure_available_percent > self.pressure.critical_available_percent)
+            && self.pressure.pressure_available_percent > self.pressure.critical_available_percent
+            && self.pressure.critical_available_percent > self.pressure.emergency_available_percent)
         {
             return Err(validation(
                 "pressure.watch_available_percent",
-                "memory thresholds must satisfy watch > pressure > critical",
+                "memory thresholds must satisfy watch > pressure > critical > emergency",
             ));
         }
         validate_percentage(
@@ -398,6 +417,48 @@ impl Config {
             "pressure.psi_full_avg10_threshold",
             self.pressure.psi_full_avg10_threshold,
         )?;
+        validate_percentage(
+            "pressure.emergency_psi_full_avg10_threshold",
+            self.pressure.emergency_psi_full_avg10_threshold,
+        )?;
+        for (field, value) in [
+            (
+                "pressure.major_fault_rate_threshold",
+                self.pressure.major_fault_rate_threshold,
+            ),
+            (
+                "pressure.swap_in_rate_threshold",
+                self.pressure.swap_in_rate_threshold,
+            ),
+            (
+                "pressure.swap_out_rate_threshold",
+                self.pressure.swap_out_rate_threshold,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(validation(field, "must be finite and non-negative"));
+            }
+        }
+        if self.pressure.emergency_psi_full_avg10_threshold
+            <= self.pressure.psi_full_avg10_threshold
+        {
+            return Err(validation(
+                "pressure.emergency_psi_full_avg10_threshold",
+                "must exceed pressure.psi_full_avg10_threshold",
+            ));
+        }
+        if self.policy.evaluation_interval_ms < 1_000 {
+            return Err(validation(
+                "policy.evaluation_interval_ms",
+                "must be at least 1000",
+            ));
+        }
+        if self.policy.decision_heartbeat_seconds == 0 {
+            return Err(validation(
+                "policy.decision_heartbeat_seconds",
+                "must be greater than zero",
+            ));
+        }
         if self.ksm.enabled {
             return Err(validation("ksm.enabled", "must be false during Phase 3"));
         }
@@ -624,6 +685,49 @@ mod tests {
         assert!(error
             .to_string()
             .contains("pressure.watch_available_percent"));
+    }
+
+    #[test]
+    fn rejects_invalid_phase_four_pressure_thresholds() {
+        for (from, to, field) in [
+            (
+                "emergency_available_percent = 3",
+                "emergency_available_percent = 7",
+                "pressure.watch_available_percent",
+            ),
+            (
+                "emergency_psi_full_avg10_threshold = 10.0",
+                "emergency_psi_full_avg10_threshold = 1.0",
+                "pressure.emergency_psi_full_avg10_threshold",
+            ),
+            (
+                "major_fault_rate_threshold = 100.0",
+                "major_fault_rate_threshold = -1.0",
+                "pressure.major_fault_rate_threshold",
+            ),
+        ] {
+            let error = Config::from_toml(&changed(from, to)).expect_err("must reject threshold");
+            assert!(error.to_string().contains(field));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_policy_frequency_and_heartbeat() {
+        for (from, to, field) in [
+            (
+                "evaluation_interval_ms = 5000",
+                "evaluation_interval_ms = 999",
+                "policy.evaluation_interval_ms",
+            ),
+            (
+                "decision_heartbeat_seconds = 300",
+                "decision_heartbeat_seconds = 0",
+                "policy.decision_heartbeat_seconds",
+            ),
+        ] {
+            let error = Config::from_toml(&changed(from, to)).expect_err("must reject interval");
+            assert!(error.to_string().contains(field));
+        }
     }
 
     #[test]

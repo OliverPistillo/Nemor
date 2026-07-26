@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use actuator::{CgroupBackend, LinuxCgroupBackend};
 use anyhow::{Context, Result};
 use classifier::{
     ClassificationOutcome, Classifier, ProcessClassification, WorkloadExplanation,
@@ -7,6 +8,9 @@ use classifier::{
 };
 use collector::{CollectorError, ProcessCollection, SystemCollector, SystemSample};
 use common::Config;
+use policy_engine::{
+    CounterSample, PolicyDecision, PolicyEngine, PolicyInput, RateFeatures, RateTracker,
+};
 use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
@@ -53,6 +57,17 @@ pub trait TelemetryStorage {
         transition: Option<&WorkloadTransition>,
     ) -> Result<usize>;
     fn retain(&mut self, cutoff_timestamp_ns: i64) -> Result<RetentionResult>;
+    fn store_policy(
+        &mut self,
+        _session_id: i64,
+        _decision: &PolicyDecision,
+        _heartbeat_seconds: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    fn policy_history_counts(&self, _timestamp_ns: i64) -> Result<(usize, usize)> {
+        Ok((0, 0))
+    }
 }
 
 impl TelemetryStorage for Storage {
@@ -79,6 +94,19 @@ impl TelemetryStorage for Storage {
 
     fn retain(&mut self, cutoff_timestamp_ns: i64) -> Result<RetentionResult> {
         self.enforce_retention(cutoff_timestamp_ns)
+    }
+
+    fn store_policy(
+        &mut self,
+        session_id: i64,
+        decision: &PolicyDecision,
+        heartbeat_seconds: u64,
+    ) -> Result<bool> {
+        self.insert_policy_decision(session_id, decision, heartbeat_seconds)
+    }
+
+    fn policy_history_counts(&self, timestamp_ns: i64) -> Result<(usize, usize)> {
+        Storage::policy_history_counts(self, timestamp_ns)
     }
 }
 
@@ -107,7 +135,12 @@ where
     retention_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut next_smaps = Instant::now();
     let mut next_classification = Instant::now();
+    let mut next_policy = Instant::now();
     let mut classifier = Classifier::new(config.classification.clone(), config.pressure.clone());
+    let mut policy_engine = PolicyEngine::new(config.pressure.clone(), 0);
+    let mut rate_tracker = RateTracker::default();
+    let mut latest_rates = RateFeatures::default();
+    let cgroup_capabilities = LinuxCgroupBackend::default().capabilities().ok();
     let mut latest_system = None;
     let mut logged_capabilities = HashSet::new();
     tokio::pin!(shutdown);
@@ -149,6 +182,14 @@ where
                             );
                             source
                         }).context("fatal system telemetry storage error")?;
+                        latest_rates = rate_tracker.update(CounterSample {
+                            timestamp_ns: sample.timestamp_ns,
+                            swap_in: sample.swap_in_pages,
+                            swap_out: sample.swap_out_pages,
+                            major_faults: sample.major_faults,
+                            pgscan: sample.pgscan,
+                            pgsteal: sample.pgsteal,
+                        });
                         latest_system = Some(sample);
                     }
                     Err(source) => {
@@ -287,6 +328,140 @@ where
                                     rule_version = %transition.explanation.rule_version,
                                     "stabilized workload class changed"
                                 );
+                            }
+                            if config.policy.enabled && now >= next_policy {
+                                next_policy = now + Duration::from_millis(
+                                    config.policy.evaluation_interval_ms
+                                );
+                                if let Some(system) = &latest_system {
+                                    let workload = outcome.class();
+                                    let confidence = match outcome {
+                                        ClassificationOutcome::Classified(decision) => {
+                                            Some(decision.confidence)
+                                        }
+                                        ClassificationOutcome::Unknown(_) => None,
+                                    };
+                                    let foreground = if classified.iter().any(|process| {
+                                        process.foreground
+                                            == classifier::ForegroundState::Foreground
+                                    }) {
+                                        classifier::ForegroundState::Foreground
+                                    } else if !classified.is_empty()
+                                        && classified.iter().all(|process| {
+                                            process.foreground
+                                                == classifier::ForegroundState::Background
+                                        })
+                                    {
+                                        classifier::ForegroundState::Background
+                                    } else {
+                                        classifier::ForegroundState::Unknown
+                                    };
+                                    let swap_total = system.swap.entries.iter().try_fold(
+                                        0_u64,
+                                        |total, entry| total.checked_add(entry.size_bytes),
+                                    );
+                                    let swap_used = system.swap.entries.iter().try_fold(
+                                        0_u64,
+                                        |total, entry| total.checked_add(entry.used_bytes),
+                                    );
+                                    let (recent_decisions, recent_safety_events) = storage
+                                        .policy_history_counts(timestamp_ns)
+                                        .context("cannot read bounded policy history")?;
+                                    let input = PolicyInput {
+                                        timestamp_ns,
+                                        ram_total_bytes: system.mem_total_bytes,
+                                        mem_available_bytes: system.mem_available_bytes,
+                                        available_percent: system.mem_available_bytes as f64
+                                            * 100.0
+                                            / system.mem_total_bytes as f64,
+                                        swap_total_bytes: swap_total,
+                                        swap_used_bytes: swap_used,
+                                        swap_in_per_second: latest_rates.swap_in_per_second,
+                                        swap_out_per_second: latest_rates.swap_out_per_second,
+                                        major_faults_per_second:
+                                            latest_rates.major_faults_per_second,
+                                        pgscan_per_second: latest_rates.pgscan_per_second,
+                                        pgsteal_per_second: latest_rates.pgsteal_per_second,
+                                        psi_memory_some_avg10: system
+                                            .psi_memory
+                                            .as_ref()
+                                            .and_then(|psi| psi.some)
+                                            .map(|line| line.avg10),
+                                        psi_memory_full_avg10: system
+                                            .psi_memory
+                                            .as_ref()
+                                            .and_then(|psi| psi.full)
+                                            .map(|line| line.avg10),
+                                        workload_class: workload,
+                                        workload_confidence: confidence,
+                                        gaming: classified.iter().any(|process| process.is_game),
+                                        critical_processes: classified
+                                            .iter()
+                                            .filter(|process| process.is_critical)
+                                            .count(),
+                                        protected_processes: classified
+                                            .iter()
+                                            .filter(|process| process.protected)
+                                            .count(),
+                                        unknown_processes,
+                                        foreground,
+                                        cgroup_capabilities: cgroup_capabilities.clone(),
+                                        actuator_available: cgroup_capabilities
+                                            .as_ref()
+                                            .is_some_and(
+                                                actuator::CgroupCapabilities::mutation_ready,
+                                            ),
+                                        recent_safety_events,
+                                        recent_decisions,
+                                    };
+                                    match policy_engine.evaluate(input, true) {
+                                        Ok(decision) => {
+                                            if decision.state_changed {
+                                                info!(
+                                                    event = "pressure_state_changed",
+                                                    session_id,
+                                                    state = ?decision.current_state,
+                                                    rule_version = %decision.rule_version,
+                                                    "deterministic pressure state changed"
+                                                );
+                                            } else if decision.candidate_state.is_some() {
+                                                debug!(
+                                                    event = "policy_hysteresis_holding",
+                                                    session_id,
+                                                    candidate = ?decision.candidate_state,
+                                                    "policy transition is waiting for its hold time"
+                                                );
+                                            }
+                                            let inserted = storage.store_policy(
+                                                session_id,
+                                                &decision,
+                                                config.policy.decision_heartbeat_seconds,
+                                            ).context("cannot persist policy decision")?;
+                                            if inserted {
+                                                info!(
+                                                    event = "policy_decision_persisted",
+                                                    session_id,
+                                                    state = ?decision.current_state,
+                                                    dry_run = decision.dry_run,
+                                                    "policy audit persisted"
+                                                );
+                                            }
+                                            debug!(
+                                                event = "policy_dry_run_plan",
+                                                session_id,
+                                                planned = decision.planned_actions.len(),
+                                                rejected = decision.rejected_actions.len(),
+                                                "policy plan stopped before actuator apply"
+                                            );
+                                        }
+                                        Err(error) => warn!(
+                                            event = "invalid_policy_telemetry",
+                                            session_id,
+                                            error = %error,
+                                            "policy input rejected; state retained and no action applied"
+                                        ),
+                                    }
+                                }
                             }
                         }
                         if classified.is_empty() {

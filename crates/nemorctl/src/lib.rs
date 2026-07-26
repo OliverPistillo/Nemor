@@ -5,6 +5,10 @@ use anyhow::{Context, Result};
 use common::{
     CheckResult, CheckStatus, DoctorReport, LinuxPaths, LoadedConfig, StatusReport, StatusState,
 };
+use policy_engine::{
+    PlannedAction, PolicyEvidence, PressureState, RejectedAction, POLICY_NAME, RULE_VERSION,
+};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::Path;
 
@@ -171,6 +175,54 @@ pub fn cgroups_status(config_path: &Path) -> Result<CgroupStatus> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyStatus {
+    pub enabled: bool,
+    pub policy_name: String,
+    pub rule_version: String,
+    pub current_state: PressureState,
+    pub previous_state: Option<PressureState>,
+    pub state_since_ns: i64,
+    pub candidate_state: Option<PressureState>,
+    pub dry_run: bool,
+    pub evidence: Vec<PolicyEvidence>,
+    pub planned_actions: Vec<PlannedAction>,
+    pub rejected_actions: Vec<RejectedAction>,
+}
+
+pub fn policy_latest(config_path: &Path) -> Result<storage::LatestPolicyDecision> {
+    let loaded = LoadedConfig::load(config_path).with_context(|| {
+        format!(
+            "policy latest input configuration {} is invalid",
+            config_path.display()
+        )
+    })?;
+    storage::latest_policy_decision(&loaded.config.general.database_path)
+}
+
+pub fn policy_status(config_path: &Path) -> Result<PolicyStatus> {
+    let loaded = LoadedConfig::load(config_path).with_context(|| {
+        format!(
+            "policy status input configuration {} is invalid",
+            config_path.display()
+        )
+    })?;
+    let latest = storage::latest_policy_decision(&loaded.config.general.database_path)?;
+    Ok(PolicyStatus {
+        enabled: loaded.config.policy.enabled,
+        policy_name: POLICY_NAME.to_owned(),
+        rule_version: RULE_VERSION.to_owned(),
+        current_state: latest.pressure_state,
+        previous_state: latest.audit.previous_state,
+        state_since_ns: latest.audit.state_since_ns,
+        candidate_state: latest.audit.candidate_state,
+        dry_run: latest.audit.dry_run,
+        evidence: latest.audit.evidence,
+        planned_actions: latest.audit.planned_actions,
+        rejected_actions: latest.audit.rejected_actions,
+    })
+}
+
 pub fn render_doctor(report: &DoctorReport, json: bool) -> Result<String> {
     if json {
         return serde_json::to_string_pretty(report).context("cannot serialize doctor report");
@@ -316,6 +368,44 @@ pub fn render_cgroups_status(report: &CgroupStatus, json: bool) -> Result<String
         report.rollback_pending,
         report.stale_recovery_state,
         report.last_safety_error.as_deref().unwrap_or("none"),
+    ))
+}
+
+pub fn render_policy_status(report: &PolicyStatus, json: bool) -> Result<String> {
+    if json {
+        return serde_json::to_string_pretty(report).context("cannot serialize policy status");
+    }
+    Ok(format!(
+        "Enabled: {}\nPolicy: {}\nRule version: {}\nCurrent state: {:?}\nPrevious state: {:?}\nState since: {}\nCandidate state: {:?}\nDry run: {}\nEvidence: {}\nPlanned actions: {}\nRejected actions: {}\n",
+        report.enabled,
+        report.policy_name,
+        report.rule_version,
+        report.current_state,
+        report.previous_state,
+        report.state_since_ns,
+        report.candidate_state,
+        report.dry_run,
+        report.evidence.len(),
+        report.planned_actions.len(),
+        report.rejected_actions.len(),
+    ))
+}
+
+pub fn render_policy_latest(report: &storage::LatestPolicyDecision, json: bool) -> Result<String> {
+    if json {
+        return serde_json::to_string_pretty(report)
+            .context("cannot serialize latest policy decision");
+    }
+    Ok(format!(
+        "Decision id: {}\nSession id: {}\nTimestamp: {}\nState: {:?}\nPolicy: {}\nRule version: {}\nDry run: {}\nModel version: {}\n",
+        report.id,
+        report.session_id,
+        report.timestamp_ns,
+        report.pressure_state,
+        report.policy_name,
+        report.rule_version,
+        report.audit.dry_run,
+        report.model_version.as_deref().unwrap_or("none"),
     ))
 }
 

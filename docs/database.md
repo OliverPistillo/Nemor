@@ -31,7 +31,7 @@ Migration 4 (`0004_cgroups.sql`) adds `cgroup_snapshots` and
 `cgroup_managed_groups`. It records session, stable catalog identity,
 PID/start ticks, original placement and properties, requested properties,
 verification, error, recovery, and rollback state. Migrations 0001–0003 remain
-unchanged, and no Phase 4 policy record is synthesized.
+unchanged. Phase 4 requires no migration 0005.
 
 ## Active records
 
@@ -67,8 +67,13 @@ version, selected class, confidence, stable evidence, rejected candidates, and
 protection reasons. Catalog entries, process samples, and an optional event are
 written transactionally per batch. The workload CLI opens SQLite read-only.
 
-## Reserved contract tables
+## Policy audit
 
-Policy decision, action result, benchmark, and model registry tables remain
-reserved parts of the supplied schema contract. Phase 3 does not synthesize
-policy decisions.
+`policy_decisions` is active in Phase 4. The first decision, state/action-audit
+changes, and configured heartbeat are persisted. `input_features_json` and
+`actions_json` are typed Serde output. `rule_version` is
+`pressure-rules-v1`; `model_version`, expected gain, and expected cost remain
+`NULL`. Latest/history reads are limited to at most 100 rows.
+
+`action_results` stays empty for dry-run decisions because no action was
+executed. Benchmark and model registry tables remain unused.

@@ -2,8 +2,9 @@
 
 use clap::{Parser, Subcommand};
 use nemorctl::{
-    cgroups_status, doctor, render_cgroups_status, render_doctor, render_report, render_status,
-    render_workload, report_latest, status, workload_latest, DoctorEnvironment,
+    cgroups_status, doctor, policy_latest, policy_status, render_cgroups_status, render_doctor,
+    render_policy_latest, render_policy_status, render_report, render_status, render_workload,
+    report_latest, status, workload_latest, DoctorEnvironment,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -41,6 +42,10 @@ enum Command {
         #[command(subcommand)]
         command: CgroupsCommand,
     },
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -62,6 +67,18 @@ enum WorkloadCommand {
 #[derive(Debug, Subcommand)]
 enum CgroupsCommand {
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Latest {
         #[arg(long)]
         json: bool,
     },
@@ -109,6 +126,20 @@ fn run() -> anyhow::Result<i32> {
         } => {
             let report = cgroups_status(&cli.config)?;
             print!("{}", render_cgroups_status(&report, json)?);
+            Ok(0)
+        }
+        Command::Policy {
+            command: PolicyCommand::Status { json },
+        } => {
+            let report = policy_status(&cli.config)?;
+            print!("{}", render_policy_status(&report, json)?);
+            Ok(0)
+        }
+        Command::Policy {
+            command: PolicyCommand::Latest { json },
+        } => {
+            let report = policy_latest(&cli.config)?;
+            print!("{}", render_policy_latest(&report, json)?);
             Ok(0)
         }
     }

@@ -1,143 +1,151 @@
 # Nemor
 
-Nemor is an observe-only telemetry service for CachyOS and other Arch
-Linux systems. Phase 3 adds fail-closed cgroup v2 planning and reversible
-primitives to the
-read-only Phase 1 telemetry pipeline. It records explainable process categories
-and stabilized session workload changes, but does not choose policies, optimize
-memory, or change Linux state.
+Nemor is an experimental Linux runtime for increasing sustainable memory
+capacity by coordinating kernel mechanisms conservatively. Its primary target
+is CachyOS/Linux. It does not promise a universal RAM multiplier: current
+operation is observe-only, and its Phase 4 decisions are deterministic rules,
+not AI.
 
-## Phase 3 status
+## Project Status
 
-The workspace contains eight Rust crates:
+| Phase | Scope | Status |
+|---|---|---|
+| Phase 0 | daemon, config, SQLite, lifecycle | ✅ Validated on CachyOS |
+| Phase 1 | Linux telemetry and reporting | ✅ Validated on CachyOS |
+| Phase 2 | process/workload classification | ✅ Validated on CachyOS |
+| Phase 3 | cgroup v2 protection primitives | 🟡 Dev complete — privileged mutation validation pending |
+| Phase 4 | deterministic policy engine | ✅ Validated on CachyOS |
+| Phase 5 | compression experiments | ⚪ Planned |
 
-- `common`: configuration, validation, shared serializable types, injectable
-  Linux paths, and one-time host metadata reads.
-- `collector`: read-only `/proc` and `/sys` parsers, system samples, process
-  samples, non-sensitive process identity signals, swap/zram/zswap detection,
-  and per-process CPU deltas.
-- `classifier`: deterministic process categorization, foreground tri-state,
-  gaming evidence, nine workload classes, explanations, and stabilization.
-- `actuator`: cgroup v2 capability inspection, explainable plans, simulated
-  verification, Linux primitives, snapshots, rollback, and recovery.
-- `storage`: SQLite connection setup, migration verification, and host/session
-  plus telemetry/catalog/workload-event/retention repositories.
-- `nemord`: foreground daemon, sampling loop, and signal-driven shutdown.
-- `nemorctl`: read-only `doctor`, `status`, `report latest`, and
-  `workload latest` commands.
-- `test-support`: Linux fixtures and temporary test resources only.
+Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
+development; ⚪ planned.
 
-The only accepted operating mode is `observe`, and
-`allow_automatic_actions` must be `false`.
+## Current validated snapshot
 
-## Prerequisites
+| Item | Result |
+|---|---|
+| Platform | CachyOS Linux, x86_64 |
+| Kernel | 7.1.4-1-cachyos |
+| Rust / Cargo | 1.97.1 / 1.97.1 |
+| Workspace crates | 9 |
+| Tests defined / executed | 122 / 122 |
+| Passed / failed / ignored | 122 / 0 / 0 |
+| Runtime mode | `observe` |
+| Validated implementation | current `main` (Phase 4 implementation commit) |
 
-- Linux (CachyOS/Arch Linux is the initial target)
-- stable Rust with `cargo`, `rustfmt`, and `clippy`
-- readable `/proc`, `/etc/machine-id`, and `/etc/os-release`
-- SQLite requires no system package because the workspace builds a bundled copy
+Linux tests include real `/proc`/`/sys` reads and real SIGINT/SIGTERM delivery.
+Privileged cgroup mutation is explicitly outside this validated snapshot.
 
-No network access is required by the binaries at runtime.
+## Performance snapshot
 
-## Build, lint, and test
+Release `nemord` was sampled on the validation host 15 times at two-second
+intervals using `/proc/<pid>/stat`, `status`, and `smaps_rollup`.
+
+| Metric | Phase 3 | Phase 4 |
+|---|---:|---:|
+| Mean CPU (one logical CPU) | 0.1990% | 0.199249% |
+| Maximum interval CPU | 0.4976% | 0.996093% |
+| Maximum RSS | ~7.03 MiB | ~7.34 MiB |
+| PSS | ~4.70 MiB | ~4.99 MiB |
+
+These are host-specific validation measurements, not universal benchmarks.
+The mean CPU is unchanged within measurement noise; memory increased modestly.
+
+## Implemented capabilities
+
+- read-only Linux memory, swap, PSI, process, zram and zswap telemetry;
+- process identity, foreground tri-state, gaming protection and workload
+  classification;
+- cgroup v2 capability inspection, guarded planning, snapshot, rollback and
+  crash-recovery machinery;
+- deterministic six-state pressure engine with explicit time, hysteresis,
+  versioned explanations and a closed action planner;
+- SQLite WAL audit, retention, deduplicated policy decisions, and bounded
+  read-only history;
+- foreground daemon with clean SIGINT/SIGTERM lifecycle;
+- read-only JSON/text CLI.
+
+## Safety model
+
+- `observe` means zero system mutations;
+- PID movement requires stable identity allow-list and fresh start ticks;
+- unknown means “do not touch”;
+- game, critical, protected and foreground workloads remain protected;
+- actuator writes require snapshot, one mutation, readback, verify and rollback;
+- policy dry-run stops before actuator apply;
+- every crate forbids unsafe Rust;
+- no destructive or unvalidated action is exposed.
+
+See [the safety model](docs/safety-model.md).
+
+## Available CLI
+
+```text
+nemorctl doctor
+nemorctl status
+nemorctl report latest
+nemorctl workload latest
+nemorctl cgroups status
+nemorctl policy status
+nemorctl policy latest
+```
+
+Every command accepts `--json` at its terminal command position and reads only
+configuration, Linux capability files, or SQLite.
+
+## Build and local observe run
 
 ```bash
-cargo build --workspace --all-targets --all-features
 cargo fmt --check
+cargo build --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-## Local run without privileges
-
-Copy the sample configuration and replace `database_path` with a location owned
-by the current user:
+Use an owned temporary database by copying `config/default.toml` and changing
+only `general.database_path`, then run:
 
 ```bash
-workdir="$(mktemp -d)"
-sed "s|/var/lib/nemor/nemor.db|$workdir/nemor.db|" \
-  config/default.toml > "$workdir/config.toml"
-cargo run -p nemord -- --config "$workdir/config.toml"
+cargo run -p nemord -- --config /path/to/config.toml
+cargo run -p nemorctl -- --config /path/to/config.toml policy status --json
+cargo run -p nemorctl -- --config /path/to/config.toml policy latest --json
 ```
 
-The process remains in the foreground. `Ctrl-C` (SIGINT) or SIGTERM closes the
-current session transactionally, sets `ended_at`, marks `clean_shutdown = 1`,
-and exits with code zero. An abnormal process termination deliberately leaves
-the record open with `clean_shutdown = 0`.
+The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
+`clean_shutdown = 1`.
 
-In another terminal, the read-only commands can use the same configuration:
+## Known limitations
 
-```bash
-cargo run -p nemorctl -- --config "$workdir/config.toml" doctor
-cargo run -p nemorctl -- --config "$workdir/config.toml" doctor --json
-cargo run -p nemorctl -- --config "$workdir/config.toml" status
-cargo run -p nemorctl -- --config "$workdir/config.toml" status --json
-cargo run -p nemorctl -- --config "$workdir/config.toml" report latest
-cargo run -p nemorctl -- --config "$workdir/config.toml" report latest --json
-cargo run -p nemorctl -- --config "$workdir/config.toml" workload latest
-cargo run -p nemorctl -- --config "$workdir/config.toml" workload latest --json
-cargo run -p nemorctl -- --config "$workdir/config.toml" cgroups status --json
-```
+- Phase 3 privileged systemd/cgroup mutations have not been validated and are
+  not enabled by the default service;
+- gaming detection is not validated against every live
+  Steam/Proton/Wine/Gamescope combination;
+- SteamOS is not supported;
+- policy operation is dry-run only;
+- no ML, GUI, or Phase 5 compression experiment exists.
 
-The cgroup command is read-only. Defaults disable cgroups and force dry-run
-behavior; see [`docs/cgroups.md`](docs/cgroups.md).
+## Roadmap
 
-`doctor` reports `pass`, `warn`, or `fail` for Linux prerequisites. Missing PSI
-or cgroups v2 support is a warning in Phase 2: PSI is an optional collector
-capability and cgroups are only observed as process paths. Missing mandatory
-identity or `/proc` inputs is a failure. Exit code
-zero means no failures, code two means at least one critical check failed, and
-code one means invalid input or an internal command error.
+- Completed and validated: Phases 0–2 and deterministic Phase 4 observe logic.
+- Validation pending: isolated privileged Phase 3 cgroup mutation.
+- Next: Phase 5 only after a separate approved scope.
+- Future work remains unavailable until implemented and measured.
 
-`status` reports database presence, schema version, the most recently registered
-host, and the latest session. `session_open` describes only the database record;
-it is not proof that a daemon process is alive.
+## Documentation
 
-`report latest` aggregates only the most recent recorded session: sample counts,
-memory/swap/PSI extrema, counter deltas, observed zram/zswap presence, and known
-missing capabilities. It makes no workload or optimization claims.
+- [Architecture](docs/architecture.md)
+- [Telemetry](docs/telemetry.md)
+- [Classification](docs/classification.md)
+- [Cgroups](docs/cgroups.md)
+- [Policy engine](docs/policy-engine.md)
+- [Safety model](docs/safety-model.md)
+- [Database](docs/database.md)
+- [CachyOS validation](docs/cachyos-validation.md)
 
-`workload latest` reports the latest stabilized deterministic class, confidence,
-rule version, non-sensitive reasons, relevant gaming/pressure signals, and
-current category counts. Before confirmation it returns a controlled
-unknown/unavailable state and creates no event.
+## Validation history
 
-## Manual systemd installation example
-
-These commands are examples only; the unit is not installed or enabled by this
-repository:
-
-```bash
-install -Dm0755 target/release/nemord /usr/bin/nemord
-install -Dm0644 config/default.toml /etc/nemor/config.toml
-install -Dm0644 packaging/systemd/nemord.service \
-  /etc/systemd/system/nemord.service
-systemctl daemon-reload
-systemctl start nemord.service
-```
-
-Stop it with `systemctl stop nemord.service`. SIGTERM is used and the
-unit allows 30 seconds for clean session closure.
-
-For manual removal, first stop the service, then remove the installed binary,
-configuration, and unit. Run `systemctl daemon-reload` after removing the unit.
-The state database is under `/var/lib/nemor`; remove that directory only
-when its historical host/session records are no longer needed. The unit is not
-enabled automatically, so no enable/disable action is part of Phase 2.
-
-## Limitations
-
-Phase 3 intentionally does not implement:
-
-- policy decisions or a pressure state machine;
-- policy selection or automatic actions;
-- kernel, sysctl, cgroup, zram, zswap, DAMON, or KSM changes;
-- AI training, inference, or model activation;
-- benchmarks;
-- safe, gaming, or capacity operating profiles.
-
-The classifier is heuristic, versioned `heuristic-v1`, and deliberately permits
-an uncertain outcome rather than inventing `idle`. Real foreground and
-Steam/Proton/Gamescope accuracy, false-positive/negative rates, classifier
-overhead, daemon memory use, and long-session behavior remain to be validated on
-CachyOS.
+| Phase | Tests after phase | Platform validation | Commit |
+|---|---:|---|---|
+| 0–2 | 90 | CachyOS | `ae06b19` |
+| 3 | 106 | Partial — privileged mutations pending | `b335e2c` |
+| 4 | 122 | CachyOS observe validation | current `main` |

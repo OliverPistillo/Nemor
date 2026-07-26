@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/collector",
     "crates/classifier",
+    "crates/policy-engine",
     "crates/storage",
     "crates/nemord",
     "crates/nemorctl",

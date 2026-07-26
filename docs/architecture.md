@@ -1,4 +1,4 @@
-# Phase 3 architecture
+# Phase 4 architecture
 
 ## Crate boundaries
 
@@ -21,10 +21,16 @@ plans, the fixed Nemor group namespace, a deterministic fake backend, guarded
 Linux primitives, snapshots, readback verification, rollback, and recovery.
 It does not select policies.
 
+`policy-engine` consumes normalized immutable inputs and explicit logical time.
+It owns counter rates, six pressure states, hysteresis, versioned rules, the
+closed action planner, explanations, and restart state. It has no Linux
+filesystem or clock access.
+
 `storage` owns SQLite connections. It enables WAL and foreign keys, verifies
 four versioned migrations, inserts system samples, atomically upserts process
 catalog entries with classified samples and workload changes, executes
-transactional retention, and produces read-only latest-session reports.
+transactional retention, produces read-only latest-session reports, and
+deduplicates Phase 4 policy audits.
 
 `nemord` is the foreground process. It parses `--config`, loads and
 validates the file, initializes JSON structured logs, opens storage, records the
@@ -52,9 +58,11 @@ snapshot helpers used only by tests. It contains no production behavior.
 8. Start the telemetry loop only after the session exists.
 9. Sample system, process, and retention schedules using monotonic timers.
 10. Classify immutable process/system snapshots on the classification schedule.
-11. Persist catalog links and stabilized changes; uncertain outcomes create no
+11. Build policy input, evaluate state, plan, reject observe-mode mutations,
+    and persist a deduplicated audit.
+12. Persist catalog links and stabilized changes; uncertain outcomes create no
     workload event.
-12. On SIGINT/SIGTERM, stop scheduling, close the session, and exit.
+13. On SIGINT/SIGTERM, stop scheduling, close the session, and exit.
 
 If mandatory host metadata cannot be read, startup stops before a session is
 created. Errors retain operation and path context.
@@ -78,6 +86,6 @@ silently lost indefinitely.
 
 ## Phase boundary
 
-Phase 3 supplies controlled primitives but does not choose policies, run
-models, benchmark, or enable mutations in observe mode. There is no
-policy-engine crate and no Phase 4 state machine.
+Phase 4 chooses only among existing Phase 3 intents and records dry-run audit.
+It does not invoke actuator apply, add a mutating public mode, tune compression,
+run models, or implement Phase 5.

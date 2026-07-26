@@ -48,10 +48,20 @@ protect_foreground = true
 watch_available_percent = 20
 pressure_available_percent = 12
 critical_available_percent = 7
+emergency_available_percent = 3
 psi_some_avg10_threshold = 10.0
 psi_full_avg10_threshold = 2.0
+emergency_psi_full_avg10_threshold = 10.0
+major_fault_rate_threshold = 100.0
+swap_in_rate_threshold = 128.0
+swap_out_rate_threshold = 128.0
 state_hold_seconds = 10
 recovery_hold_seconds = 30
+
+[policy]
+enabled = true
+evaluation_interval_ms = 5000
+decision_heartbeat_seconds = 300
 
 [compression]
 backend = "detect"

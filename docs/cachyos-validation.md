@@ -168,3 +168,40 @@ this CachyOS host. The default service remains observe-only and receives no
 cgroup delegation. If the hierarchy is not writable without administrative
 elevation, kernel mutations remain explicitly unvalidated rather than being
 simulated as real.
+
+## Phase 4 validation
+
+Phase 4 was validated on the same CachyOS host on 2026-07-26 without sudo or
+cgroup mutation. The workspace contains nine crates. The complete suite defines
+and executes 122 tests: all passed, none failed or were ignored. New tests cover
+the six pressure states, escalation and recovery through `STABILIZING`,
+hysteresis holds, rate derivation/reset, invalid and non-finite input,
+1,000 identical serialized evaluations, gaming/unknown invariants, observe
+rejections, relevant safety-event suppression, SQLite audit deduplication,
+heartbeat, nullable model/gain/cost fields, and bounded history.
+
+A final release daemon ran for 16 seconds with a temporary database and unchanged
+`mode = "observe"`. It read real telemetry, classified current processes,
+evaluated `nemor-policy-v1` / `pressure-rules-v1`, persisted three explainable
+policy audits, and transitioned conservatively from restart `WATCH` to
+`NORMAL`. `nemorctl policy status --json` and `policy latest --json` returned
+valid typed JSON. The latest input contained real RAM, swap, PSI and counter
+rates; unknown processes remained explicitly rejected. `model_version`,
+expected gain and expected cost were null.
+
+The session received real SIGTERM, exited zero, and reported `closed_clean`.
+There were zero `action_results`. A read-only search found no `nemor-*` cgroup
+before or after the run. No cgroup, sysctl, swap, zram, zswap, DAMON, KSM,
+reclaim, freezer, process signal, network, or ML operation was performed.
+
+Release overhead was sampled 15 times at two-second intervals:
+
+- mean CPU: 0.199249% of one logical CPU;
+- maximum interval CPU: 0.996093%;
+- maximum RSS: 7,696,384 bytes (about 7.34 MiB);
+- PSS: 5,233,664 bytes (about 4.99 MiB).
+
+Compared with Phase 3, mean CPU was effectively unchanged. The maximum
+interval varied upward and resident memory increased by about 0.31 MiB; neither
+is a material regression. Phase 3 remains development-complete with privileged
+mutation validation pending.

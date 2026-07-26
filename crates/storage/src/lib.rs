@@ -8,6 +8,10 @@ use classifier::{
 };
 use collector::{ProcessSample, SystemSample};
 use common::{HostMetadata, HostSummary, SessionSummary, StatusReport, StatusState};
+use policy_engine::{
+    CandidateRejection, PlannedAction, PolicyDecision, PolicyEvidence, PolicyInput, PressureState,
+    RejectedAction,
+};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -64,6 +68,84 @@ impl Storage {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn insert_policy_decision(
+        &self,
+        session_id: i64,
+        decision: &PolicyDecision,
+        heartbeat_seconds: u64,
+    ) -> Result<bool> {
+        let features = serde_json::to_string(&decision.input_features)
+            .context("cannot serialize policy input features")?;
+        let audit = PolicyActionAudit::from(decision);
+        let actions =
+            serde_json::to_string(&audit).context("cannot serialize policy action audit")?;
+        let previous: Option<(i64, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT timestamp_ns, pressure_state, actions_json
+                 FROM policy_decisions WHERE session_id=?1
+                 ORDER BY timestamp_ns DESC, id DESC LIMIT 1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .context("cannot read previous policy decision")?;
+        let state = state_text(decision.current_state);
+        let heartbeat_ns =
+            i64::try_from(u128::from(heartbeat_seconds).saturating_mul(1_000_000_000))
+                .unwrap_or(i64::MAX);
+        if let Some((timestamp, old_state, old_actions)) = previous {
+            let old_audit: PolicyActionAudit =
+                serde_json::from_str(&old_actions).context("invalid previous policy audit JSON")?;
+            let same_plan = old_audit.planned_actions == audit.planned_actions
+                && old_audit.rejected_actions == audit.rejected_actions;
+            if old_state == state
+                && same_plan
+                && decision.timestamp_ns.saturating_sub(timestamp) < heartbeat_ns
+            {
+                return Ok(false);
+            }
+        }
+        self.connection.execute(
+            "INSERT INTO policy_decisions (
+                session_id, timestamp_ns, pressure_state, policy_name,
+                input_features_json, actions_json, expected_gain_bytes,
+                expected_cost_score, model_version, rule_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7)",
+            params![
+                session_id,
+                decision.timestamp_ns,
+                state,
+                decision.policy_name,
+                features,
+                actions,
+                decision.rule_version,
+            ],
+        )?;
+        Ok(true)
+    }
+
+    pub fn policy_history_counts(&self, timestamp_ns: i64) -> Result<(usize, usize)> {
+        let decision_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT id FROM policy_decisions ORDER BY timestamp_ns DESC, id DESC LIMIT 20
+             )",
+            [],
+            |row| row.get::<_, usize>(0),
+        )?;
+        let cutoff = timestamp_ns.saturating_sub(300_000_000_000);
+        let safety_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT id FROM safety_events
+                WHERE timestamp_ns >= ?1 AND event_type LIKE 'cgroup_%'
+                ORDER BY timestamp_ns DESC, id DESC LIMIT 20
+             )",
+            [cutoff],
+            |row| row.get::<_, usize>(0),
+        )?;
+        Ok((decision_count, safety_count))
     }
 
     pub fn connection(&self) -> &Connection {
@@ -656,6 +738,157 @@ pub struct LatestWorkloadReport {
     pub critical_processes: u64,
     pub unknown_processes: u64,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyActionAudit {
+    pub previous_state: Option<PressureState>,
+    pub state_changed: bool,
+    pub state_since_ns: i64,
+    pub candidate_state: Option<PressureState>,
+    pub evidence: Vec<PolicyEvidence>,
+    pub rejected_candidates: Vec<CandidateRejection>,
+    pub planned_actions: Vec<PlannedAction>,
+    pub rejected_actions: Vec<RejectedAction>,
+    pub dry_run: bool,
+    pub transition_reason: String,
+}
+
+impl From<&PolicyDecision> for PolicyActionAudit {
+    fn from(value: &PolicyDecision) -> Self {
+        Self {
+            previous_state: value.previous_state,
+            state_changed: value.state_changed,
+            state_since_ns: value.state_since_ns,
+            candidate_state: value.candidate_state,
+            evidence: value.evidence.clone(),
+            rejected_candidates: value.rejected_candidates.clone(),
+            planned_actions: value.planned_actions.clone(),
+            rejected_actions: value.rejected_actions.clone(),
+            dry_run: value.dry_run,
+            transition_reason: value.transition_reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatestPolicyDecision {
+    pub id: i64,
+    pub session_id: i64,
+    pub timestamp_ns: i64,
+    pub pressure_state: PressureState,
+    pub policy_name: String,
+    pub input_features: PolicyInput,
+    pub audit: PolicyActionAudit,
+    pub expected_gain_bytes: Option<u64>,
+    pub expected_cost_score: Option<f64>,
+    pub model_version: Option<String>,
+    pub rule_version: String,
+}
+
+pub fn latest_policy_decision(path: impl AsRef<Path>) -> Result<LatestPolicyDecision> {
+    let path = path.as_ref();
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("cannot open database {} read-only", path.display()))?;
+    query_policy_decisions(&connection, 1)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("database contains no policy decisions"))
+}
+
+pub fn recent_policy_decisions(
+    path: impl AsRef<Path>,
+    limit: usize,
+) -> Result<Vec<LatestPolicyDecision>> {
+    let path = path.as_ref();
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("cannot open database {} read-only", path.display()))?;
+    query_policy_decisions(&connection, limit.clamp(1, 100))
+}
+
+fn query_policy_decisions(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<LatestPolicyDecision>> {
+    let mut statement = connection.prepare(
+        "SELECT id, session_id, timestamp_ns, pressure_state, policy_name,
+                input_features_json, actions_json, expected_gain_bytes,
+                expected_cost_score, model_version, rule_version
+         FROM policy_decisions ORDER BY timestamp_ns DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([i64::try_from(limit).unwrap_or(100)], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            id,
+            session_id,
+            timestamp_ns,
+            state,
+            policy_name,
+            features,
+            actions,
+            gain,
+            cost,
+            model,
+            rules,
+        ) = row?;
+        Ok(LatestPolicyDecision {
+            id,
+            session_id,
+            timestamp_ns,
+            pressure_state: parse_pressure_state(&state)?,
+            policy_name,
+            input_features: serde_json::from_str(&features).context("invalid policy input JSON")?,
+            audit: serde_json::from_str(&actions).context("invalid policy action JSON")?,
+            expected_gain_bytes: optional_i64_to_u64(gain, "expected gain")?,
+            expected_cost_score: cost,
+            model_version: model,
+            rule_version: rules.unwrap_or_else(|| "unknown".to_owned()),
+        })
+    })
+    .collect()
+}
+
+fn state_text(state: PressureState) -> &'static str {
+    match state {
+        PressureState::Normal => "NORMAL",
+        PressureState::Watch => "WATCH",
+        PressureState::Pressure => "PRESSURE",
+        PressureState::Critical => "CRITICAL",
+        PressureState::Emergency => "EMERGENCY",
+        PressureState::Stabilizing => "STABILIZING",
+    }
+}
+
+fn parse_pressure_state(value: &str) -> Result<PressureState> {
+    match value {
+        "NORMAL" => Ok(PressureState::Normal),
+        "WATCH" => Ok(PressureState::Watch),
+        "PRESSURE" => Ok(PressureState::Pressure),
+        "CRITICAL" => Ok(PressureState::Critical),
+        "EMERGENCY" => Ok(PressureState::Emergency),
+        "STABILIZING" => Ok(PressureState::Stabilizing),
+        _ => bail!("unknown pressure state `{value}`"),
+    }
 }
 
 pub fn latest_telemetry_report(path: impl AsRef<Path>) -> Result<LatestTelemetryReport> {
@@ -2043,5 +2276,83 @@ mod tests {
         let empty = latest_workload_report(&path).expect("controlled empty report");
         assert!(!empty.available);
         assert_eq!(empty.current_class, None);
+    }
+
+    #[test]
+    fn policy_audit_deduplicates_and_reads_limited_history() {
+        use actuator::CgroupCapabilities;
+        use policy_engine::{PolicyEngine, PolicyInput};
+
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("policy.db");
+        let storage = Storage::open(&path).expect("database");
+        let host_id = storage.upsert_host(&host("policy-host")).expect("host");
+        let session = storage
+            .open_session(host_id, "0.1", "hash")
+            .expect("session");
+        let config = common::Config::from_toml(include_str!("../../../config/default.toml"))
+            .expect("config");
+        let mut engine = PolicyEngine::new(config.pressure, 0);
+        let make_input = |timestamp_ns| PolicyInput {
+            timestamp_ns,
+            ram_total_bytes: 1_000,
+            mem_available_bytes: 500,
+            available_percent: 50.0,
+            swap_total_bytes: Some(100),
+            swap_used_bytes: Some(0),
+            swap_in_per_second: Some(0.0),
+            swap_out_per_second: Some(0.0),
+            major_faults_per_second: Some(0.0),
+            pgscan_per_second: Some(0.0),
+            pgsteal_per_second: Some(0.0),
+            psi_memory_some_avg10: Some(0.0),
+            psi_memory_full_avg10: Some(0.0),
+            workload_class: Some(WorkloadClass::Desktop),
+            workload_confidence: Some(0.9),
+            gaming: false,
+            critical_processes: 0,
+            protected_processes: 0,
+            unknown_processes: 0,
+            foreground: ForegroundState::Unknown,
+            cgroup_capabilities: Some(CgroupCapabilities {
+                cgroup_v2: true,
+                memory_controller: true,
+                hierarchy: "/sys/fs/cgroup".into(),
+                writable: false,
+                memory_low: true,
+                memory_high: true,
+                attach: false,
+            }),
+            actuator_available: false,
+            recent_safety_events: 0,
+            recent_decisions: 0,
+        };
+        let first = engine.evaluate(make_input(1), true).expect("decision");
+        assert!(storage
+            .insert_policy_decision(session, &first, 300)
+            .expect("insert"));
+        let duplicate = engine.evaluate(make_input(2), true).expect("duplicate");
+        assert!(!storage
+            .insert_policy_decision(session, &duplicate, 300)
+            .expect("dedupe"));
+        let heartbeat = engine
+            .evaluate(make_input(301_000_000_001), true)
+            .expect("heartbeat");
+        assert!(storage
+            .insert_policy_decision(session, &heartbeat, 300)
+            .expect("heartbeat insert"));
+        drop(storage);
+
+        let latest = latest_policy_decision(&path).expect("latest");
+        assert_eq!(latest.rule_version, policy_engine::RULE_VERSION);
+        assert_eq!(latest.model_version, None);
+        assert!(latest.audit.dry_run);
+        serde_json::to_string(&latest).expect("valid JSON");
+        assert_eq!(
+            recent_policy_decisions(&path, 1_000)
+                .expect("history")
+                .len(),
+            2
+        );
     }
 }

@@ -11,6 +11,7 @@ clap.workspace = true
 collector = { package = "nemor-collector", path = "../collector" }
 classifier = { package = "nemor-classifier", path = "../classifier" }
 common = { package = "nemor-common", path = "../common" }
+policy-engine = { package = "nemor-policy-engine", path = "../policy-engine" }
 storage = { package = "nemor-storage", path = "../storage" }
 tokio.workspace = true
 tracing.workspace = true

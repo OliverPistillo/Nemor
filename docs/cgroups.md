@@ -93,5 +93,8 @@ configuration, backend, managed state, pending rollback, stale recovery state,
 and the latest relevant safety error. There is intentionally no CLI apply
 command.
 
-Phase 4 policy selection is outside this design. Phase 3 supplies only
+Phase 4 can request foreground protection or a background soft limit, but
+cannot bypass this design. Concrete targets still pass identity,
+PID/start-tick, classification, ownership, and bounds checks. In `observe`,
+policy records a rejection and never calls apply. Phase 3 continues to supply
 authorized primitives, plans, persistence, verification, and recovery.
