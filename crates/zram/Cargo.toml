@@ -1,22 +1,18 @@
 [package]
-name = "nemorctl"
+name = "nemor-zram"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-actuator = { package = "nemor-actuator", path = "../actuator" }
-anyhow.workspace = true
-clap.workspace = true
 common = { package = "nemor-common", path = "../common" }
 policy-engine = { package = "nemor-policy-engine", path = "../policy-engine" }
 serde.workspace = true
 serde_json.workspace = true
-storage = { package = "nemor-storage", path = "../storage" }
-zram = { package = "nemor-zram", path = "../zram" }
+thiserror.workspace = true
 
 [dev-dependencies]
-test-support = { package = "nemor-test-support", path = "../test-support" }
+tempfile.workspace = true
 
 [lints]
 workspace = true

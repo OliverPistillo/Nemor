@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use nemorctl::{
     cgroups_status, doctor, policy_latest, policy_status, render_cgroups_status, render_doctor,
     render_policy_latest, render_policy_status, render_report, render_status, render_workload,
-    report_latest, status, workload_latest, DoctorEnvironment,
+    render_zram, report_latest, status, workload_latest, zram_profiles, zram_report_latest,
+    zram_status, DoctorEnvironment,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -46,6 +47,10 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    Zram {
+        #[command(subcommand)]
+        command: ZramCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,6 +83,30 @@ enum PolicyCommand {
         #[arg(long)]
         json: bool,
     },
+    Latest {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ZramCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Profiles {
+        #[arg(long)]
+        json: bool,
+    },
+    Report {
+        #[command(subcommand)]
+        command: ZramReportCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ZramReportCommand {
     Latest {
         #[arg(long)]
         json: bool,
@@ -140,6 +169,27 @@ fn run() -> anyhow::Result<i32> {
         } => {
             let report = policy_latest(&cli.config)?;
             print!("{}", render_policy_latest(&report, json)?);
+            Ok(0)
+        }
+        Command::Zram {
+            command: ZramCommand::Status { json },
+        } => {
+            print!("{}", render_zram(&zram_status(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Zram {
+            command: ZramCommand::Profiles { json },
+        } => {
+            print!("{}", render_zram(&zram_profiles(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Zram {
+            command:
+                ZramCommand::Report {
+                    command: ZramReportCommand::Latest { json },
+                },
+        } => {
+            print!("{}", render_zram(&zram_report_latest(&cli.config)?, json)?);
             Ok(0)
         }
     }

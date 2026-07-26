@@ -1,4 +1,4 @@
-# Phase 4 safety model
+# Phase 5 safety model
 
 The only valid mode is exactly `observe`.
 `general.allow_automatic_actions`, `ksm.enabled`, and `damon.enabled` must all be
@@ -28,6 +28,19 @@ signals, freezes, suspends, or terminates a process.
 Phase 3 never writes `memory.max`, `memory.swap.max`, `memory.reclaim`, freezer,
 sysctl, zram/zswap, KSM, or DAMON state and never shells out to system
 administration commands.
+
+The Phase 5 zram backend treats every discovered system device as external.
+Observe performs inventory, metrics, planning, and audit only. A transaction
+requires explicit ownership, a snapshot, available headroom, safe pressure,
+replacement-first activation, readback verification, and rollback. It never
+resets active system zram and never disables the only valid swap backend before
+a verified replacement exists. Ambiguity blocks the operation.
+
+Potential mutation helpers are an internal allow-list of absolute
+`mkswap`/`swapon`/`swapoff` paths with separate validated arguments and an
+owned canonical `/dev/zramN` only. No shell or config-controlled executable is
+accepted. There is no zswap, writeback/backing device, sysctl, reclaim, freezer,
+KSM, DAMON, arbitrary signal, or network operation.
 
 Classification is data-only. It cannot signal a process, change priority,
 reclaim memory, create a cgroup, or write a kernel setting. Unknown identities,

@@ -2,12 +2,21 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ZramProfileIntent {
+    Safe,
+    Gaming,
+    Capacity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActionKind {
     NoAction,
     PrepareForegroundProtection,
     ProtectForeground,
     ApplyBackgroundSoftLimit,
     RollbackCgroupMeasures,
+    SelectZramProfile { profile: ZramProfileIntent },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

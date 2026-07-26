@@ -9,7 +9,8 @@ use classifier::{
 use collector::{CollectorError, ProcessCollection, SystemCollector, SystemSample};
 use common::Config;
 use policy_engine::{
-    CounterSample, PolicyDecision, PolicyEngine, PolicyInput, RateFeatures, RateTracker,
+    ActionKind, CounterSample, PolicyDecision, PolicyEngine, PolicyInput, RateFeatures,
+    RateTracker, ZramProfileIntent,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -68,6 +69,9 @@ pub trait TelemetryStorage {
     fn policy_history_counts(&self, _timestamp_ns: i64) -> Result<(usize, usize)> {
         Ok((0, 0))
     }
+    fn store_zram_audit(&mut self, _session_id: i64, _audit: &zram::ZramAuditReport) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl TelemetryStorage for Storage {
@@ -108,6 +112,64 @@ impl TelemetryStorage for Storage {
     fn policy_history_counts(&self, timestamp_ns: i64) -> Result<(usize, usize)> {
         Storage::policy_history_counts(self, timestamp_ns)
     }
+
+    fn store_zram_audit(&mut self, session_id: i64, audit: &zram::ZramAuditReport) -> Result<()> {
+        self.insert_configuration_snapshot(session_id, zram::AUDIT_REASON, &audit.plans, audit)?;
+        Ok(())
+    }
+}
+
+fn zram_audit(decision: &PolicyDecision, config: &Config) -> Result<zram::ZramAuditReport> {
+    let inventory =
+        zram::inspect_linux(std::path::Path::new("/")).context("cannot inspect zram inventory")?;
+    let requested = decision
+        .planned_actions
+        .iter()
+        .find_map(|action| match &action.kind {
+            ActionKind::SelectZramProfile { profile } => Some(match profile {
+                ZramProfileIntent::Safe => zram::ZramProfile::Safe,
+                ZramProfileIntent::Gaming => zram::ZramProfile::Gaming,
+                ZramProfileIntent::Capacity => zram::ZramProfile::Capacity,
+            }),
+            _ => None,
+        })
+        .unwrap_or(zram::ZramProfile::Safe);
+    let mut plans = Vec::new();
+    for device in &inventory.devices {
+        plans.push(zram::plan_profile(
+            &zram::ProfileContext {
+                requested,
+                device,
+                benchmarks: &[],
+                total_ram_bytes: decision.input_features.ram_total_bytes,
+                mem_available_bytes: decision.input_features.mem_available_bytes,
+                current_used_bytes: device.mm_stat.mem_used_total.unwrap_or(0),
+                pressure_state: decision.current_state,
+                psi_full_avg10: decision.input_features.psi_memory_full_avg10,
+                swap_in_per_second: decision.input_features.swap_in_per_second,
+                gaming: decision.input_features.gaming,
+                pressure_worsening: matches!(
+                    decision.current_state,
+                    policy_engine::PressureState::Critical
+                        | policy_engine::PressureState::Emergency
+                ),
+                safety_events: decision.input_features.recent_safety_events,
+                rollback_pending: false,
+                provider_matches_snapshot: true,
+            },
+            &config.compression,
+            &config.general.mode,
+        ));
+    }
+    Ok(zram::ZramAuditReport {
+        timestamp_ns: decision.timestamp_ns,
+        inventory,
+        plans,
+        benchmark_evidence: Vec::new(),
+        rollback_pending: false,
+        recovery_pending: false,
+        dry_run: true,
+    })
 }
 
 pub async fn run_sampling_loop<C, S, F>(
@@ -438,6 +500,17 @@ where
                                                 config.policy.decision_heartbeat_seconds,
                                             ).context("cannot persist policy decision")?;
                                             if inserted {
+                                                match zram_audit(&decision, config) {
+                                                    Ok(audit) => storage
+                                                        .store_zram_audit(session_id, &audit)
+                                                        .context("cannot persist zram observe audit")?,
+                                                    Err(error) => warn!(
+                                                        event = "zram_inventory_unavailable",
+                                                        session_id,
+                                                        error = %error,
+                                                        "zram observe audit was unavailable"
+                                                    ),
+                                                }
                                                 info!(
                                                     event = "policy_decision_persisted",
                                                     session_id,

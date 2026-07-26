@@ -70,6 +70,58 @@ impl Storage {
         &self.path
     }
 
+    pub fn insert_configuration_snapshot<T: Serialize, U: Serialize>(
+        &self,
+        session_id: i64,
+        reason: &str,
+        configuration: &T,
+        system_values: &U,
+    ) -> Result<i64> {
+        if reason.is_empty() || reason.len() > 64 {
+            bail!("invalid configuration snapshot reason");
+        }
+        let config_json =
+            serde_json::to_string(configuration).context("cannot serialize snapshot plan")?;
+        let system_values_json =
+            serde_json::to_string(system_values).context("cannot serialize snapshot state")?;
+        self.connection.execute(
+            "INSERT INTO configuration_snapshots (
+                session_id, reason, config_json, system_values_json
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, reason, config_json, system_values_json],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn insert_zram_benchmark<T: Serialize>(
+        &self,
+        host_id: i64,
+        profile: &str,
+        real_isolated_device: bool,
+        results: &T,
+    ) -> Result<i64> {
+        if !matches!(profile, "safe" | "gaming" | "capacity") {
+            bail!("invalid zram benchmark profile");
+        }
+        let parameters =
+            serde_json::to_string(results).context("cannot serialize zram benchmark results")?;
+        let status = if real_isolated_device {
+            "completed_real"
+        } else {
+            "simulated_fixture"
+        };
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        self.connection.execute(
+            "INSERT INTO benchmark_runs (
+                host_id, name, workload, profile, baseline, started_at,
+                ended_at, status, parameters_json, notes
+             ) VALUES (?1, 'zram-isolated', 'deterministic-fixtures', ?2, 0,
+                       ?3, ?3, ?4, ?5, 'Phase 5 bounded benchmark')",
+            params![host_id, profile, now, status, parameters],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
     pub fn insert_policy_decision(
         &self,
         session_id: i64,
@@ -784,6 +836,41 @@ pub struct LatestPolicyDecision {
     pub expected_cost_score: Option<f64>,
     pub model_version: Option<String>,
     pub rule_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatestConfigurationSnapshot {
+    pub id: i64,
+    pub session_id: Option<i64>,
+    pub created_at: String,
+    pub reason: String,
+    pub config_json: String,
+    pub system_values_json: String,
+}
+
+pub fn latest_configuration_snapshot(
+    path: impl AsRef<Path>,
+    reason: &str,
+) -> Result<LatestConfigurationSnapshot> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection
+        .query_row(
+            "SELECT id, session_id, created_at, reason, config_json, system_values_json
+             FROM configuration_snapshots WHERE reason=?1 ORDER BY id DESC LIMIT 1",
+            [reason],
+            |row| {
+                Ok(LatestConfigurationSnapshot {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    reason: row.get(3)?,
+                    config_json: row.get(4)?,
+                    system_values_json: row.get(5)?,
+                })
+            },
+        )
+        .optional()?
+        .context("no matching configuration snapshot is available")
 }
 
 pub fn latest_policy_decision(path: impl AsRef<Path>) -> Result<LatestPolicyDecision> {
@@ -2353,6 +2440,42 @@ mod tests {
                 .expect("history")
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn zram_snapshot_and_benchmark_preserve_real_simulated_label() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("zram-audit.db");
+        let storage = Storage::open(&path).expect("database");
+        let host_id = storage.upsert_host(&host("zram-host")).expect("host");
+        let session = storage
+            .open_session(host_id, "0.1", "hash")
+            .expect("session");
+        let plan = serde_json::json!({"profile": "safe", "dry_run": true});
+        let state = serde_json::json!({"devices": [], "rollback_pending": false});
+        storage
+            .insert_configuration_snapshot(session, "zram_observe_audit", &plan, &state)
+            .expect("snapshot");
+        let simulated = storage
+            .insert_zram_benchmark(host_id, "safe", false, &Vec::<u8>::new())
+            .expect("benchmark");
+        let status: String = storage
+            .connection()
+            .query_row(
+                "SELECT status FROM benchmark_runs WHERE id=?1",
+                [simulated],
+                |row| row.get(0),
+            )
+            .expect("status");
+        assert_eq!(status, "simulated_fixture");
+        drop(storage);
+        let latest = latest_configuration_snapshot(&path, "zram_observe_audit").expect("latest");
+        assert_eq!(latest.session_id, Some(session));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&latest.system_values_json)
+                .expect("valid JSON"),
+            state
         );
     }
 }

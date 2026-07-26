@@ -1,4 +1,6 @@
-use crate::{ActionKind, PlannedAction, PolicyInput, PressureState, RejectedAction};
+use crate::{
+    ActionKind, PlannedAction, PolicyInput, PressureState, RejectedAction, ZramProfileIntent,
+};
 use actuator::{plan as actuator_plan, CgroupPlan, PlanInput};
 use common::CgroupsConfig;
 
@@ -18,17 +20,47 @@ pub fn plan_actions(state: PressureState, input: &PolicyInput, observe: bool) ->
         .is_some_and(actuator::CgroupCapabilities::mutation_ready);
 
     match state {
-        PressureState::Normal => planned.push(action(ActionKind::NoAction, "system_stable", false)),
-        PressureState::Watch => planned.push(action(
-            ActionKind::PrepareForegroundProtection,
-            "early_pressure_signals",
-            false,
-        )),
+        PressureState::Normal => {
+            planned.push(action(ActionKind::NoAction, "system_stable", false));
+            planned.push(zram_action(
+                ZramProfileIntent::Safe,
+                "preserve_current_zram",
+            ));
+        }
+        PressureState::Watch => {
+            planned.push(action(
+                ActionKind::PrepareForegroundProtection,
+                "early_pressure_signals",
+                false,
+            ));
+            planned.push(zram_action(
+                if input.gaming {
+                    ZramProfileIntent::Gaming
+                } else {
+                    ZramProfileIntent::Safe
+                },
+                "analyze_zram_without_risky_change",
+            ));
+        }
         PressureState::Pressure | PressureState::Critical | PressureState::Emergency => {
             planned.push(action(
                 ActionKind::ProtectForeground,
                 "preserve_confirmed_foreground_and_protected_workloads",
                 true,
+            ));
+            planned.push(zram_action(
+                if input.gaming {
+                    ZramProfileIntent::Gaming
+                } else if state == PressureState::Pressure {
+                    ZramProfileIntent::Capacity
+                } else {
+                    ZramProfileIntent::Safe
+                },
+                if state == PressureState::Pressure {
+                    "evaluate_capacity_without_bypassing_zram_guards"
+                } else {
+                    "critical_states_block_zram_reinitialization"
+                },
             ));
             planned.push(action(
                 ActionKind::ApplyBackgroundSoftLimit,
@@ -50,6 +82,10 @@ pub fn plan_actions(state: PressureState, input: &PolicyInput, observe: bool) ->
                 ActionKind::RollbackCgroupMeasures,
                 "conservative_recovery_after_pressure",
                 true,
+            ));
+            planned.push(zram_action(
+                ZramProfileIntent::Safe,
+                "hold_zram_configuration_during_stabilization",
             ));
             if input.recent_safety_events > 0 {
                 reject_mutations(&mut planned, &mut rejected, "recent_cgroup_safety_event");
@@ -75,6 +111,10 @@ fn action(kind: ActionKind, reason: &str, mutating: bool) -> PlannedAction {
         mutating,
         actuator_plan: None,
     }
+}
+
+fn zram_action(profile: ZramProfileIntent, reason: &str) -> PlannedAction {
+    action(ActionKind::SelectZramProfile { profile }, reason, false)
 }
 
 fn reject_mutations(

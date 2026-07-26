@@ -37,3 +37,6 @@ jobs:
 
       - name: Classify real Nemor Linux process telemetry read-only
         run: cargo test -p nemor-classifier tests::real_linux_process_identity_can_be_classified_read_only --all-features
+
+      - name: Inspect real Nemor Linux zram interfaces read-only
+        run: cargo test -p nemor-zram tests::linux_backend_inspects_real_host_read_only --all-features

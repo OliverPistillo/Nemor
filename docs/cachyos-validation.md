@@ -205,3 +205,35 @@ Compared with Phase 3, mean CPU was effectively unchanged. The maximum
 interval varied upward and resident memory increased by about 0.31 MiB; neither
 is a material regression. Phase 3 remains development-complete with privileged
 mutation validation pending.
+
+## Phase 5 validation
+
+Phase 5 was exercised on 2026-07-26 on CachyOS kernel
+`7.1.4-1-cachyos`, Rust/Cargo 1.97.1, without sudo. The ten-crate workspace
+defines 140 tests: all passed, none failed or were ignored; the 122 Phase 4
+tests remain intact.
+
+The real read-only inventory found one active 16,640,901,120-byte zram swap
+device at priority 100, managed by the systemd zram generator and classified
+external. Its active algorithm was `zstd`; available algorithms were `842`,
+`deflate`, `lz4`, `lz4hc`, `lzo`, `lzo-rle`, and `zstd`. At the final read it
+held 1,414,635,520 original bytes, 320,925,071 compressed bytes, and
+329,650,176 allocated bytes: logical ratio 4.4080, effective ratio 4.2913,
+allocator efficiency 0.9735, and 1,084,985,344 bytes saved. These values are a
+momentary host observation, not a universal benchmark. CPU cost is unavailable
+because no isolated algorithm benchmark was permitted.
+
+The current user could read `hot_add` but had no delegated zram-control or
+device access. Nemor made no real zram mutation and did not run `sudo`. The
+system device was never adopted, reset, deactivated, or written. The simulated
+backend demonstrated replacement-first apply/verify/rollback, failure
+injection, retry, crash recovery, and no-swap-loss. Privileged mutation
+validation therefore remains pending.
+
+A release daemon ran in `observe` with a temporary database, persisted four
+typed zram audit snapshots and zero action results or benchmark runs, received
+SIGTERM, exited zero, and closed cleanly. All Phase 0–5 CLI commands returned
+valid JSON. Fifteen samples at two-second intervals measured mean CPU
+0.212940%, maximum interval 0.496909%, maximum RSS 7,675,904 bytes (~7.32 MiB),
+and final PSS 5,244,928 bytes (~5.00 MiB), without a material Phase 4
+regression.

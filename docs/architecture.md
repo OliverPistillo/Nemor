@@ -26,6 +26,11 @@ It owns counter rates, six pressure states, hysteresis, versioned rules, the
 closed action planner, explanations, and restart state. It has no Linux
 filesystem or clock access.
 
+`zram` owns Linux zram inventory and parsing, zero-safe compression metrics,
+three deterministic profile plans, bounded benchmark evidence, ownership and
+pressure guards, and replacement-first apply/verify/rollback/recovery
+primitives. It does not read policy thresholds or grant itself ownership.
+
 `storage` owns SQLite connections. It enables WAL and foreign keys, verifies
 four versioned migrations, inserts system samples, atomically upserts process
 catalog entries with classified samples and workload changes, executes
@@ -60,9 +65,11 @@ snapshot helpers used only by tests. It contains no production behavior.
 10. Classify immutable process/system snapshots on the classification schedule.
 11. Build policy input, evaluate state, plan, reject observe-mode mutations,
     and persist a deduplicated audit.
-12. Persist catalog links and stabilized changes; uncertain outcomes create no
+12. Inspect zram read-only, translate the selected profile intent into a
+    blocked/dry-run technical plan, and persist its typed snapshot.
+13. Persist catalog links and stabilized changes; uncertain outcomes create no
     workload event.
-13. On SIGINT/SIGTERM, stop scheduling, close the session, and exit.
+14. On SIGINT/SIGTERM, stop scheduling, close the session, and exit.
 
 If mandatory host metadata cannot be read, startup stops before a session is
 created. Errors retain operation and path context.
@@ -86,6 +93,6 @@ silently lost indefinitely.
 
 ## Phase boundary
 
-Phase 4 chooses only among existing Phase 3 intents and records dry-run audit.
-It does not invoke actuator apply, add a mutating public mode, tune compression,
-run models, or implement Phase 5.
+Phase 5 adds zram-only planning and guarded primitives. Observe mode never
+invokes them. It does not configure zswap, backing devices, writeback, disk
+tiering, KSM, DAMON, or any Phase 6 mechanism.

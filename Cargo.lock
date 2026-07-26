@@ -570,6 +570,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemor-zram"
+version = "0.1.0"
+dependencies = [
+ "nemor-common",
+ "nemor-policy-engine",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "nemorctl"
 version = "0.1.0"
 dependencies = [
@@ -580,6 +592,7 @@ dependencies = [
  "nemor-policy-engine",
  "nemor-storage",
  "nemor-test-support",
+ "nemor-zram",
  "serde",
  "serde_json",
 ]
@@ -597,6 +610,7 @@ dependencies = [
  "nemor-policy-engine",
  "nemor-storage",
  "nemor-test-support",
+ "nemor-zram",
  "nemorctl",
  "nix",
  "serde_json",

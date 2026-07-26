@@ -114,6 +114,17 @@ pub struct CompressionConfig {
     pub backend: String,
     pub preferred_low_latency: String,
     pub preferred_capacity: String,
+    pub enabled: bool,
+    pub active_profile: String,
+    pub dry_run: bool,
+    pub allow_runtime_reconfigure: bool,
+    pub allow_persistent_reconfigure: bool,
+    pub max_zram_percent_ram: u8,
+    pub safe_headroom_percent: u8,
+    pub benchmark_enabled: bool,
+    pub benchmark_max_bytes: u64,
+    pub max_cpu_overhead_percent: f64,
+    pub min_capacity_gain_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,16 +470,71 @@ impl Config {
                 "must be greater than zero",
             ));
         }
+        if self.compression.backend != "detect" {
+            return Err(validation(
+                "compression.backend",
+                "must be exactly `detect` during Phase 5",
+            ));
+        }
+        if !matches!(
+            self.compression.active_profile.as_str(),
+            "safe" | "gaming" | "capacity"
+        ) {
+            return Err(validation(
+                "compression.active_profile",
+                "must be safe, gaming, or capacity",
+            ));
+        }
+        for (field, value) in [
+            (
+                "compression.max_zram_percent_ram",
+                f64::from(self.compression.max_zram_percent_ram),
+            ),
+            (
+                "compression.safe_headroom_percent",
+                f64::from(self.compression.safe_headroom_percent),
+            ),
+            (
+                "compression.max_cpu_overhead_percent",
+                self.compression.max_cpu_overhead_percent,
+            ),
+            (
+                "compression.min_capacity_gain_percent",
+                self.compression.min_capacity_gain_percent,
+            ),
+        ] {
+            validate_percentage(field, value)?;
+        }
+        if self.compression.max_zram_percent_ram == 0 {
+            return Err(validation(
+                "compression.max_zram_percent_ram",
+                "must be greater than zero",
+            ));
+        }
+        if self.compression.benchmark_max_bytes == 0
+            || self.compression.benchmark_max_bytes > 268_435_456
+        {
+            return Err(validation(
+                "compression.benchmark_max_bytes",
+                "must be between 1 and 268435456 bytes",
+            ));
+        }
         if self.ksm.enabled {
-            return Err(validation("ksm.enabled", "must be false during Phase 3"));
+            return Err(validation(
+                "ksm.enabled",
+                "must remain false in the current implementation",
+            ));
         }
         if self.damon.enabled {
-            return Err(validation("damon.enabled", "must be false during Phase 3"));
+            return Err(validation(
+                "damon.enabled",
+                "must remain false in the current implementation",
+            ));
         }
         if self.damon.mode != "monitor_only" {
             return Err(validation(
                 "damon.mode",
-                "must be exactly `monitor_only` during Phase 3",
+                "must be exactly `monitor_only` in the current implementation",
             ));
         }
         Ok(())
@@ -727,6 +793,35 @@ mod tests {
         ] {
             let error = Config::from_toml(&changed(from, to)).expect_err("must reject interval");
             assert!(error.to_string().contains(field));
+        }
+    }
+
+    #[test]
+    fn validates_phase_five_compression_configuration() {
+        for (from, to, field) in [
+            (
+                "active_profile = \"safe\"",
+                "active_profile = \"fast\"",
+                "compression.active_profile",
+            ),
+            (
+                "max_zram_percent_ram = 100",
+                "max_zram_percent_ram = 0",
+                "compression.max_zram_percent_ram",
+            ),
+            (
+                "benchmark_max_bytes = 67108864",
+                "benchmark_max_bytes = 0",
+                "compression.benchmark_max_bytes",
+            ),
+            (
+                "max_cpu_overhead_percent = 2.0",
+                "max_cpu_overhead_percent = nan",
+                "compression.max_cpu_overhead_percent",
+            ),
+        ] {
+            let error = Config::from_toml(&changed(from, to)).expect_err("must reject zram field");
+            assert!(error.to_string().contains(field), "{error}");
         }
     }
 

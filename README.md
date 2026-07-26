@@ -3,7 +3,7 @@
 Nemor is an experimental Linux runtime for increasing sustainable memory
 capacity by coordinating kernel mechanisms conservatively. Its primary target
 is CachyOS/Linux. It does not promise a universal RAM multiplier: current
-operation is observe-only, and its Phase 4 decisions are deterministic rules,
+operation is observe-only, and its policy decisions are deterministic rules,
 not AI.
 
 ## Project Status
@@ -15,7 +15,8 @@ not AI.
 | Phase 2 | process/workload classification | ✅ Validated on CachyOS |
 | Phase 3 | cgroup v2 protection primitives | 🟡 Dev complete — privileged mutation validation pending |
 | Phase 4 | deterministic policy engine | ✅ Validated on CachyOS |
-| Phase 5 | compression experiments | ⚪ Planned |
+| Phase 5 | safe zram backend and profiles | 🟡 Dev complete — privileged mutation validation pending |
+| Phase 6 | disk-backed compression/tiering | ⚪ Planned |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
 development; ⚪ planned.
@@ -27,11 +28,12 @@ development; ⚪ planned.
 | Platform | CachyOS Linux, x86_64 |
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
-| Workspace crates | 9 |
-| Tests defined / executed | 122 / 122 |
-| Passed / failed / ignored | 122 / 0 / 0 |
+| Workspace crates | 10 |
+| Tests defined / executed | 140 / 140 |
+| Passed / failed / ignored | 140 / 0 / 0 |
 | Runtime mode | `observe` |
-| Validated implementation | current `main` (Phase 4 implementation commit) |
+| Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
+| Validated implementation | current `main` (Phase 5 implementation commit) |
 
 Linux tests include real `/proc`/`/sys` reads and real SIGINT/SIGTERM delivery.
 Privileged cgroup mutation is explicitly outside this validated snapshot.
@@ -41,12 +43,12 @@ Privileged cgroup mutation is explicitly outside this validated snapshot.
 Release `nemord` was sampled on the validation host 15 times at two-second
 intervals using `/proc/<pid>/stat`, `status`, and `smaps_rollup`.
 
-| Metric | Phase 3 | Phase 4 |
-|---|---:|---:|
-| Mean CPU (one logical CPU) | 0.1990% | 0.199249% |
-| Maximum interval CPU | 0.4976% | 0.996093% |
-| Maximum RSS | ~7.03 MiB | ~7.34 MiB |
-| PSS | ~4.70 MiB | ~4.99 MiB |
+| Metric | Phase 3 | Phase 4 | Phase 5 |
+|---|---:|---:|---:|
+| Mean CPU (one logical CPU) | 0.1990% | 0.199249% | 0.212940% |
+| Maximum interval CPU | 0.4976% | 0.996093% | 0.496909% |
+| Maximum RSS | ~7.03 MiB | ~7.34 MiB | ~7.32 MiB |
+| PSS | ~4.70 MiB | ~4.99 MiB | ~5.00 MiB |
 
 These are host-specific validation measurements, not universal benchmarks.
 The mean CPU is unchanged within measurement noise; memory increased modestly.
@@ -60,6 +62,8 @@ The mean CPU is unchanged within measurement noise; memory increased modestly.
   crash-recovery machinery;
 - deterministic six-state pressure engine with explicit time, hysteresis,
   versioned explanations and a closed action planner;
+- zram inventory, real compression metrics, safe/gaming/capacity plans,
+  bounded benchmark machinery, ownership/headroom guards, rollback and recovery;
 - SQLite WAL audit, retention, deduplicated policy decisions, and bounded
   read-only history;
 - foreground daemon with clean SIGINT/SIGTERM lifecycle;
@@ -88,6 +92,9 @@ nemorctl workload latest
 nemorctl cgroups status
 nemorctl policy status
 nemorctl policy latest
+nemorctl zram status
+nemorctl zram profiles
+nemorctl zram report latest
 ```
 
 Every command accepts `--json` at its terminal command position and reads only
@@ -122,13 +129,16 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
   Steam/Proton/Wine/Gamescope combination;
 - SteamOS is not supported;
 - policy operation is dry-run only;
-- no ML, GUI, or Phase 5 compression experiment exists.
+- isolated Phase 5 benchmark and mutations lack delegated kernel privileges;
+- no ML or GUI exists;
+- zswap, writeback/backing devices, disk tiering, and Phase 6 are unavailable.
 
 ## Roadmap
 
 - Completed and validated: Phases 0–2 and deterministic Phase 4 observe logic.
-- Validation pending: isolated privileged Phase 3 cgroup mutation.
-- Next: Phase 5 only after a separate approved scope.
+- Validation pending: isolated privileged Phase 3 cgroup and Phase 5 zram
+  mutations.
+- Next: Phase 6 only after a separate approved scope.
 - Future work remains unavailable until implemented and measured.
 
 ## Documentation
@@ -138,6 +148,7 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - [Classification](docs/classification.md)
 - [Cgroups](docs/cgroups.md)
 - [Policy engine](docs/policy-engine.md)
+- [Zram backend](docs/zram.md)
 - [Safety model](docs/safety-model.md)
 - [Database](docs/database.md)
 - [CachyOS validation](docs/cachyos-validation.md)
@@ -148,4 +159,5 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 |---|---:|---|---|
 | 0–2 | 90 | CachyOS | `ae06b19` |
 | 3 | 106 | Partial — privileged mutations pending | `b335e2c` |
-| 4 | 122 | CachyOS observe validation | current `main` |
+| 4 | 122 | CachyOS observe validation | `7a1d180` |
+| 5 | 140 | CachyOS read-only; privileged mutations pending | current implementation commit |

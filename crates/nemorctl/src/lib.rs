@@ -11,6 +11,7 @@ use policy_engine::{
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::Path;
+use zram::{CompressionMetrics, ZramAuditReport, ZramProfile, ZramProfilePlan};
 
 #[derive(Debug, Clone)]
 pub struct DoctorEnvironment {
@@ -223,6 +224,106 @@ pub fn policy_status(config_path: &Path) -> Result<PolicyStatus> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZramDeviceStatus {
+    pub inventory: zram::DeviceInventory,
+    pub metrics: CompressionMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZramStatus {
+    pub available: bool,
+    pub devices: Vec<ZramDeviceStatus>,
+    pub enabled: bool,
+    pub dry_run: bool,
+    pub rollback_pending: bool,
+    pub recovery_pending: bool,
+}
+
+pub fn zram_status(config_path: &Path) -> Result<ZramStatus> {
+    let loaded = LoadedConfig::load(config_path).context("invalid zram status configuration")?;
+    let inventory = zram::inspect_linux(Path::new("/"))?;
+    Ok(ZramStatus {
+        available: inventory.available,
+        devices: inventory
+            .devices
+            .into_iter()
+            .map(|inventory| ZramDeviceStatus {
+                metrics: inventory.metrics(),
+                inventory,
+            })
+            .collect(),
+        enabled: loaded.config.compression.enabled,
+        dry_run: loaded.config.general.mode == "observe" || loaded.config.compression.dry_run,
+        rollback_pending: false,
+        recovery_pending: false,
+    })
+}
+
+pub fn zram_profiles(config_path: &Path) -> Result<Vec<ZramProfilePlan>> {
+    let loaded = LoadedConfig::load(config_path).context("invalid zram profile configuration")?;
+    let inventory = zram::inspect_linux(Path::new("/"))?;
+    let (total_ram_bytes, available_bytes) = read_memory_capacity()?;
+    Ok(inventory
+        .devices
+        .iter()
+        .flat_map(|device| {
+            [
+                ZramProfile::Safe,
+                ZramProfile::Gaming,
+                ZramProfile::Capacity,
+            ]
+            .map(|requested| {
+                zram::plan_profile(
+                    &zram::ProfileContext {
+                        requested,
+                        device,
+                        benchmarks: &[],
+                        total_ram_bytes,
+                        mem_available_bytes: available_bytes,
+                        current_used_bytes: device.mm_stat.mem_used_total.unwrap_or(0),
+                        pressure_state: PressureState::Watch,
+                        psi_full_avg10: None,
+                        swap_in_per_second: None,
+                        gaming: requested == ZramProfile::Gaming,
+                        pressure_worsening: false,
+                        safety_events: 0,
+                        rollback_pending: false,
+                        provider_matches_snapshot: true,
+                    },
+                    &loaded.config.compression,
+                    &loaded.config.general.mode,
+                )
+            })
+        })
+        .collect())
+}
+
+pub fn zram_report_latest(config_path: &Path) -> Result<ZramAuditReport> {
+    let loaded = LoadedConfig::load(config_path).context("invalid zram report configuration")?;
+    let snapshot = storage::latest_configuration_snapshot(
+        &loaded.config.general.database_path,
+        zram::AUDIT_REASON,
+    )?;
+    serde_json::from_str(&snapshot.system_values_json).context("invalid stored zram audit JSON")
+}
+
+fn read_memory_capacity() -> Result<(u64, u64)> {
+    let input = fs::read_to_string("/proc/meminfo").context("cannot read /proc/meminfo")?;
+    let read = |name: &str| -> Result<u64> {
+        input
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|value| value.split_whitespace().next())
+            .context("required meminfo field is unavailable")?
+            .parse::<u64>()
+            .context("invalid meminfo value")?
+            .checked_mul(1024)
+            .context("meminfo value overflow")
+    };
+    Ok((read("MemTotal:")?, read("MemAvailable:")?))
+}
+
 pub fn render_doctor(report: &DoctorReport, json: bool) -> Result<String> {
     if json {
         return serde_json::to_string_pretty(report).context("cannot serialize doctor report");
@@ -407,6 +508,13 @@ pub fn render_policy_latest(report: &storage::LatestPolicyDecision, json: bool) 
         report.audit.dry_run,
         report.model_version.as_deref().unwrap_or("none"),
     ))
+}
+
+pub fn render_zram<T: Serialize + std::fmt::Debug>(report: &T, json: bool) -> Result<String> {
+    if json {
+        return serde_json::to_string_pretty(report).context("cannot serialize zram output");
+    }
+    Ok(format!("{report:#?}\n"))
 }
 
 fn optional_u64(value: Option<u64>) -> String {

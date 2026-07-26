@@ -76,4 +76,16 @@ changes, and configured heartbeat are persisted. `input_features_json` and
 `NULL`. Latest/history reads are limited to at most 100 rows.
 
 `action_results` stays empty for dry-run decisions because no action was
-executed. Benchmark and model registry tables remain unused.
+executed.
+
+## Zram audit
+
+Phase 5 needs no migration 0005. Typed zram observe reports are stored in the
+existing `configuration_snapshots` table with reason `zram_observe_audit`.
+They include the inventory, compression metrics inputs, profile plans,
+benchmark evidence, and rollback/recovery flags. Latest reads open SQLite
+read-only.
+
+The existing `benchmark_runs`/`benchmark_metrics` schema is sufficient.
+Isolated results retain a real-versus-simulated marker; simulated fixture data
+cannot be reported as a kernel benchmark. The model registry remains unused.

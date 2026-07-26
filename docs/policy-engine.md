@@ -29,8 +29,11 @@ expected gain, and expected cost remain `NULL`; Phase 4 contains no ML.
 
 The closed action vocabulary is `NoAction`, `PrepareForegroundProtection`,
 `ProtectForeground`, `ApplyBackgroundSoftLimit`, and
-`RollbackCgroupMeasures`. Unsupported actions are structured rejections.
-There is no zram/zswap tuning, sysctl, reclaim, freezer, process signal,
+`RollbackCgroupMeasures`, plus `SelectZramProfile` with exactly
+`safe`/`gaming`/`capacity`. The latter is a non-mutating intent; `nemor-zram`
+performs its own evidence, ownership, headroom and pressure validation.
+Unsupported actions are structured rejections.
+There is no zswap tuning, sysctl, reclaim, freezer, process signal,
 `MemoryMax`, `MemorySwapMax`, KSM, DAMON, or future placeholder.
 
 Policy expresses intent; concrete targets still pass the Phase 3 actuator’s
@@ -48,5 +51,7 @@ a configured heartbeat. Identical audits are deduplicated deterministically.
 `action_results` receives no simulated successes. History reads are capped at
 100 rows. `nemorctl policy status` and `policy latest` are read-only.
 
-Phase 5 remains unimplemented: no compression profiles, tuning experiments,
-learning system, or new actuator is present.
+Normal selects safe/current, gaming selects the gaming intent without allowing
+a risky live switch, pressure may request capacity analysis, and
+critical/emergency/stabilizing retain safe/current. Observe stops after typed
+planning and persistence. No learning system or Phase 6 mechanism is present.

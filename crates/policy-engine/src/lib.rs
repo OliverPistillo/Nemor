@@ -10,7 +10,7 @@ pub mod policy;
 pub mod state;
 pub mod transition;
 
-pub use action::{ActionKind, PlannedAction, RejectedAction};
+pub use action::{ActionKind, PlannedAction, RejectedAction, ZramProfileIntent};
 pub use error::PolicyError;
 pub use explanation::{CandidateRejection, PolicyEvidence};
 pub use features::{CounterSample, PolicyInput, RateFeatures, RateTracker};

@@ -67,6 +67,17 @@ decision_heartbeat_seconds = 300
 backend = "detect"
 preferred_low_latency = "lz4"
 preferred_capacity = "zstd"
+enabled = true
+active_profile = "safe"
+dry_run = true
+allow_runtime_reconfigure = false
+allow_persistent_reconfigure = false
+max_zram_percent_ram = 100
+safe_headroom_percent = 15
+benchmark_enabled = false
+benchmark_max_bytes = 67108864
+max_cpu_overhead_percent = 2.0
+min_capacity_gain_percent = 10.0
 
 [ksm]
 enabled = false
