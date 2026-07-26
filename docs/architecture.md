@@ -1,4 +1,4 @@
-# Phase 2 architecture
+# Phase 3 architecture
 
 ## Crate boundaries
 
@@ -16,8 +16,13 @@ safe signatures, process categories, foreground tri-state, gaming evidence,
 workload precedence, explanations, confidence, and transition stabilization.
 It has no filesystem writes and no actuator dependency.
 
+`actuator` owns cgroup v2 capability inspection, explainable authorization
+plans, the fixed Nemor group namespace, a deterministic fake backend, guarded
+Linux primitives, snapshots, readback verification, rollback, and recovery.
+It does not select policies.
+
 `storage` owns SQLite connections. It enables WAL and foreign keys, verifies
-three versioned migrations, inserts system samples, atomically upserts process
+four versioned migrations, inserts system samples, atomically upserts process
 catalog entries with classified samples and workload changes, executes
 transactional retention, and produces read-only latest-session reports.
 
@@ -40,7 +45,7 @@ snapshot helpers used only by tests. It contains no production behavior.
 3. Compute SHA-256 over those exact bytes.
 4. Initialize structured stdout/stderr logging.
 5. Open SQLite, set connection PRAGMAs, and transactionally verify or apply
-   migrations 1, 2, and 3.
+   migrations 1 through 4.
 6. Read mandatory host metadata once and upsert it by machine ID.
 7. Insert an `observe` session with the real crate version, configuration hash,
    UTC start time, and `clean_shutdown = 0`.
@@ -73,7 +78,6 @@ silently lost indefinitely.
 
 ## Phase boundary
 
-The schema preserves explicitly supplied contracts for later phases. Phase 2
-classifies workloads but does not choose policies, run models, benchmark, or
-apply actions. There is no policy-engine or actuator crate and no path that
-changes Linux memory, kernel, cgroup, compression, KSM, or DAMON state.
+Phase 3 supplies controlled primitives but does not choose policies, run
+models, benchmark, or enable mutations in observe mode. There is no
+policy-engine crate and no Phase 4 state machine.

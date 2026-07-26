@@ -1,14 +1,15 @@
 # Nemor
 
 Nemor is an observe-only telemetry service for CachyOS and other Arch
-Linux systems. Phase 2 adds deterministic workload classification to the
+Linux systems. Phase 3 adds fail-closed cgroup v2 planning and reversible
+primitives to the
 read-only Phase 1 telemetry pipeline. It records explainable process categories
 and stabilized session workload changes, but does not choose policies, optimize
 memory, or change Linux state.
 
-## Phase 2 status
+## Phase 3 status
 
-The workspace contains seven Rust crates:
+The workspace contains eight Rust crates:
 
 - `common`: configuration, validation, shared serializable types, injectable
   Linux paths, and one-time host metadata reads.
@@ -17,6 +18,8 @@ The workspace contains seven Rust crates:
   and per-process CPU deltas.
 - `classifier`: deterministic process categorization, foreground tri-state,
   gaming evidence, nine workload classes, explanations, and stabilization.
+- `actuator`: cgroup v2 capability inspection, explainable plans, simulated
+  verification, Linux primitives, snapshots, rollback, and recovery.
 - `storage`: SQLite connection setup, migration verification, and host/session
   plus telemetry/catalog/workload-event/retention repositories.
 - `nemord`: foreground daemon, sampling loop, and signal-driven shutdown.
@@ -73,7 +76,11 @@ cargo run -p nemorctl -- --config "$workdir/config.toml" report latest
 cargo run -p nemorctl -- --config "$workdir/config.toml" report latest --json
 cargo run -p nemorctl -- --config "$workdir/config.toml" workload latest
 cargo run -p nemorctl -- --config "$workdir/config.toml" workload latest --json
+cargo run -p nemorctl -- --config "$workdir/config.toml" cgroups status --json
 ```
+
+The cgroup command is read-only. Defaults disable cgroups and force dry-run
+behavior; see [`docs/cgroups.md`](docs/cgroups.md).
 
 `doctor` reports `pass`, `warn`, or `fail` for Linux prerequisites. Missing PSI
 or cgroups v2 support is a warning in Phase 2: PSI is an optional collector
@@ -120,10 +127,10 @@ enabled automatically, so no enable/disable action is part of Phase 2.
 
 ## Limitations
 
-Phase 2 intentionally does not implement:
+Phase 3 intentionally does not implement:
 
 - policy decisions or a pressure state machine;
-- memory actuators or automatic actions;
+- policy selection or automatic actions;
 - kernel, sysctl, cgroup, zram, zswap, DAMON, or KSM changes;
 - AI training, inference, or model activation;
 - benchmarks;

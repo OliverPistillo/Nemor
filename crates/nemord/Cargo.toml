@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+actuator = { package = "nemor-actuator", path = "../actuator" }
 anyhow.workspace = true
 clap.workspace = true
 collector = { package = "nemor-collector", path = "../collector" }

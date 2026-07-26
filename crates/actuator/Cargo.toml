@@ -1,23 +1,18 @@
 [package]
-name = "nemor-storage"
+name = "nemor-actuator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-chrono.workspace = true
-collector = { package = "nemor-collector", path = "../collector" }
 classifier = { package = "nemor-classifier", path = "../classifier" }
-actuator = { package = "nemor-actuator", path = "../actuator" }
+collector = { package = "nemor-collector", path = "../collector" }
 common = { package = "nemor-common", path = "../common" }
-hex.workspace = true
-rusqlite.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

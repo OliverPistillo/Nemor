@@ -27,6 +27,12 @@ transactional. It adds only nullable `process_samples.foreground_state`, needed
 to distinguish `foreground`, `background`, and `unknown`, plus the
 session/time workload-event index. Migrations 1 and 2 remain unchanged.
 
+Migration 4 (`0004_cgroups.sql`) adds `cgroup_snapshots` and
+`cgroup_managed_groups`. It records session, stable catalog identity,
+PID/start ticks, original placement and properties, requested properties,
+verification, error, recovery, and rollback state. Migrations 0001–0003 remain
+unchanged, and no Phase 4 policy record is synthesized.
+
 ## Active records
 
 `hosts` stores one logical record per `machine_id`. Each valid startup refreshes
@@ -63,6 +69,6 @@ written transactionally per batch. The workload CLI opens SQLite read-only.
 
 ## Reserved contract tables
 
-Policy decision, action result, benchmark, model registry, safety event, and
-configuration snapshot tables remain reserved parts of the supplied schema
-contract. Phase 2 does not insert into or query them.
+Policy decision, action result, benchmark, and model registry tables remain
+reserved parts of the supplied schema contract. Phase 3 does not synthesize
+policy decisions.

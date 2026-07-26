@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use actuator::{CgroupBackend, LinuxCgroupBackend};
 use anyhow::{Context, Result};
 use clap::Parser;
 use common::{HostMetadata, LinuxPaths, LoadedConfig};
@@ -61,6 +62,33 @@ async fn run(loaded: LoadedConfig) -> Result<()> {
         mode = %loaded.config.general.mode,
         "validated configuration loaded"
     );
+
+    let cgroup_backend = LinuxCgroupBackend::default();
+    match cgroup_backend.capabilities() {
+        Ok(capabilities) => {
+            info!(
+                event = "cgroup_capability_detected",
+                cgroup_v2 = capabilities.cgroup_v2,
+                memory_controller = capabilities.memory_controller,
+                writable = capabilities.writable,
+                backend = "linux_cgroupfs",
+                "cgroup v2 capabilities inspected read-only"
+            );
+            if loaded.config.general.mode == "observe" {
+                info!(
+                    event = "cgroup_mutation_blocked_by_observe",
+                    configured_enabled = loaded.config.cgroups.enabled,
+                    configured_dry_run = loaded.config.cgroups.dry_run,
+                    "observe mode permits cgroup planning only"
+                );
+            }
+        }
+        Err(error) => info!(
+            event = "cgroup_capability_unavailable",
+            error = %error,
+            "cgroup actuator remains fail-closed"
+        ),
+    }
 
     let mut storage = Storage::open(&loaded.config.general.database_path).with_context(|| {
         format!(

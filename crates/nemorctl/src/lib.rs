@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use actuator::{BackendKind, CgroupBackend, CgroupStatus, LinuxCgroupBackend};
 use anyhow::{Context, Result};
 use common::{
     CheckResult, CheckStatus, DoctorReport, LinuxPaths, LoadedConfig, StatusReport, StatusState,
@@ -144,6 +145,32 @@ pub fn workload_latest(config_path: &Path) -> Result<storage::LatestWorkloadRepo
     storage::latest_workload_report(&loaded.config.general.database_path)
 }
 
+pub fn cgroups_status(config_path: &Path) -> Result<CgroupStatus> {
+    let loaded = LoadedConfig::load(config_path).with_context(|| {
+        format!(
+            "cgroups status input configuration {} is invalid",
+            config_path.display()
+        )
+    })?;
+    let backend = LinuxCgroupBackend::default();
+    let capabilities = backend.capabilities()?;
+    let stored = storage::inspect_cgroup_status(&loaded.config.general.database_path)?;
+    Ok(CgroupStatus {
+        cgroup_v2: capabilities.cgroup_v2,
+        memory_controller: capabilities.memory_controller,
+        enabled: loaded.config.cgroups.enabled,
+        dry_run: loaded.config.general.mode == "observe"
+            || loaded.config.cgroups.dry_run
+            || !loaded.config.cgroups.enabled,
+        backend: BackendKind::LinuxCgroupfs,
+        managed_groups: stored.managed_groups,
+        assignments: stored.assignments,
+        rollback_pending: stored.rollback_pending,
+        stale_recovery_state: stored.stale_recovery_state,
+        last_safety_error: stored.last_safety_error,
+    })
+}
+
 pub fn render_doctor(report: &DoctorReport, json: bool) -> Result<String> {
     if json {
         return serde_json::to_string_pretty(report).context("cannot serialize doctor report");
@@ -269,6 +296,26 @@ pub fn render_workload(report: &storage::LatestWorkloadReport, json: bool) -> Re
         report.critical_processes,
         report.unknown_processes,
         report.message,
+    ))
+}
+
+pub fn render_cgroups_status(report: &CgroupStatus, json: bool) -> Result<String> {
+    if json {
+        return serde_json::to_string_pretty(report)
+            .context("cannot serialize cgroup status report");
+    }
+    Ok(format!(
+        "Cgroup v2: {}\nMemory controller: {}\nEnabled: {}\nDry run: {}\nBackend: {:?}\nManaged groups: {}\nAssignments: {}\nRollback pending: {}\nStale recovery state: {}\nLast safety error: {}\n",
+        report.cgroup_v2,
+        report.memory_controller,
+        report.enabled,
+        report.dry_run,
+        report.backend,
+        report.managed_groups,
+        report.assignments,
+        report.rollback_pending,
+        report.stale_recovery_state,
+        report.last_safety_error.as_deref().unwrap_or("none"),
     ))
 }
 
@@ -457,6 +504,22 @@ mod tests {
             .find(|check| check.name == "distribution")
             .expect("distribution result");
         assert_eq!(distribution.details.as_deref(), Some("id=cachyos"));
+    }
+
+    #[test]
+    fn cgroup_status_is_read_only_and_reports_safe_defaults() {
+        let fixture = LinuxFixture::compatible().expect("fixture");
+        let before = snapshot_files(fixture.root()).expect("before");
+        let report = cgroups_status(fixture.config_path()).expect("cgroup status");
+        assert!(!report.enabled);
+        assert!(report.dry_run);
+        assert_eq!(report.managed_groups, 0);
+        assert_eq!(report.assignments, 0);
+        let json = render_cgroups_status(&report, true).expect("JSON");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["backend"], "linux_cgroupfs");
+        let after = snapshot_files(fixture.root()).expect("after");
+        assert_eq!(before, after);
     }
 
     #[test]

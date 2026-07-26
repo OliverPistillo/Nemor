@@ -10,6 +10,7 @@ use thiserror::Error;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub general: GeneralConfig,
+    pub cgroups: CgroupsConfig,
     pub telemetry: TelemetryConfig,
     pub classification: ClassificationConfig,
     pub safety: SafetyConfig,
@@ -18,6 +19,22 @@ pub struct Config {
     pub ksm: KsmConfig,
     pub damon: DamonConfig,
     pub gaming: GamingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CgroupsConfig {
+    pub enabled: bool,
+    pub dry_run: bool,
+    pub allow_move: bool,
+    pub rollback_on_exit: bool,
+    pub recover_unclean_session: bool,
+    pub foreground_min_percent: u8,
+    pub foreground_max_percent: u8,
+    pub background_high_min_percent: u8,
+    pub background_high_max_percent: u8,
+    pub minimum_headroom_percent: u8,
+    pub allowed_identities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,14 +172,71 @@ impl Config {
         if self.general.mode != "observe" {
             return Err(validation(
                 "general.mode",
-                "must be exactly `observe` during Phase 2",
+                "must be exactly `observe` during Phase 3",
             ));
         }
         if self.general.allow_automatic_actions {
             return Err(validation(
                 "general.allow_automatic_actions",
-                "must be false during Phase 2",
+                "must be false during Phase 3",
             ));
+        }
+        for (field, value) in [
+            (
+                "cgroups.foreground_min_percent",
+                self.cgroups.foreground_min_percent,
+            ),
+            (
+                "cgroups.foreground_max_percent",
+                self.cgroups.foreground_max_percent,
+            ),
+            (
+                "cgroups.background_high_min_percent",
+                self.cgroups.background_high_min_percent,
+            ),
+            (
+                "cgroups.background_high_max_percent",
+                self.cgroups.background_high_max_percent,
+            ),
+            (
+                "cgroups.minimum_headroom_percent",
+                self.cgroups.minimum_headroom_percent,
+            ),
+        ] {
+            validate_percentage(field, f64::from(value))?;
+        }
+        if self.cgroups.foreground_min_percent > self.cgroups.foreground_max_percent {
+            return Err(validation(
+                "cgroups.foreground_min_percent",
+                "must not exceed cgroups.foreground_max_percent",
+            ));
+        }
+        if self.cgroups.background_high_min_percent > self.cgroups.background_high_max_percent {
+            return Err(validation(
+                "cgroups.background_high_min_percent",
+                "must not exceed cgroups.background_high_max_percent",
+            ));
+        }
+        if u16::from(self.cgroups.foreground_max_percent)
+            + u16::from(self.cgroups.minimum_headroom_percent)
+            > 100
+        {
+            return Err(validation(
+                "cgroups.minimum_headroom_percent",
+                "foreground maximum plus headroom must not exceed 100 percent",
+            ));
+        }
+        for identity in &self.cgroups.allowed_identities {
+            if identity.len() != 64
+                || !identity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(validation(
+                    "cgroups.allowed_identities",
+                    "entries must be lowercase SHA-256 identities",
+                ));
+            }
         }
         if self.general.database_path.as_os_str().is_empty() {
             return Err(validation("general.database_path", "must not be empty"));
@@ -325,15 +399,15 @@ impl Config {
             self.pressure.psi_full_avg10_threshold,
         )?;
         if self.ksm.enabled {
-            return Err(validation("ksm.enabled", "must be false during Phase 2"));
+            return Err(validation("ksm.enabled", "must be false during Phase 3"));
         }
         if self.damon.enabled {
-            return Err(validation("damon.enabled", "must be false during Phase 2"));
+            return Err(validation("damon.enabled", "must be false during Phase 3"));
         }
         if self.damon.mode != "monitor_only" {
             return Err(validation(
                 "damon.mode",
-                "must be exactly `monitor_only` during Phase 2",
+                "must be exactly `monitor_only` during Phase 3",
             ));
         }
         Ok(())
@@ -395,6 +469,33 @@ mod tests {
         let config = Config::from_toml(DEFAULT).expect("default configuration should parse");
         assert_eq!(config.general.mode, "observe");
         assert!(!config.general.allow_automatic_actions);
+        assert!(!config.cgroups.enabled);
+        assert!(config.cgroups.dry_run);
+        assert!(!config.cgroups.allow_move);
+    }
+
+    #[test]
+    fn rejects_invalid_cgroup_bounds_and_allow_list() {
+        for (from, to, field) in [
+            (
+                "foreground_min_percent = 5",
+                "foreground_min_percent = 41",
+                "cgroups.foreground_min_percent",
+            ),
+            (
+                "minimum_headroom_percent = 10",
+                "minimum_headroom_percent = 61",
+                "cgroups.minimum_headroom_percent",
+            ),
+            (
+                "allowed_identities = []",
+                "allowed_identities = [\"pid-123\"]",
+                "cgroups.allowed_identities",
+            ),
+        ] {
+            let error = Config::from_toml(&changed(from, to)).expect_err("must reject value");
+            assert!(error.to_string().contains(field));
+        }
     }
 
     #[test]

@@ -481,6 +481,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemor-actuator"
+version = "0.1.0"
+dependencies = [
+ "nemor-classifier",
+ "nemor-collector",
+ "nemor-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "nemor-classifier"
 version = "0.1.0"
 dependencies = [
@@ -521,6 +534,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
+ "nemor-actuator",
  "nemor-classifier",
  "nemor-collector",
  "nemor-common",
@@ -548,6 +562,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nemor-actuator",
  "nemor-common",
  "nemor-storage",
  "nemor-test-support",
@@ -560,6 +575,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nemor-actuator",
  "nemor-classifier",
  "nemor-collector",
  "nemor-common",

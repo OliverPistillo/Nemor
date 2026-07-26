@@ -1,24 +1,33 @@
-# Phase 2 safety model
+# Phase 3 safety model
 
 The only valid mode is exactly `observe`.
 `general.allow_automatic_actions`, `ksm.enabled`, and `damon.enabled` must all be
 false, while `damon.mode` must remain `monitor_only`. Invalid values stop startup
 before the database or a session is created.
 
-There is no actuator crate, trait, command, or alternate profile. Production
+The actuator crate adds controlled primitives but no alternate profile.
+Production
 collection opens Linux telemetry files with read-only standard-library calls.
 It enumerates `/proc` and `/sys/block` and reads `/proc/<pid>/exe` links, but
 never opens a kernel interface for
 write, never mounts debugfs, and has no fixture override in the installed
-daemon. Nothing writes `/proc`,
-`/sys`, cgroupfs, sysctl, zram, zswap, DAMON, KSM, or any kernel parameter.
+daemon. Observe mode writes neither cgroupfs nor any other kernel interface.
 
 The systemd unit uses a dynamic unprivileged user, an empty capability and
 ambient-capability set, no-new-privileges, a strict read-only filesystem, and a
 single writable state directory. Home, devices, kernel modules, kernel tunables,
 and cgroups are protected, and IP networking is denied. This privilege model
-must be explicitly reconsidered before a future actuator or cgroup feature;
-Phase 2 grants no dormant privilege for them.
+must be explicitly reconsidered before a privileged cgroup deployment; Phase 3
+grants no dormant privilege.
+
+PID moves require an explicit stable SHA-256 identity allow-list entry and a
+fresh PID/starttime match. Unknown identities are never moved. Only fixed
+Nemor-owned groups and `memory.low`/`memory.high` are mutable. Rollback never
+signals, freezes, suspends, or terminates a process.
+
+Phase 3 never writes `memory.max`, `memory.swap.max`, `memory.reclaim`, freezer,
+sysctl, zram/zswap, KSM, or DAMON state and never shells out to system
+administration commands.
 
 Classification is data-only. It cannot signal a process, change priority,
 reclaim memory, create a cgroup, or write a kernel setting. Unknown identities,

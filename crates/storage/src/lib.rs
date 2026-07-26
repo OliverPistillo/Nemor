@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use actuator::{ActuatorError, BackendKind, MutationSnapshot, SnapshotStore};
 use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use classifier::{
@@ -13,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const MIGRATION_VERSION: i64 = 3;
+pub const MIGRATION_VERSION: i64 = 4;
 pub const INITIAL_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0001_initial.sql"
@@ -25,6 +26,10 @@ pub const TELEMETRY_MIGRATION: &str = include_str!(concat!(
 pub const CLASSIFIER_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0003_workload_classifier.sql"
+));
+pub const CGROUP_MIGRATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0004_cgroups.sql"
 ));
 
 pub struct Storage {
@@ -65,10 +70,39 @@ impl Storage {
         &self.connection
     }
 
+    pub fn record_cgroup_safety_event(
+        &self,
+        session_id: Option<i64>,
+        timestamp_ns: i64,
+        severity: &str,
+        event_type: &str,
+        message: &str,
+        context_json: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(severity, "info" | "warning" | "error") || !event_type.starts_with("cgroup_") {
+            bail!("invalid cgroup safety event");
+        }
+        self.connection.execute(
+            "INSERT INTO safety_events (
+                session_id, timestamp_ns, severity, event_type, message, context_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id,
+                timestamp_ns,
+                severity,
+                event_type,
+                message,
+                context_json
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn migrate(&mut self) -> Result<()> {
         self.apply_migration(1, INITIAL_MIGRATION, true)?;
         self.apply_migration(2, TELEMETRY_MIGRATION, false)?;
-        self.apply_migration(3, CLASSIFIER_MIGRATION, false)
+        self.apply_migration(3, CLASSIFIER_MIGRATION, false)?;
+        self.apply_migration(4, CGROUP_MIGRATION, false)
     }
 
     pub fn migrate_source(&mut self, source: &str) -> Result<()> {
@@ -934,6 +968,208 @@ pub fn migration_checksum(source: &str) -> String {
     hex::encode(Sha256::digest(source.as_bytes()))
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CgroupStorageStatus {
+    pub managed_groups: usize,
+    pub assignments: usize,
+    pub rollback_pending: usize,
+    pub stale_recovery_state: usize,
+    pub last_safety_error: Option<String>,
+}
+
+pub fn inspect_cgroup_status(path: impl AsRef<Path>) -> Result<CgroupStorageStatus> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(CgroupStorageStatus::default());
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("cannot open database {} read-only", path.display()))?;
+    let has_schema: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cgroup_snapshots')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_schema {
+        return Ok(CgroupStorageStatus::default());
+    }
+    let managed_groups = connection.query_row(
+        "SELECT COUNT(*) FROM cgroup_managed_groups WHERE owned_by_nemor = 1",
+        [],
+        |row| row.get::<_, usize>(0),
+    )?;
+    let assignments = connection.query_row(
+        "SELECT COUNT(*) FROM cgroup_snapshots WHERE applied = 1 AND rolled_back = 0",
+        [],
+        |row| row.get::<_, usize>(0),
+    )?;
+    let rollback_pending = connection.query_row(
+        "SELECT COUNT(*) FROM cgroup_snapshots WHERE applied = 1 AND rolled_back = 0",
+        [],
+        |row| row.get::<_, usize>(0),
+    )?;
+    let stale_recovery_state = connection.query_row(
+        "SELECT COUNT(*) FROM cgroup_snapshots
+         WHERE rolled_back = 0 AND last_error IS NOT NULL",
+        [],
+        |row| row.get::<_, usize>(0),
+    )?;
+    let last_safety_error = connection
+        .query_row(
+            "SELECT message FROM safety_events
+             WHERE event_type LIKE 'cgroup_%' AND severity IN ('warning', 'error')
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(CgroupStorageStatus {
+        managed_groups,
+        assignments,
+        rollback_pending,
+        stale_recovery_state,
+        last_safety_error,
+    })
+}
+
+impl SnapshotStore for Storage {
+    fn persist(&mut self, snapshot: MutationSnapshot) -> Result<u64, ActuatorError> {
+        let original_properties = serde_json::to_string(&snapshot.original_properties)
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?;
+        let requested_properties = serde_json::to_string(&snapshot.requested_properties)
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?;
+        self.connection
+            .execute(
+                "INSERT INTO cgroup_snapshots (
+                    session_id, timestamp_ns, process_catalog_id, identity, pid,
+                    start_time_ticks, original_group, target_group,
+                    original_properties_json, requested_properties_json, reason,
+                    applied, verified, rolled_back, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    snapshot.session_id,
+                    snapshot.timestamp_ns,
+                    snapshot.process_catalog_id,
+                    snapshot.identity,
+                    i64::from(snapshot.pid),
+                    i64::try_from(snapshot.start_time_ticks).map_err(|_| {
+                        ActuatorError::Persistence("start ticks overflow".to_owned())
+                    })?,
+                    snapshot.original_group,
+                    snapshot.target_group,
+                    original_properties,
+                    requested_properties,
+                    snapshot.reason,
+                    snapshot.applied,
+                    snapshot.verified,
+                    snapshot.rolled_back,
+                    snapshot.last_error,
+                ],
+            )
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?;
+        u64::try_from(self.connection.last_insert_rowid())
+            .map_err(|_| ActuatorError::Persistence("snapshot id is negative".to_owned()))
+    }
+
+    fn update(&mut self, snapshot: &MutationSnapshot) -> Result<(), ActuatorError> {
+        self.connection
+            .execute(
+                "UPDATE cgroup_snapshots SET applied=?1, verified=?2, rolled_back=?3,
+                    last_error=?4 WHERE id=?5",
+                params![
+                    snapshot.applied,
+                    snapshot.verified,
+                    snapshot.rolled_back,
+                    snapshot.last_error,
+                    i64::try_from(snapshot.id).map_err(|_| ActuatorError::Persistence(
+                        "snapshot id overflow".to_owned()
+                    ))?,
+                ],
+            )
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    fn pending(&self) -> Result<Vec<MutationSnapshot>, ActuatorError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, session_id, timestamp_ns, process_catalog_id, identity, pid,
+                    start_time_ticks, original_group, target_group,
+                    original_properties_json, requested_properties_json, reason,
+                    applied, verified, rolled_back, last_error
+                 FROM cgroup_snapshots WHERE applied=1 AND rolled_back=0 ORDER BY id",
+            )
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?;
+        let mut snapshots = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?
+        {
+            let original: String = row.get(9).map_err(db_persistence)?;
+            let requested: String = row.get(10).map_err(db_persistence)?;
+            snapshots.push(MutationSnapshot {
+                id: row.get(0).map_err(db_persistence)?,
+                session_id: row.get(1).map_err(db_persistence)?,
+                timestamp_ns: row.get(2).map_err(db_persistence)?,
+                process_catalog_id: row.get(3).map_err(db_persistence)?,
+                identity: row.get(4).map_err(db_persistence)?,
+                pid: row.get(5).map_err(db_persistence)?,
+                start_time_ticks: row.get(6).map_err(db_persistence)?,
+                original_group: row.get(7).map_err(db_persistence)?,
+                target_group: row.get(8).map_err(db_persistence)?,
+                original_properties: serde_json::from_str(&original)
+                    .map_err(|error| ActuatorError::Persistence(error.to_string()))?,
+                requested_properties: serde_json::from_str(&requested)
+                    .map_err(|error| ActuatorError::Persistence(error.to_string()))?,
+                reason: row.get(11).map_err(db_persistence)?,
+                applied: row.get(12).map_err(db_persistence)?,
+                verified: row.get(13).map_err(db_persistence)?,
+                rolled_back: row.get(14).map_err(db_persistence)?,
+                last_error: row.get(15).map_err(db_persistence)?,
+            });
+        }
+        Ok(snapshots)
+    }
+
+    fn record_managed_group(
+        &mut self,
+        name: &str,
+        session_id: i64,
+        backend: BackendKind,
+    ) -> Result<(), ActuatorError> {
+        let backend = serde_json::to_value(backend)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| ActuatorError::Persistence("invalid backend kind".to_owned()))?;
+        self.connection
+            .execute(
+                "INSERT INTO cgroup_managed_groups (
+                    name, session_id, backend, owned_by_nemor, state
+                 ) VALUES (?1, ?2, ?3, 1, 'active')
+                 ON CONFLICT(name) DO UPDATE SET
+                    session_id=excluded.session_id, backend=excluded.backend,
+                    owned_by_nemor=1, state='active', updated_at=CURRENT_TIMESTAMP",
+                params![name, session_id, backend],
+            )
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_managed_group(&mut self, name: &str) -> Result<(), ActuatorError> {
+        self.connection
+            .execute("DELETE FROM cgroup_managed_groups WHERE name=?1", [name])
+            .map_err(|error| ActuatorError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+}
+
+fn db_persistence(error: rusqlite::Error) -> ActuatorError {
+    ActuatorError::Persistence(error.to_string())
+}
+
 pub fn inspect_status(path: impl AsRef<Path>) -> Result<StatusReport> {
     let path = path.as_ref();
     if !path.exists() {
@@ -1067,6 +1303,8 @@ mod tests {
         "action_results",
         "benchmark_metrics",
         "benchmark_runs",
+        "cgroup_managed_groups",
+        "cgroup_snapshots",
         "configuration_snapshots",
         "hosts",
         "model_registry",
@@ -1226,6 +1464,7 @@ mod tests {
                 (1, migration_checksum(INITIAL_MIGRATION)),
                 (2, migration_checksum(TELEMETRY_MIGRATION)),
                 (3, migration_checksum(CLASSIFIER_MIGRATION)),
+                (4, migration_checksum(CGROUP_MIGRATION)),
             ]
         );
     }
@@ -1242,7 +1481,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration count");
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
         let journal: String = storage
             .connection()
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -1307,6 +1546,27 @@ mod tests {
         assert!(error
             .to_string()
             .contains("migration version 3 checksum mismatch"));
+    }
+
+    #[test]
+    fn rejects_changed_cgroup_migration_checksum() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("memory.db");
+        let storage = Storage::open(&path).expect("database");
+        storage
+            .connection()
+            .execute(
+                "UPDATE schema_migrations SET checksum = 'changed' WHERE version = 4",
+                [],
+            )
+            .expect("corrupt fixture checksum");
+        drop(storage);
+        let error = Storage::open(&path)
+            .err()
+            .expect("changed cgroup migration must fail");
+        assert!(error
+            .to_string()
+            .contains("migration version 4 checksum mismatch"));
     }
 
     #[test]

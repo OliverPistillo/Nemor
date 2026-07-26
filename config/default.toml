@@ -4,6 +4,19 @@ sample_interval_ms = 1000
 database_path = "/var/lib/nemor/nemor.db"
 allow_automatic_actions = false
 
+[cgroups]
+enabled = false
+dry_run = true
+allow_move = false
+rollback_on_exit = true
+recover_unclean_session = true
+foreground_min_percent = 5
+foreground_max_percent = 40
+background_high_min_percent = 20
+background_high_max_percent = 80
+minimum_headroom_percent = 10
+allowed_identities = []
+
 [telemetry]
 process_sample_interval_ms = 5000
 smaps_rollup_interval_ms = 60000

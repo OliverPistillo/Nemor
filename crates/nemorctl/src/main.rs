@@ -2,8 +2,8 @@
 
 use clap::{Parser, Subcommand};
 use nemorctl::{
-    doctor, render_doctor, render_report, render_status, render_workload, report_latest, status,
-    workload_latest, DoctorEnvironment,
+    cgroups_status, doctor, render_cgroups_status, render_doctor, render_report, render_status,
+    render_workload, report_latest, status, workload_latest, DoctorEnvironment,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -37,6 +37,10 @@ enum Command {
         #[command(subcommand)]
         command: WorkloadCommand,
     },
+    Cgroups {
+        #[command(subcommand)]
+        command: CgroupsCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -50,6 +54,14 @@ enum ReportCommand {
 #[derive(Debug, Subcommand)]
 enum WorkloadCommand {
     Latest {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CgroupsCommand {
+    Status {
         #[arg(long)]
         json: bool,
     },
@@ -90,6 +102,13 @@ fn run() -> anyhow::Result<i32> {
         } => {
             let report = workload_latest(&cli.config)?;
             print!("{}", render_workload(&report, json)?);
+            Ok(0)
+        }
+        Command::Cgroups {
+            command: CgroupsCommand::Status { json },
+        } => {
+            let report = cgroups_status(&cli.config)?;
+            print!("{}", render_cgroups_status(&report, json)?);
             Ok(0)
         }
     }

@@ -160,3 +160,11 @@ FASE 2 — VALIDATA SU CACHYOS
 The open environmental limitation is direct observation of an active Steam,
 Proton, Wine, or Gamescope game. Their detector logic remains covered by
 fixtures and absence of an active game is not a phase 2 failure.
+
+## Phase 3 follow-up
+
+Phase 3 performs real read-only cgroup v2 and memory-controller inspection on
+this CachyOS host. The default service remains observe-only and receives no
+cgroup delegation. If the hierarchy is not writable without administrative
+elevation, kernel mutations remain explicitly unvalidated rather than being
+simulated as real.
