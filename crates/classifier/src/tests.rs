@@ -138,6 +138,26 @@ fn steam_wine_and_proton_helpers_alone_are_not_games() {
 }
 
 #[test]
+fn generic_desktop_app_scope_is_not_steam_game_evidence() {
+    let configuration = config();
+    let classifier = Classifier::new(
+        configuration.classification.clone(),
+        configuration.pressure.clone(),
+    );
+    let mut sample = process(10, Some("unrecognized"));
+    sample.cgroup_path = Some(
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.example.App.scope"
+            .to_owned(),
+    );
+    let classified = classifier.classify_processes(&[sample]);
+    assert!(!classified[0].is_game);
+    assert!(!classified[0]
+        .reasons
+        .iter()
+        .any(|reason| reason == "steam_app_cgroup"));
+}
+
+#[test]
 fn native_steam_proton_and_gamescope_scenarios_require_context() {
     let mut configuration = config();
     configuration.classification.game_executables = vec!["native-game".to_owned()];

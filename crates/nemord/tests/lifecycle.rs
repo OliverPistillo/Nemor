@@ -9,8 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use test_support::LinuxFixture;
 
-#[test]
-fn real_daemon_closes_session_on_sigterm_and_status_reads_it() {
+fn assert_clean_shutdown(signal: Signal) {
     let fixture = LinuxFixture::compatible().expect("fixture");
     let executable = env!("CARGO_BIN_EXE_nemord");
     let child = Command::new(executable)
@@ -36,7 +35,7 @@ fn real_daemon_closes_session_on_sigterm_and_status_reads_it() {
     }
 
     let raw_pid = i32::try_from(child.id()).expect("PID fits i32");
-    kill(Pid::from_raw(raw_pid), Signal::SIGTERM).expect("send SIGTERM safely");
+    kill(Pid::from_raw(raw_pid), signal).expect("send shutdown signal safely");
     let output = child.wait_with_output().expect("wait for daemon");
     assert!(
         output.status.success(),
@@ -57,4 +56,14 @@ fn real_daemon_closes_session_on_sigterm_and_status_reads_it() {
     .expect("status --json rendering");
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid status JSON");
     assert_eq!(parsed["state"], "closed_clean");
+}
+
+#[test]
+fn real_daemon_closes_session_on_sigterm_and_status_reads_it() {
+    assert_clean_shutdown(Signal::SIGTERM);
+}
+
+#[test]
+fn real_daemon_closes_session_on_sigint_and_status_reads_it() {
+    assert_clean_shutdown(Signal::SIGINT);
 }

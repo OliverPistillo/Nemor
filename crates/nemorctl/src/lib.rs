@@ -96,6 +96,7 @@ pub fn doctor(config_path: &Path, environment: &DoctorEnvironment) -> Result<Doc
         CheckStatus::Fail,
         "/etc/os-release is readable",
     ));
+    checks.push(distribution_check(&environment.paths.os_release()));
     checks.push(readable_file(
         "machine_id",
         &environment.paths.machine_id(),
@@ -307,6 +308,32 @@ fn database_path_checks(database_path: &Path) -> Vec<CheckResult> {
     vec![database, directory]
 }
 
+fn distribution_check(path: &Path) -> CheckResult {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let distribution = contents.lines().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == "ID")
+                    .then(|| value.trim().trim_matches('"').trim_matches('\'').to_owned())
+            });
+            match distribution.filter(|value| !value.is_empty()) {
+                Some(distribution) => pass_with_details(
+                    "distribution",
+                    "Linux distribution is identifiable",
+                    Some(format!("id={distribution}")),
+                ),
+                None => fail("distribution", "os-release does not contain a valid ID"),
+            }
+        }
+        Err(error) => result(
+            "distribution",
+            CheckStatus::Fail,
+            "Linux distribution is not identifiable",
+            Some(format!("path={}, error={error}", path.display())),
+        ),
+    }
+}
+
 fn readable_file(
     name: &str,
     path: &Path,
@@ -424,6 +451,12 @@ mod tests {
         let json = render_doctor(&report, true).expect("JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(parsed["checks"].is_array());
+        let distribution = report
+            .checks
+            .iter()
+            .find(|check| check.name == "distribution")
+            .expect("distribution result");
+        assert_eq!(distribution.details.as_deref(), Some("id=cachyos"));
     }
 
     #[test]

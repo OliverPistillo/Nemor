@@ -136,14 +136,27 @@ fn initialize_logging() -> Result<()> {
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> Result<&'static str> {
-    use tokio::signal::unix::{signal, SignalKind};
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::time::{self, Duration};
 
-    let mut terminate =
-        signal(SignalKind::terminate()).context("cannot install SIGTERM handler")?;
-    let mut interrupt = signal(SignalKind::interrupt()).context("cannot install SIGINT handler")?;
-    tokio::select! {
-        _ = terminate.recv() => Ok("SIGTERM"),
-        _ = interrupt.recv() => Ok("SIGINT"),
+    let terminate = Arc::new(AtomicBool::new(false));
+    let interrupt = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGTERM, Arc::clone(&terminate))
+        .context("cannot install SIGTERM handler")?;
+    signal_hook::flag::register(SIGINT, Arc::clone(&interrupt))
+        .context("cannot install SIGINT handler")?;
+
+    let mut poll = time::interval(Duration::from_millis(25));
+    loop {
+        poll.tick().await;
+        if terminate.load(Ordering::Relaxed) {
+            return Ok("SIGTERM");
+        }
+        if interrupt.load(Ordering::Relaxed) {
+            return Ok("SIGINT");
+        }
     }
 }
 

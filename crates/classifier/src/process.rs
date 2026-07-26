@@ -67,8 +67,8 @@ fn classify_one(
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let steam_app_cgroup =
-        cgroup.contains("steam_app_") || (cgroup.contains("/app-") && cgroup.contains(".scope"));
+    let steam_app_cgroup = cgroup.contains("steam_app_")
+        || (cgroup.contains("/app-") && cgroup.contains("steam") && cgroup.contains(".scope"));
     let configured_game = contains_name(&config.game_executables, &name);
     let proton_or_wine = is_proton_or_wine(&name);
 
