@@ -118,3 +118,11 @@ The pipeline is process identity → target plan → owned monitor-only session 
 `damon:damon_aggregated` → normalized hot/warm/cold evidence → SQLite/export.
 No DAMOS or memory-management action exists in Phase 7. See
 [damon.md](damon.md).
+## Phase 8 action boundary
+
+`nemor-damos` owns DAMOS capability, fail-closed eligibility, exact address
+fences, quotas, stat-shadow/pageout transaction models, refault cooldown, and
+owned recovery. `nemor-damon` remains observational. Production is plan-only;
+kernel mutation exists only in the manual privileged validation binary. That
+controlled owned-target path is validated on CachyOS with exact pagemap
+evidence; it is not an automatic production reclaim path.

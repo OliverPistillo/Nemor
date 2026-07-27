@@ -366,6 +366,57 @@ pub fn damon_export(config_path: &Path, format: damon::ExportFormat, output: &Pa
         .map_err(anyhow::Error::msg)
 }
 
+pub fn damos_status(config_path: &Path) -> Result<damos::DamosReport> {
+    let loaded = LoadedConfig::load(config_path).context("invalid DAMOS status configuration")?;
+    let damon_capability = damon::inspect_linux(
+        Path::new("/"),
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|value| value.trim().to_owned()),
+    );
+    Ok(damos::DamosReport {
+        schema: damos::REPORT_SCHEMA.into(),
+        capability: damos::observe_capability(&damon_capability),
+        plan: None,
+        shadow_stats: None,
+        live_stats: None,
+        reclaim: None,
+        refault: None,
+        refault_state: damos::RefaultState::NotEvaluated,
+        blacklist: None,
+        cleanup: true,
+        recovery: true,
+        recovery_idempotent: true,
+        host_unchanged: true,
+        dry_run: true,
+        blocked_reasons: vec![if loaded.config.damos.live_apply {
+            "production_live_apply_forbidden"
+        } else {
+            "validation_harness_only"
+        }
+        .into()],
+    })
+}
+
+pub fn damos_history(config_path: &Path) -> Result<Vec<storage::DamosHistoryEntry>> {
+    let loaded = LoadedConfig::load(config_path).context("invalid DAMOS history configuration")?;
+    storage::damos_history(&loaded.config.general.database_path, 20).or_else(|_| Ok(Vec::new()))
+}
+
+pub fn damos_plan_latest(config_path: &Path) -> Result<Option<storage::DamosHistoryEntry>> {
+    Ok(damos_history(config_path)?.into_iter().next())
+}
+
+pub fn damos_blacklist(config_path: &Path) -> Result<Vec<damos::BlacklistRecord>> {
+    let loaded =
+        LoadedConfig::load(config_path).context("invalid DAMOS blacklist configuration")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| i64::try_from(value.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    storage::damos_blacklist(&loaded.config.general.database_path, now).or_else(|_| Ok(Vec::new()))
+}
+
 fn read_memory_capacity() -> Result<(u64, u64)> {
     let input = fs::read_to_string("/proc/meminfo").context("cannot read /proc/meminfo")?;
     let read = |name: &str| -> Result<u64> {

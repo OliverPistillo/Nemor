@@ -65,3 +65,11 @@ Normal selects safe/current, gaming selects the gaming intent without allowing
 a risky live switch, pressure may request capacity analysis, and
 critical/emergency/stabilizing retain safe/current. Observe stops after typed
 planning and persistence. No learning system or Phase 6 mechanism is present.
+## Phase 8 plan-only integration
+
+NORMAL, WATCH, and STABILIZING reject DAMOS pageout. PRESSURE through EMERGENCY
+can yield only a dry-run candidate for background stable-cold unprotected
+identity. `nemor-damos` revalidates identity, history, fence, quota, conflicts,
+and blacklist. The daemon never applies the plan. Real pageout validation is
+confined to the separately audited manual harness and does not broaden this
+production policy boundary.

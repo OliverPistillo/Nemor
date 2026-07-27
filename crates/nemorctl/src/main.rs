@@ -2,8 +2,9 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use nemorctl::{
-    cgroups_status, damon_export, damon_report_latest, damon_sessions, damon_status, doctor,
-    policy_latest, policy_status, render_cgroups_status, render_doctor, render_policy_latest,
+    cgroups_status, damon_export, damon_report_latest, damon_sessions, damon_status,
+    damos_blacklist, damos_history, damos_plan_latest, damos_status, doctor, policy_latest,
+    policy_status, render_cgroups_status, render_doctor, render_policy_latest,
     render_policy_status, render_report, render_status, render_workload, render_zram,
     report_latest, status, tiering_recommend, tiering_report_latest, tiering_status,
     workload_latest, zram_profiles, zram_report_latest, zram_status, DoctorEnvironment,
@@ -59,6 +60,10 @@ enum Command {
     Damon {
         #[command(subcommand)]
         command: DamonCommand,
+    },
+    Damos {
+        #[command(subcommand)]
+        command: DamosCommand,
     },
 }
 
@@ -176,6 +181,34 @@ enum DamonCommand {
 
 #[derive(Debug, Subcommand)]
 enum DamonReportCommand {
+    Latest {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DamosCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Plan {
+        #[command(subcommand)]
+        command: DamosPlanCommand,
+    },
+    History {
+        #[arg(long)]
+        json: bool,
+    },
+    Blacklist {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DamosPlanCommand {
     Latest {
         #[arg(long)]
         json: bool,
@@ -317,6 +350,33 @@ fn run() -> anyhow::Result<i32> {
                 "exported_bytes={}",
                 damon_export(&cli.config, format, &output)?
             );
+            Ok(0)
+        }
+        Command::Damos {
+            command: DamosCommand::Status { json },
+        } => {
+            print!("{}", render_zram(&damos_status(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Damos {
+            command:
+                DamosCommand::Plan {
+                    command: DamosPlanCommand::Latest { json },
+                },
+        } => {
+            print!("{}", render_zram(&damos_plan_latest(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Damos {
+            command: DamosCommand::History { json },
+        } => {
+            print!("{}", render_zram(&damos_history(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Damos {
+            command: DamosCommand::Blacklist { json },
+        } => {
+            print!("{}", render_zram(&damos_blacklist(&cli.config)?, json)?);
             Ok(0)
         }
     }

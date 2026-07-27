@@ -119,6 +119,15 @@ export_max_bytes = 67108864
 max_action_time_ms = 5
 max_action_bytes = 268435456
 
+[damos]
+enabled = false
+live_apply = false
+min_complete_cold_windows = 3
+refault_window_seconds = 30
+blacklist_seconds = 300
+max_total_applied_bytes = 268435456
+apply_interval_us = 500000
+
 [gaming]
 auto_detect = true
 protect_gamescope = true

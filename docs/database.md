@@ -106,3 +106,10 @@ kernel, operation, requested/effective attributes, source, target identity,
 overhead and clean-shutdown state. Region rows retain raw ranges/access counts
 and normalized observational evidence, never memory contents. Reads and
 exports are bounded; retention and drop accounting prevent unbounded growth.
+## DAMOS migration
+
+Migration `0006_damos.sql` adds linked action plans, action results, and bounded
+early-refault blacklist evidence. It preserves decision/plan/session/scheme
+links and tried/applied distinction without storing memory contents. Phase 8
+validation proved the audit chain on an owned synthetic action; normal daemon
+operation remains plan-only and does not create live pageout results.

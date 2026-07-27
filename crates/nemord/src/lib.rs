@@ -82,6 +82,9 @@ pub trait TelemetryStorage {
     fn store_damon_audit(&mut self, _session_id: i64, _audit: &damon::DamonReport) -> Result<()> {
         Ok(())
     }
+    fn store_damos_audit(&mut self, _session_id: i64, _audit: &damos::DamosReport) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl TelemetryStorage for Storage {
@@ -149,6 +152,10 @@ impl TelemetryStorage for Storage {
             &audit.capability,
             audit,
         )?;
+        Ok(())
+    }
+    fn store_damos_audit(&mut self, session_id: i64, audit: &damos::DamosReport) -> Result<()> {
+        self.insert_configuration_snapshot(session_id, damos::AUDIT_REASON, &audit.plan, audit)?;
         Ok(())
     }
 }
@@ -574,6 +581,29 @@ where
                                                     .context(
                                                         "cannot persist DAMON observe audit",
                                                     )?;
+                                                let damos_audit = damos::DamosReport {
+                                                    schema: damos::REPORT_SCHEMA.into(),
+                                                    capability: damos::DamosCapability::default(),
+                                                    plan: None,
+                                                    shadow_stats: None,
+                                                    live_stats: None,
+                                                    reclaim: None,
+                                                    refault: None,
+                                                    refault_state:
+                                                        damos::RefaultState::NotEvaluated,
+                                                    blacklist: None,
+                                                    cleanup: true,
+                                                    recovery: true,
+                                                    recovery_idempotent: true,
+                                                    host_unchanged: true,
+                                                    dry_run: true,
+                                                    blocked_reasons: vec![
+                                                        "production_live_apply_forbidden".into(),
+                                                    ],
+                                                };
+                                                storage
+                                                    .store_damos_audit(session_id, &damos_audit)
+                                                    .context("cannot persist DAMOS plan-only audit")?;
                                                 info!(
                                                     event = "policy_decision_persisted",
                                                     session_id,

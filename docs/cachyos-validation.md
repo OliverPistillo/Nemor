@@ -269,3 +269,24 @@ detection with mapping-local `MADV_NOHUGEPAGE` (9/9, mean 1.0). This is a
 host-specific validation-harness finding, not a global THP policy. Final
 `kdamond` CPU was 0.0%, capture CPU 0.02308834%, and synthetic target slowdown
 about 3.00004%; the slowdown remains a Phase 10 real-workload benchmark item.
+
+## Phase 8 controlled DAMOS validation
+
+On the same CachyOS kernel, ATTEMPT 4 passed every mandatory controlled-reclaim
+gate for a synthetic child owned by the privileged harness. The profile used
+an exact COLD core address allow filter, `nr_accesses=0`, `age.min=3`, 5 ms and
+8 MiB quotas, a 10 s reset interval, 5 s live deadline and five-snapshot
+secondary fence.
+
+Two live COLD candidates totaling 8,388,608 bytes were tried and applied.
+Exact pagemap evidence showed HOT and WARM unchanged at 8 MiB present and zero
+swapped. COLD changed from 32 MiB present/zero swapped to 24 MiB present/8 MiB
+swapped, then returned to 32 MiB present/zero swapped after controlled refault;
+the content fingerprint remained valid. The early-refault blacklist blocked
+the next plan. Cleanup/recovery were idempotent, no OOM occurred and the host
+structure was unchanged.
+
+`kdamond` CPU was 0.25%, validation-control CPU approximately 0.25876444% and
+control slowdown 0%. This validates only the controlled synthetic owned-target
+path. The normal daemon remains observe-only, and Phase 6 dedicated
+zswap+NVMe boot validation remains pending.

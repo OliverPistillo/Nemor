@@ -200,6 +200,7 @@ DAMOS, reclaim, pageout, LRU promotion/deprioritization, migration, zram,
 zswap, tiering or persistent boot mutation. `/dev/zram0` remained
 external/protected.
 
-Phase 7 measures only. Phase 8 may introduce separately controlled DAMOS
-reclaim, but it is planned and not started; no Phase 8 action exists in this
-code.
+Phase 7 measures only and remains zero-DAMOS. Phase 8 implements controlled
+DAMOS reclaim behind the separate `nemor-damos` and manual privileged
+validation boundary. Normal daemon and CLI operation remain observe/read-only;
+the validated pageout path targets only a harness-owned synthetic child.

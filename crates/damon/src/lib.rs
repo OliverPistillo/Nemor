@@ -379,9 +379,12 @@ pub fn size_scaling_supports_tlb_hypothesis(attempts: &[ProbeEvidence]) -> bool 
 pub struct ZoneBacking {
     pub start: u64,
     pub end: u64,
+    pub range_size_bytes: u64,
     pub size_kib: u64,
+    pub containing_vma_size_kib: u64,
     pub rss_kib: u64,
     pub pss_kib: u64,
+    pub swap_kib: u64,
     pub kernel_page_size_kib: Option<u64>,
     pub mmu_page_size_kib: Option<u64>,
     pub anon_huge_pages_kib: u64,
@@ -400,6 +403,7 @@ pub fn parse_smaps_zone(text: &str, zone: AddressRange) -> Result<ZoneBacking, D
     let mut result = ZoneBacking {
         start: zone.start,
         end: zone.end,
+        range_size_bytes: zone.end.saturating_sub(zone.start),
         ..ZoneBacking::default()
     };
     let mut current = None;
@@ -428,6 +432,7 @@ pub fn parse_smaps_zone(text: &str, zone: AddressRange) -> Result<ZoneBacking, D
             "Size" => result.size_kib = result.size_kib.saturating_add(kib().unwrap_or(0)),
             "Rss" => result.rss_kib = result.rss_kib.saturating_add(kib().unwrap_or(0)),
             "Pss" => result.pss_kib = result.pss_kib.saturating_add(kib().unwrap_or(0)),
+            "Swap" => result.swap_kib = result.swap_kib.saturating_add(kib().unwrap_or(0)),
             "KernelPageSize" => result.kernel_page_size_kib = kib(),
             "MMUPageSize" => result.mmu_page_size_kib = kib(),
             "AnonHugePages" => {
@@ -448,6 +453,7 @@ pub fn parse_smaps_zone(text: &str, zone: AddressRange) -> Result<ZoneBacking, D
     }
     result.vm_flags.sort();
     result.vm_flags.dedup();
+    result.containing_vma_size_kib = result.size_kib;
     result.backing = (if result.anon_huge_pages_kib > 0 {
         if result.kernel_page_size_kib == Some(4) {
             "mixed_or_thp"

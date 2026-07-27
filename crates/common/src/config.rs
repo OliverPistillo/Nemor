@@ -20,6 +20,7 @@ pub struct Config {
     pub tiering: TieringConfig,
     pub ksm: KsmConfig,
     pub damon: DamonConfig,
+    pub damos: DamosConfig,
     pub gaming: GamingConfig,
 }
 
@@ -176,6 +177,18 @@ pub struct DamonConfig {
     pub export_max_bytes: u64,
     pub max_action_time_ms: u64,
     pub max_action_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DamosConfig {
+    pub enabled: bool,
+    pub live_apply: bool,
+    pub min_complete_cold_windows: u32,
+    pub refault_window_seconds: u64,
+    pub blacklist_seconds: u64,
+    pub max_total_applied_bytes: u64,
+    pub apply_interval_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -688,6 +701,24 @@ impl Config {
                 "session, sample, retention, and export bounds must be non-zero and bounded",
             ));
         }
+        if self.damos.enabled || self.damos.live_apply {
+            return Err(validation(
+                "damos.live_apply",
+                "Phase 8 production DAMOS must remain disabled and plan-only",
+            ));
+        }
+        if self.damos.min_complete_cold_windows < 3
+            || self.damos.refault_window_seconds == 0
+            || self.damos.blacklist_seconds < self.damos.refault_window_seconds
+            || self.damos.max_total_applied_bytes == 0
+            || self.damos.max_total_applied_bytes > self.damon.max_action_bytes
+            || self.damos.apply_interval_us == 0
+        {
+            return Err(validation(
+                "damos",
+                "invalid cold evidence, cooldown, total ceiling, or apply interval",
+            ));
+        }
         Ok(())
     }
 }
@@ -1035,6 +1066,18 @@ mod tests {
         ))
         .expect_err("DAMON must remain disabled");
         assert!(error.to_string().contains("damon.enabled"));
+    }
+
+    #[test]
+    fn phase_eight_production_damos_is_always_plan_only() {
+        for (from, to) in [
+            ("[damos]\nenabled = false", "[damos]\nenabled = true"),
+            ("live_apply = false", "live_apply = true"),
+        ] {
+            let error = Config::from_toml(&changed(from, to))
+                .expect_err("production DAMOS mutation must be rejected");
+            assert!(error.to_string().contains("damos.live_apply"));
+        }
     }
 
     #[test]

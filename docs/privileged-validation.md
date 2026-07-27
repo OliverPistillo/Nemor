@@ -192,3 +192,24 @@ Readback proved three initial target regions and `nr_schemes=0`. Stop, cleanup,
 crash recovery and a second idempotent recovery restored the structural host
 baseline. No external session, `/dev/zram0`, zswap/tiering state, persistent
 configuration or boot setting was changed.
+## Phase 8 DAMOS gate
+
+`--damos` is separate from monitor-only `--damon`. It runs an owned stat shadow,
+proves no HOT/WARM range overlap, cleans it, then creates an independent bounded
+pageout session. Gates cover quota/fence readback, target-attributable reclaim,
+collateral slowdown, refault integrity, blacklist rejection, cleanup, recovery,
+idempotence, and structural host equality.
+
+The final ATTEMPT 4 completed successfully on CachyOS
+`7.1.4-1-cachyos`. With an exact modern COLD allow filter, the kernel tried and
+applied two age-three zero-access candidates totaling 8,388,608 bytes.
+Exact-range pagemap snapshots showed HOT and WARM unchanged at 8 MiB present
+and zero swapped, while COLD changed from 32 MiB present/zero swapped to 24 MiB
+present/8 MiB swapped. After the scheme was stopped, controlled refault
+restored COLD to 32 MiB present/zero swapped with valid content.
+
+The refault blacklist blocked the next plan; cleanup, recovery, idempotence,
+zero OOM and structural host equality passed. `kdamond` CPU was 0.25%,
+validation-control CPU approximately 0.25876444%, and control slowdown 0%.
+These results apply only to the bounded owned synthetic target. Normal
+`nemord` and `nemorctl` cannot execute pageout.

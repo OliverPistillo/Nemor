@@ -18,7 +18,7 @@ not AI.
 | Phase 5 | safe zram backend and profiles | ✅ Validated on CachyOS |
 | Phase 6 | zswap + NVMe tiering backend | 🟡 Dev complete / boot validation pending |
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
-| Phase 8 | controlled DAMOS reclaim | ⚪ Planned / not started |
+| Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
 development; ⚪ planned.
@@ -30,15 +30,16 @@ development; ⚪ planned.
 | Platform | CachyOS Linux, x86_64 |
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
-| Workspace crates | 12 |
-| Tests defined / executed | 213 / 213 |
-| Passed / failed / ignored | 213 / 0 / 0 |
+| Workspace crates | 13 |
+| Tests defined / executed | 268 / 268 |
+| Passed / failed / ignored | 268 / 0 / 0 |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
 | Host storage | Btrfs, non-rotational SATA SSD; no NVMe evidence |
 | Phase 6 validation | read-only + live-safe swapfile; dedicated boot pending |
 | Phase 7 validation | real `vaddr` monitor-only session; 30/30 gates; host unchanged |
+| Phase 8 validation | owned-target DAMOS pageout; 8 MiB COLD reclaimed; host unchanged |
 
 Linux tests include real `/proc`/`/sys` reads and real SIGINT/SIGTERM delivery.
 The dedicated bounded harness additionally validates isolated privileged
@@ -47,22 +48,27 @@ The Phase 6 harness additionally validated a bounded owned Btrfs swapfile
 lifecycle, write accounting and recovery without changing zswap or zram0.
 The Phase 7 harness validated an owned synthetic DAMON session, isolated
 tracefs capture, zero DAMOS, bounded datasets, cleanup and crash recovery.
+The Phase 8 harness validated controlled DAMOS pageout on an owned synthetic
+target with exact-range pagemap evidence; this does not enable production
+pageout.
 
 ## Performance snapshot
 
 Release `nemord` was sampled on the validation host 15 times at two-second
 intervals using `/proc/<pid>/stat`, `status`, and `smaps_rollup`.
 
-| Metric | Phase 3 | Phase 4 | Phase 5 | Phase 6 |
-|---|---:|---:|---:|---:|
-| Mean CPU (one logical CPU) | 0.1990% | 0.199249% | 0.212940% | 0.232293% |
-| Maximum interval CPU | 0.4976% | 0.996093% | 0.496909% | 0.995682% |
-| Maximum RSS | ~7.03 MiB | ~7.34 MiB | ~7.32 MiB | ~7.67 MiB |
-| PSS | ~4.70 MiB | ~4.99 MiB | ~5.00 MiB | ~5.34 MiB |
+| Metric | Phase 3 | Phase 4 | Phase 5 | Phase 6 | Phase 8 observe |
+|---|---:|---:|---:|---:|---:|
+| Mean CPU (one logical CPU) | 0.1990% | 0.199249% | 0.212940% | 0.232293% | 0.200000% |
+| Maximum interval CPU | 0.4976% | 0.996093% | 0.496909% | 0.995682% | 0.500000% |
+| Maximum RSS | ~7.03 MiB | ~7.34 MiB | ~7.32 MiB | ~7.67 MiB | ~7.86 MiB |
+| PSS | ~4.70 MiB | ~4.99 MiB | ~5.00 MiB | ~5.34 MiB | ~5.54 MiB |
 
 These are host-specific validation measurements, not universal benchmarks.
 Phase 6 used the same 15 two-second interval method. Mean CPU and memory
 increased modestly; storage inventory is bounded by the normal sampling loop.
+The Phase 8 observe measurement also used 15 two-second intervals with no
+owned DAMON/DAMOS session; it measures only the unchanged observe runtime.
 
 Phase 7 measured the owned monitor session separately from normal daemon
 observe performance:
@@ -79,6 +85,22 @@ The hard Phase 7 gate covers combined `kdamond` and capture CPU against a 1%
 budget. The separately measured ~3% synthetic target slowdown is not hidden
 and is not a production overhead promise; Phase 10 must compare real workloads
 and stock behavior.
+
+Phase 8 measured its privileged synthetic action separately:
+
+| Phase 8 controlled reclaim metric | Result |
+|---|---:|
+| COLD tried / applied | 8 MiB / 8 MiB |
+| HOT present/swapped before → after | 8 MiB/0 → 8 MiB/0 |
+| WARM present/swapped before → after | 8 MiB/0 → 8 MiB/0 |
+| COLD present/swapped before → after | 32 MiB/0 → 24 MiB/8 MiB |
+| COLD after controlled refault | 32 MiB present, 0 swapped |
+| `kdamond` CPU | 0.25% |
+| validation control CPU | ~0.25876444% |
+| control workload slowdown | 0.0% |
+
+These are synthetic results from this validation host, not universal
+production performance claims.
 
 ## Implemented capabilities
 
@@ -107,6 +129,12 @@ and stock behavior.
 - an owned privileged validation path with explicit target regions,
   per-instance monotonic trace clock, zero DAMOS, overhead accounting and
   idempotent cleanup/recovery.
+- a separate DAMOS controlled-reclaim planner with stable-cold eligibility,
+  exact COLD address fencing, hard quotas, stat-shadow/pageout transaction
+  models, decision audit, exact-range residency evidence, refault blacklist,
+  truthful stop-only rollback and owned recovery. The real kernel path is
+  validated only for the owned synthetic harness target; production remains
+  plan-only.
 
 ## Safety model
 
@@ -125,6 +153,8 @@ and stock behavior.
 - normal observe mode never creates, configures, starts or stops `kdamond` and
   never mutates tracefs; unavailable or unknown DAMON capability means no
   action.
+- normal daemon and CLI cannot apply DAMOS; only the explicit manual
+  `--damos` validation scope can page out its owned synthetic COLD mapping.
 
 See [the safety model](docs/safety-model.md).
 
@@ -149,6 +179,10 @@ nemorctl damon sessions
 nemorctl damon report latest
 nemorctl damon export --format jsonl --output <new-path>
 nemorctl damon export --format csv --output <new-path>
+nemorctl damos status
+nemorctl damos plan latest
+nemorctl damos history
+nemorctl damos blacklist
 ```
 
 Read commands accept `--json` at their terminal command position. DAMON export
@@ -195,16 +229,19 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
   to establish a controlled base-page comparison;
 - the validated ~3% synthetic target slowdown requires reevaluation on real
   workloads and is not a production guarantee;
-- no DAMOS, reclaim, pageout, LRU or migration action is implemented.
+- Phase 8 pageout is validated only on a controlled synthetic owned target and
+  remains unavailable to normal `nemord` and `nemorctl`; rollback stops further
+  reclaim but cannot undo pages already paged out byte-for-byte;
+- no LRU, migration, arbitrary-process, foreground, or gaming reclaim exists.
 
 ## Roadmap
 
-- Completed and validated on CachyOS: Phases 0–5 and Phase 7.
+- Completed and validated on CachyOS: Phases 0–5, Phase 7 and Phase 8.
 - Phase 6 implementation and live-safe swapfile validation are complete;
   dedicated zswap+NVMe boot validation remains pending.
 - The runtime default remains observe-only despite isolated privileged
-  validation of Phases 3, 5, 6 and 7.
-- Phase 8 controlled DAMOS reclaim is planned and not started.
+  validation of Phases 3, 5, 6, 7 and 8.
+- Phase 9 is planned and not started.
 
 ## Documentation
 
@@ -216,6 +253,7 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - [Zram backend](docs/zram.md)
 - [Zswap and storage tiering](docs/tiering.md)
 - [DAMON monitor-only telemetry](docs/damon.md)
+- [DAMOS controlled reclaim](docs/damos.md)
 - [Safety model](docs/safety-model.md)
 - [Database](docs/database.md)
 - [CachyOS validation](docs/cachyos-validation.md)
@@ -232,3 +270,4 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 | 3 + 5 gate | 148 | CachyOS privileged isolated validation | current validation commit |
 | 6 development | 173 | CachyOS read-only + live-safe swapfile; boot pending | current development |
 | 7 | 213 | CachyOS real `vaddr`, 9 windows, zero DAMOS, host unchanged | current Phase 7 commit |
+| 8 | 268 | CachyOS controlled synthetic DAMOS pageout; 8 MiB COLD-only reclaim, refault/recovery, host unchanged | current Phase 8 commit |

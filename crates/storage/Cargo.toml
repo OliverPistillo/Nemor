@@ -12,6 +12,7 @@ classifier = { package = "nemor-classifier", path = "../classifier" }
 actuator = { package = "nemor-actuator", path = "../actuator" }
 common = { package = "nemor-common", path = "../common" }
 policy-engine = { package = "nemor-policy-engine", path = "../policy-engine" }
+damos = { package = "nemor-damos", path = "../damos" }
 hex.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

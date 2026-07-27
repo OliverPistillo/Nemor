@@ -85,3 +85,12 @@ and owned `nemor-validation-*` objects. It verifies `nr_schemes=0`; there is no
 DAMOS, reclaim, pageout, LRU or migration implementation. Mapping-local
 `MADV_NOHUGEPAGE` is restricted to the synthetic A/B validation control and is
 not a runtime workload policy.
+## Controlled DAMOS boundary
+
+Phase 8 adds no production mutation. Manual `--damos` is restricted to an
+owned synthetic PID/start-time identity and exact COLD fence. Unknown
+capability, identity, filter, quota, or ownership blocks action. Foreground,
+gaming, critical, and protected targets always reject. Pageout rollback stops
+future actions; it cannot undo reclaimed pages byte-for-byte. The controlled
+path is validated on CachyOS with COLD-only trace candidates and exact-range
+pagemap proof that HOT/WARM remained resident.

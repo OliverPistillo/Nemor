@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const MIGRATION_VERSION: i64 = 5;
+pub const MIGRATION_VERSION: i64 = 6;
 pub const INITIAL_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0001_initial.sql"
@@ -38,6 +38,10 @@ pub const CGROUP_MIGRATION: &str = include_str!(concat!(
 pub const DAMON_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0005_damon.sql"
+));
+pub const DAMOS_MIGRATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0006_damos.sql"
 ));
 
 pub struct Storage {
@@ -241,7 +245,8 @@ impl Storage {
         self.apply_migration(2, TELEMETRY_MIGRATION, false)?;
         self.apply_migration(3, CLASSIFIER_MIGRATION, false)?;
         self.apply_migration(4, CGROUP_MIGRATION, false)?;
-        self.apply_migration(5, DAMON_MIGRATION, false)
+        self.apply_migration(5, DAMON_MIGRATION, false)?;
+        self.apply_migration(6, DAMOS_MIGRATION, false)
     }
 
     pub fn migrate_source(&mut self, source: &str) -> Result<()> {
@@ -889,6 +894,72 @@ pub fn latest_policy_decision(path: impl AsRef<Path>) -> Result<LatestPolicyDeci
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("database contains no policy decisions"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DamosHistoryEntry {
+    pub plan_id: String,
+    pub decision_id: String,
+    pub session_id: String,
+    pub disposition: String,
+    pub reasons_json: String,
+    pub created_at: String,
+}
+
+pub fn damos_history(path: impl AsRef<Path>, limit: usize) -> Result<Vec<DamosHistoryEntry>> {
+    if limit == 0 || limit > 100 {
+        bail!("DAMOS history limit must be between 1 and 100");
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut statement = connection.prepare(
+        "SELECT plan_id, decision_id, session_id, disposition, reason_codes_json, created_at
+         FROM damos_action_plans ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([i64::try_from(limit)?], |row| {
+            Ok(DamosHistoryEntry {
+                plan_id: row.get(0)?,
+                decision_id: row.get(1)?,
+                session_id: row.get(2)?,
+                disposition: row.get(3)?,
+                reasons_json: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+pub fn damos_blacklist(path: impl AsRef<Path>, now_ns: i64) -> Result<Vec<damos::BlacklistRecord>> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut statement = connection.prepare(
+        "SELECT evidence_json, stable_identity, region_signature, reason, created_at_ns,
+                expires_at_ns, source_action_id
+         FROM damos_refault_blacklist WHERE expires_at_ns > ?1 ORDER BY expires_at_ns",
+    )?;
+    let rows = statement
+        .query_map([now_ns], |row| {
+            let evidence: String = row.get(0)?;
+            let evidence = serde_json::from_str(&evidence).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let stable: String = row.get(1)?;
+            let region: String = row.get(2)?;
+            Ok(damos::BlacklistRecord {
+                key: format!("{stable}:{region}"),
+                reason: row.get(3)?,
+                created_at_ns: u128::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                expires_at_ns: u128::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                source_action_id: row.get(6)?,
+                evidence,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 pub fn recent_policy_decisions(
@@ -1634,6 +1705,9 @@ mod tests {
         "damon_overhead_samples",
         "damon_region_samples",
         "damon_sessions",
+        "damos_action_plans",
+        "damos_action_results",
+        "damos_refault_blacklist",
         "hosts",
         "model_registry",
         "policy_decisions",
@@ -1794,6 +1868,7 @@ mod tests {
                 (3, migration_checksum(CLASSIFIER_MIGRATION)),
                 (4, migration_checksum(CGROUP_MIGRATION)),
                 (5, migration_checksum(DAMON_MIGRATION)),
+                (6, migration_checksum(DAMOS_MIGRATION)),
             ]
         );
     }
@@ -1810,7 +1885,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration count");
-        assert_eq!(count, 5);
+        assert_eq!(count, MIGRATION_VERSION);
         let journal: String = storage
             .connection()
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

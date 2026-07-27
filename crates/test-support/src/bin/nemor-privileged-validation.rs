@@ -71,6 +71,56 @@ const DAMON_REQUIRED_GATES: &[&str] = &[
     "recovery_idempotent",
     "host_unchanged",
 ];
+const DAMOS_REQUIRED_GATES: &[&str] = &[
+    "capability",
+    "vaddr_pageout_supported",
+    "synthetic_workload_ready",
+    "base_page_backing_verified",
+    "stable_target_identity",
+    "pagemap_range_evidence",
+    "stable_cold_evidence",
+    "gaming_foreground_protection",
+    "policy_decision_recorded",
+    "plan_audited",
+    "quota_within_ceiling",
+    "quota_reset_after_session",
+    "snapshot_ceiling_allows_eligibility",
+    "quota_readback",
+    "cold_address_fence",
+    "cold_address_filter_semantics_verified",
+    "shadow_config_readback",
+    "shadow_candidate_evidence",
+    "shadow_first_eligibility",
+    "shadow_session_passed",
+    "shadow_hot_overlap_zero",
+    "shadow_warm_overlap_zero",
+    "shadow_cleanup",
+    "live_session_independent",
+    "live_config_readback",
+    "live_candidate_evidence",
+    "live_snapshot_ceiling",
+    "pageout_action_readback",
+    "kdamond_started",
+    "kdamond_stopped",
+    "damos_stats_present",
+    "sz_applied_positive",
+    "reclaim_effect_observed",
+    "quota_respected",
+    "hard_byte_ceiling_respected",
+    "hot_not_reclaimed",
+    "warm_not_reclaimed",
+    "control_slowdown_within_budget",
+    "zero_oom",
+    "scheme_removed",
+    "refault_content_valid",
+    "refault_detected",
+    "blacklist_created",
+    "blacklist_blocks_next_plan",
+    "cleanup",
+    "recovery",
+    "recovery_idempotent",
+    "host_unchanged",
+];
 
 #[derive(Debug, Clone, Copy)]
 enum Scope {
@@ -79,6 +129,7 @@ enum Scope {
     Zram,
     Tiering,
     Damon,
+    Damos,
     All,
 }
 
@@ -95,6 +146,8 @@ struct Cli {
     tiering: bool,
     #[arg(long)]
     damon: bool,
+    #[arg(long)]
+    damos: bool,
     #[arg(long)]
     all: bool,
     #[arg(long)]
@@ -114,6 +167,7 @@ impl Cli {
             (self.zram, Scope::Zram),
             (self.tiering, Scope::Tiering),
             (self.damon, Scope::Damon),
+            (self.damos, Scope::Damos),
             (self.all, Scope::All),
         ];
         let values: Vec<_> = selected
@@ -123,7 +177,7 @@ impl Cli {
         match values.as_slice() {
             [scope] => Ok(*scope),
             _ => bail!(
-                "select exactly one of --preflight, --cgroups, --zram, --tiering, --damon, or --all"
+                "select exactly one of --preflight, --cgroups, --zram, --tiering, --damon, --damos, or --all"
             ),
         }
     }
@@ -169,10 +223,20 @@ struct HostSnapshot {
     validation_processes: BTreeSet<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum GateState {
+    #[default]
+    NotEvaluated,
+    Pass,
+    Fail,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Check {
     name: String,
     passed: bool,
+    state: GateState,
     detail: String,
 }
 
@@ -281,6 +345,89 @@ struct DamonEvidence {
     instrumentation_failure_reason: Option<String>,
     signal_failure_reason: Option<String>,
     required_gates_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DamosEvidence {
+    attempted: bool,
+    checks: Vec<Check>,
+    capability: Option<damos::DamosCapability>,
+    decision_id: Option<String>,
+    plan_id: Option<String>,
+    shadow_session_id: Option<String>,
+    live_session_id: Option<String>,
+    target_pid: Option<u32>,
+    target_start_ticks: Option<u64>,
+    cold_range: Option<damon::AddressRange>,
+    zone_backing: BTreeMap<String, damon::ZoneBacking>,
+    filter_api: Option<damos::FilterApi>,
+    filter_layer: Option<String>,
+    filter_type: Option<String>,
+    filter_matching_requested: Option<bool>,
+    filter_matching_effective: Option<bool>,
+    filter_allow_requested: Option<bool>,
+    filter_allow_effective: Option<bool>,
+    filter_start_requested: Option<u64>,
+    filter_start_effective: Option<u64>,
+    filter_end_requested: Option<u64>,
+    filter_end_effective: Option<u64>,
+    quota_requested: Option<damos::DamosQuota>,
+    quota_effective: Option<damos::DamosQuota>,
+    shadow_access_pattern: Option<damos::Readback<damos::AccessPattern>>,
+    live_access_pattern: Option<damos::Readback<damos::AccessPattern>>,
+    shadow_monitoring_intervals: Option<damos::Readback<damos::MonitoringIntervals>>,
+    live_monitoring_intervals: Option<damos::Readback<damos::MonitoringIntervals>>,
+    shadow_stats: Option<damos::DamosStats>,
+    live_stats: Option<damos::DamosStats>,
+    shadow_trace: Option<DamosTraceDiagnostic>,
+    live_trace: Option<DamosTraceDiagnostic>,
+    shadow_candidates: Vec<damos::DamosBeforeApplyEvent>,
+    live_candidates: Vec<damos::DamosBeforeApplyEvent>,
+    shadow_sysfs_timestamps_ns: BTreeMap<String, u128>,
+    shadow_sysfs_clock_domain: Option<String>,
+    reclaim: Option<damos::ReclaimEvidence>,
+    refault: Option<damos::RefaultEvidence>,
+    blacklist: Option<damos::BlacklistRecord>,
+    refault_state: Option<damos::RefaultState>,
+    configured_age_min: Option<u64>,
+    empirical_shadow_first_eligibility_snapshot: Option<u64>,
+    empirical_shadow_first_region_age: Option<u64>,
+    requested_max_nr_snapshots: Option<u64>,
+    effective_max_nr_snapshots: Option<u64>,
+    live_deadline_ms: Option<u64>,
+    quota_reset_interval_ms: Option<u64>,
+    quota_reset_margin_ms: Option<u64>,
+    action_hard_ceiling_bytes: Option<u64>,
+    configured_session_total_ceiling: Option<u64>,
+    separate_owned_mappings: Option<bool>,
+    containing_vma_shared: Option<bool>,
+    kdamond_cpu_percent: Option<f64>,
+    control_cpu_percent: Option<f64>,
+    control_slowdown_percent: Option<f64>,
+    failure_class: Option<String>,
+    failure_reason: Option<String>,
+    required_gates_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DamosTraceDiagnostic {
+    available: bool,
+    instance_path: String,
+    trace_clock: Option<String>,
+    userspace_clock: Option<String>,
+    trace_clock_readback: bool,
+    event_enable_readback: bool,
+    tracing_on_readback: bool,
+    capture_worker_ready: bool,
+    trace_bytes_read: u64,
+    trace_lines_read: u64,
+    event_lines_seen: u64,
+    events_parsed: u64,
+    parse_failures: u64,
+    timestamp_failures: u64,
+    bytes_after_stop: u64,
+    raw_first: Vec<String>,
+    raw_last: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -518,6 +665,177 @@ impl TraceCaptureWorker {
     }
 }
 
+struct DamosTraceCaptureWorker {
+    stop: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+    instance: PathBuf,
+    clock: TraceClockPlan,
+}
+
+impl DamosTraceCaptureWorker {
+    fn start(instance: &Path, clock: TraceClockPlan) -> Result<Self> {
+        let enable = instance.join("events/damon/damos_before_apply/enable");
+        if read_trimmed(&enable)? != "1" || read_trimmed(&instance.join("tracing_on"))? != "1" {
+            bail!("DAMOS capture requires owned event/tracing readback");
+        }
+        let mut file = OpenOptions::new().read(true).open(instance.join("trace"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let worker_stop = Arc::clone(&stop);
+        let worker_ready = Arc::clone(&ready);
+        let worker_buffer = Arc::clone(&buffer);
+        let handle = thread::spawn(move || -> Result<()> {
+            worker_ready.store(true, Ordering::Release);
+            while !worker_stop.load(Ordering::Acquire) {
+                file.seek(SeekFrom::Start(0))?;
+                let mut snapshot = Vec::new();
+                file.read_to_end(&mut snapshot)?;
+                if snapshot.len() > 1024 * 1024 {
+                    bail!("DAMOS trace exceeded bounded one-MiB buffer");
+                }
+                *worker_buffer
+                    .lock()
+                    .map_err(|_| anyhow!("DAMOS trace buffer poisoned"))? = snapshot;
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !ready.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                bail!("DAMOS capture worker readiness timeout");
+            }
+            thread::yield_now();
+        }
+        Ok(Self {
+            stop,
+            ready,
+            buffer,
+            handle: Some(handle),
+            instance: instance.to_path_buf(),
+            clock,
+        })
+    }
+
+    fn bytes_read(&self) -> Result<usize> {
+        Ok(self
+            .buffer
+            .lock()
+            .map_err(|_| anyhow!("DAMOS trace buffer poisoned"))?
+            .len())
+    }
+
+    fn drain_and_stop(
+        mut self,
+        bytes_at_stop: usize,
+    ) -> Result<(DamosTraceDiagnostic, Vec<damos::DamosBeforeApplyEvent>)> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut last = self.bytes_read()?;
+        let mut stable = 0;
+        while Instant::now() < deadline && stable < 2 {
+            thread::sleep(Duration::from_millis(25));
+            let current = self.bytes_read()?;
+            if current == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = current;
+            }
+        }
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| anyhow!("DAMOS capture worker panicked"))??;
+        }
+        let bytes = self
+            .buffer
+            .lock()
+            .map_err(|_| anyhow!("DAMOS trace buffer poisoned"))?
+            .clone();
+        parse_damos_trace_capture(
+            &self.instance,
+            &self.clock,
+            self.ready.load(Ordering::Acquire),
+            &bytes,
+            bytes.len().saturating_sub(bytes_at_stop),
+        )
+    }
+}
+
+fn parse_damos_trace_capture(
+    instance: &Path,
+    clock: &TraceClockPlan,
+    worker_ready: bool,
+    bytes: &[u8],
+    bytes_after_stop: usize,
+) -> Result<(DamosTraceDiagnostic, Vec<damos::DamosBeforeApplyEvent>)> {
+    const RAW_LIMIT: usize = 4;
+    let text = String::from_utf8_lossy(bytes);
+    let lines = text
+        .lines()
+        .filter(|line| line.contains("damos_before_apply:"))
+        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    let mut parse_failures = 0;
+    let mut timestamp_failures = 0;
+    for line in &lines {
+        if let Some(timestamp) = trace_timestamp_ns_for(line, "damos_before_apply:") {
+            match damos::parse_damos_before_apply(line, timestamp) {
+                Ok(event) => events.push(event),
+                Err(_) => parse_failures += 1,
+            }
+        } else {
+            timestamp_failures += 1;
+        }
+    }
+    let raw_first = lines
+        .iter()
+        .take(RAW_LIMIT)
+        .map(|line| (*line).to_owned())
+        .collect();
+    let raw_last = lines
+        .iter()
+        .rev()
+        .take(RAW_LIMIT)
+        .map(|line| (*line).to_owned())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    Ok((
+        DamosTraceDiagnostic {
+            available: true,
+            instance_path: instance.display().to_string(),
+            trace_clock: Some(clock.effective.clone()),
+            userspace_clock: Some(clock.userspace_clock.report_name().to_owned()),
+            trace_clock_readback: clock.readback,
+            event_enable_readback: read_trimmed(
+                &instance.join("events/damon/damos_before_apply/enable"),
+            )
+            .ok()
+            .as_deref()
+                == Some("1"),
+            tracing_on_readback: read_trimmed(&instance.join("tracing_on")).ok().as_deref()
+                == Some("1"),
+            capture_worker_ready: worker_ready,
+            trace_bytes_read: bytes.len() as u64,
+            trace_lines_read: text.lines().count() as u64,
+            event_lines_seen: lines.len() as u64,
+            events_parsed: events.len() as u64,
+            parse_failures,
+            timestamp_failures,
+            bytes_after_stop: bytes_after_stop as u64,
+            raw_first,
+            raw_last,
+        },
+        events,
+    ))
+}
+
 fn parse_trace_capture(
     session_id: &str,
     instance: &Path,
@@ -655,6 +973,7 @@ struct ValidationReport {
     zram: ZramEvidence,
     tiering: TieringEvidence,
     damon: DamonEvidence,
+    damos: DamosEvidence,
     host_unchanged: bool,
     errors: Vec<String>,
 }
@@ -753,7 +1072,14 @@ fn main() -> Result<()> {
         return run_internal_worker(worker);
     }
     if cli.cleanup_owned_residue {
-        if cli.preflight || cli.cgroups || cli.zram || cli.tiering || cli.damon || cli.all {
+        if cli.preflight
+            || cli.cgroups
+            || cli.zram
+            || cli.tiering
+            || cli.damon
+            || cli.damos
+            || cli.all
+        {
             bail!("--cleanup-owned-residue cannot be combined with validation modes");
         }
         return cleanup_owned_residue();
@@ -779,6 +1105,7 @@ fn main() -> Result<()> {
         zram: ZramEvidence::default(),
         tiering: TieringEvidence::default(),
         damon: DamonEvidence::default(),
+        damos: DamosEvidence::default(),
         host_unchanged: false,
         errors: Vec::new(),
     };
@@ -807,6 +1134,12 @@ fn main() -> Result<()> {
             report.errors.push(format!("damon: {error:#}"));
         }
     }
+    if matches!(scope, Scope::Damos | Scope::All) {
+        deadline.check("DAMOS validation")?;
+        if let Err(error) = validate_damos(&mut report.damos, &deadline) {
+            report.errors.push(format!("damos: {error:#}"));
+        }
+    }
 
     report.final_snapshot = snapshot_host()?;
     report.host_unchanged = compare_host(&baseline, &report.final_snapshot).is_ok();
@@ -827,6 +1160,22 @@ fn main() -> Result<()> {
             report
                 .errors
                 .push("damon: one or more mandatory validation gates failed".to_owned());
+        }
+    }
+    if matches!(scope, Scope::Damos | Scope::All) {
+        report.damos.checks.push(check(
+            "host_unchanged",
+            report.host_unchanged,
+            "final structural host snapshot compared with baseline".to_owned(),
+        ));
+        fill_damos_not_evaluated_gates(&mut report.damos);
+        report.damos.required_gates_passed =
+            required_checks_pass(&report.damos.checks, DAMOS_REQUIRED_GATES);
+        if !report.damos.required_gates_passed {
+            ensure_damos_failure_taxonomy(&mut report.damos);
+            report
+                .errors
+                .push("damos: one or more mandatory validation gates failed".to_owned());
         }
     }
     report.finished_ns = now_ns()?;
@@ -1586,10 +1935,16 @@ fn damon_target_worker() -> Result<()> {
     let backing_profile: damon::PageBackingProfile = serde_json::from_slice(&fs::read(
         Path::new(STATE_DIR).join("damon-backing-profile"),
     )?)?;
-    let zone = zone_bytes;
-    let mut hot = owned_anonymous_zone(zone, backing_profile)?;
-    let mut warm = owned_anonymous_zone(zone, backing_profile)?;
-    let mut cold = owned_anonymous_zone(zone, backing_profile)?;
+    let cold_bytes = fs::read_to_string(Path::new(STATE_DIR).join("damon-cold-zone-bytes"))
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(zone_bytes);
+    if cold_bytes == 0 || cold_bytes > damon::MAX_DIAGNOSTIC_ZONE_BYTES as usize {
+        bail!("DAMOS COLD zone size is outside bound");
+    }
+    let mut hot = owned_anonymous_zone(zone_bytes, backing_profile)?;
+    let mut warm = owned_anonymous_zone(zone_bytes, backing_profile)?;
+    let mut cold = owned_anonymous_zone(cold_bytes, backing_profile)?;
     hot.fill(1);
     warm.fill(2);
     cold.fill(3);
@@ -1684,7 +2039,17 @@ fn damon_target_worker() -> Result<()> {
     }
     let started_ns = now_ns()?;
     active.store(true, Ordering::Release);
+    let mut cold_refault_fingerprint = None;
     while !Path::new(STATE_DIR).join("damon-stop").exists() {
+        if cold_refault_fingerprint.is_none() && Path::new(STATE_DIR).join("damon-refault").exists()
+        {
+            let (_, fingerprint) = touch_zone(&mut cold);
+            cold_refault_fingerprint = Some(fingerprint);
+            fs::write(
+                Path::new(STATE_DIR).join("damon-refault-result"),
+                fingerprint.to_string(),
+            )?;
+        }
         write_workload_progress(&WorkloadProgress {
             hot_cycles: hot_cycles.load(Ordering::Acquire),
             warm_cycles: warm_cycles.load(Ordering::Acquire),
@@ -1707,7 +2072,7 @@ fn damon_target_worker() -> Result<()> {
     let (warm, warm_fingerprint) = warm_thread
         .join()
         .map_err(|_| anyhow!("WARM worker panicked"))?;
-    let cold_fingerprint = fingerprint_zone(&cold);
+    let cold_fingerprint = cold_refault_fingerprint.unwrap_or_else(|| fingerprint_zone(&cold));
     write_workload_progress(&WorkloadProgress {
         hot_cycles: hot_cycles.load(Ordering::Acquire),
         warm_cycles: warm_cycles.load(Ordering::Acquire),
@@ -2629,6 +2994,1384 @@ fn validate_damon(evidence: &mut DamonEvidence, deadline: &Deadline) -> Result<(
     Ok(())
 }
 
+fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<()> {
+    evidence.attempted = true;
+    deadline.check("DAMOS preflight")?;
+    let damon_capability = damon::inspect_linux(
+        Path::new("/"),
+        Some(read_command("/usr/bin/uname", &["-r"])?),
+    );
+    let capability_safe = damon_capability.supported
+        && damon_capability.writable
+        && !damon_capability.active_external_session
+        && !damon_capability.special_module_conflict;
+    evidence.checks.push(check(
+        "capability",
+        capability_safe,
+        format!("{damon_capability:?}"),
+    ));
+    if !capability_safe {
+        evidence.failure_class = Some("capability_failure".into());
+        bail!("DAMON ownership/capability preflight failed");
+    }
+    if mem_available_bytes()? < 1024 * 1024 * 1024 + 48 * 1024 * 1024 {
+        evidence.failure_class = Some("safety_failure".into());
+        bail!("one-GiB MemAvailable headroom cannot be preserved");
+    }
+    let admin = Path::new("/sys/kernel/mm/damon/admin/kdamonds");
+    if read_trimmed(&admin.join("nr_kdamonds"))? != "0" {
+        evidence.failure_class = Some("safety_failure".into());
+        bail!("external kdamond objects make ownership ambiguous");
+    }
+    let baseline_instances = trace_instances()?;
+    let mut child = spawn_damos_target()?;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(STATE_DIR).join("damon-target.json"))?)?;
+    let [hot, warm, cold] = target_ranges_from_metadata(&metadata)?;
+    evidence.target_pid = Some(child.id());
+    evidence.target_start_ticks = Some(child.start_ticks);
+    evidence.cold_range = Some(cold);
+    let identity_ok = metadata["pid"].as_u64() == Some(u64::from(child.id()))
+        && metadata["start_ticks"].as_u64() == Some(child.start_ticks)
+        && proc_start_ticks(child.id())? == Some(child.start_ticks);
+    evidence.checks.push(check(
+        "synthetic_workload_ready",
+        metadata["state"] == "ready",
+        "READY barrier reached".into(),
+    ));
+    evidence.checks.push(check(
+        "stable_target_identity",
+        identity_ok,
+        format!("pid={}, start_ticks={}", child.id(), child.start_ticks),
+    ));
+    if !identity_ok {
+        bail!("synthetic target identity mismatch");
+    }
+    let smaps = fs::read_to_string(format!("/proc/{}/smaps", child.id()))?;
+    let mut backing = BTreeMap::from([
+        ("hot".to_owned(), damon::parse_smaps_zone(&smaps, hot)?),
+        ("warm".to_owned(), damon::parse_smaps_zone(&smaps, warm)?),
+        ("cold".to_owned(), damon::parse_smaps_zone(&smaps, cold)?),
+    ]);
+    for zone in backing.values_mut() {
+        zone.explicit_nohugepage_requested = true;
+        zone.explicit_nohugepage_verified = zone.anon_huge_pages_kib == 0
+            && (zone.thp_eligible == Some(false) || zone.vm_flags.iter().any(|flag| flag == "nh"));
+    }
+    evidence.separate_owned_mappings = Some([hot, warm, cold].into_iter().all(|left| {
+        [hot, warm, cold]
+            .into_iter()
+            .all(|right| left == right || left.overlap(right) == 0)
+    }));
+    let containing_vma_shared = mark_shared_vma_group(&mut backing);
+    evidence.containing_vma_shared = Some(containing_vma_shared);
+    evidence.zone_backing = backing.clone();
+    let base_pages = backing
+        .values()
+        .all(|zone| zone.explicit_nohugepage_requested && zone.explicit_nohugepage_verified);
+    evidence.checks.push(check(
+        "base_page_backing_verified",
+        base_pages,
+        format!("{backing:?}"),
+    ));
+    if !base_pages {
+        bail!("mapping-local NOHUGEPAGE readback failed");
+    }
+    let ranges =
+        damon::InitialRegionPlan::new(vec![hot, warm, cold], &proc_mapped_ranges(child.id())?)?;
+    signal_damon_target("damon-start")?;
+    std::thread::sleep(Duration::from_millis(1600));
+    let progress = read_progress()?;
+    evidence.checks.push(check(
+        "stable_cold_evidence",
+        progress.cold_cycles == 0,
+        "COLD untouched across at least three 500ms complete windows".into(),
+    ));
+    let protected_reject = |foreground, gaming| {
+        let input = damos::EligibilityInput {
+            identity: Some(damos::StableTargetIdentity {
+                pid: child.id(),
+                start_ticks: child.start_ticks,
+                stable_key: format!("synthetic:{}", child.start_ticks),
+                owned: true,
+            }),
+            identity_fresh: true,
+            background: true,
+            foreground,
+            gaming,
+            critical: false,
+            protected: false,
+            known_classification: true,
+            pressure: policy_engine::PressureState::Pressure,
+            cold_observations: (0..3)
+                .map(|_| damos::ColdObservation {
+                    complete: true,
+                    nr_accesses: 0,
+                    age: 3,
+                    range: cold,
+                })
+                .collect(),
+            valid_age_evidence: true,
+            recent_refault: false,
+            blacklisted: false,
+            safety_conflict: false,
+        };
+        damos::evaluate_eligibility(&input).disposition == damos::PlanDisposition::Rejected
+    };
+    evidence.checks.push(check(
+        "gaming_foreground_protection",
+        protected_reject(true, false) && protected_reject(false, true),
+        "foreground and gaming inputs rejected before sysfs action".into(),
+    ));
+
+    let access_pattern = damos::AccessPattern::validation_cold();
+    let monitoring_intervals = damos::MonitoringIntervals {
+        sample_us: 25_000,
+        aggr_us: 500_000,
+        update_us: 10_000_000,
+    };
+    let quota = damos::DamosQuota {
+        time_ms: damos::VALIDATION_TIME_QUOTA_MS,
+        bytes: damos::VALIDATION_BYTE_QUOTA,
+        reset_interval_ms: damos::VALIDATION_RESET_INTERVAL_MS,
+        total_applied_bytes: damos::VALIDATION_TOTAL_APPLIED_CEILING,
+    };
+    let configured_age_min = access_pattern.configured_age_min();
+    let max_nr_snapshots = damos::VALIDATION_MAX_NR_SNAPSHOTS;
+    damos::validate_attempt2_bounds(
+        &access_pattern,
+        &quota,
+        500_000,
+        damos::VALIDATION_LIVE_DEADLINE_MS,
+        max_nr_snapshots,
+    )?;
+    evidence.configured_age_min = Some(configured_age_min);
+    evidence.requested_max_nr_snapshots = Some(max_nr_snapshots);
+    evidence.live_deadline_ms = Some(damos::VALIDATION_LIVE_DEADLINE_MS);
+    evidence.quota_reset_interval_ms = Some(quota.reset_interval_ms);
+    evidence.quota_reset_margin_ms = Some(
+        quota
+            .reset_interval_ms
+            .saturating_sub(damos::VALIDATION_LIVE_DEADLINE_MS),
+    );
+    evidence.action_hard_ceiling_bytes = Some(damos::VALIDATION_BYTE_QUOTA);
+    evidence.configured_session_total_ceiling = Some(damos::VALIDATION_TOTAL_APPLIED_CEILING);
+
+    let shadow_id = format!("nemor-validation-damos-shadow-{}", now_ns()?);
+    evidence.shadow_session_id = Some(shadow_id.clone());
+    let shadow = run_owned_damos_session(DamosSessionSpec {
+        session_id: &shadow_id,
+        admin,
+        child_pid: child.id(),
+        child_start_ticks: child.start_ticks,
+        ranges: &ranges,
+        hot,
+        warm,
+        cold,
+        action: damos::DamosAction::Stat,
+        duration: Duration::from_millis(3_000),
+        validated_filter: None,
+        access_pattern: &access_pattern,
+        monitoring_intervals: &monitoring_intervals,
+        quota: &quota,
+        max_nr_snapshots: None,
+    })?;
+    evidence.capability = Some(shadow.capability.clone());
+    evidence.shadow_stats = Some(shadow.stats.clone());
+    evidence.shadow_trace = Some(shadow.trace.clone());
+    evidence.shadow_candidates = shadow.candidates.clone();
+    evidence.shadow_sysfs_timestamps_ns = shadow.sysfs_timestamps_ns.clone();
+    evidence.shadow_sysfs_clock_domain = Some("realtime".into());
+    evidence.shadow_access_pattern = Some(shadow.access_pattern.clone());
+    evidence.shadow_monitoring_intervals = Some(shadow.monitoring_intervals.clone());
+    evidence.empirical_shadow_first_eligibility_snapshot = shadow.stats.first_tried_snapshot_index;
+    evidence.empirical_shadow_first_region_age = shadow.stats.first_tried_region_age;
+    let shadow_trace_valid = shadow.trace.available
+        && shadow.trace.trace_clock_readback
+        && shadow.trace.event_enable_readback
+        && shadow.trace.tracing_on_readback
+        && shadow.trace.capture_worker_ready
+        && shadow.trace.events_parsed > 0
+        && shadow.trace.parse_failures == 0
+        && shadow.trace.timestamp_failures == 0;
+    let shadow_candidates_valid =
+        damos::validate_shadow_candidates(&shadow.candidates, hot, warm, cold, configured_age_min)
+            .is_ok();
+    let shadow_sysfs_lifecycle_valid = tried_regions_lifecycle(&shadow.sysfs_timestamps_ns)
+        .is_some_and(|lifecycle| lifecycle.valid());
+    evidence.filter_api = Some(shadow.filter_spec.api.clone());
+    evidence.filter_layer = Some(shadow.filter_spec.layer.clone());
+    evidence.filter_type = Some(shadow.filter_spec.filter_type.clone());
+    evidence.filter_matching_requested = Some(shadow.filter_spec.matching);
+    evidence.filter_matching_effective = Some(shadow.filter_spec.matching);
+    evidence.filter_allow_requested = shadow.filter_spec.allow;
+    evidence.filter_allow_effective = shadow.filter_spec.allow;
+    evidence.filter_start_requested = Some(cold.start);
+    evidence.filter_start_effective = Some(shadow.filter_spec.range.start);
+    evidence.filter_end_requested = Some(cold.end);
+    evidence.filter_end_effective = Some(shadow.filter_spec.range.end);
+    evidence.checks.extend([
+        check(
+            "vaddr_pageout_supported",
+            shadow.capability.live_pageout_ready().is_ok(),
+            format!("{:?}", shadow.capability),
+        ),
+        check(
+            "cold_address_fence",
+            shadow.fence_readback,
+            format!("range={cold:?}"),
+        ),
+        check(
+            "cold_address_filter_semantics_verified",
+            shadow.fence_readback && shadow.filter_spec.validate(cold).is_ok(),
+            format!("filter={:?}", shadow.filter_spec),
+        ),
+        check(
+            "shadow_config_readback",
+            shadow.access_pattern.readback && shadow.monitoring_intervals.readback,
+            format!(
+                "pattern={:?}, intervals={:?}",
+                shadow.access_pattern, shadow.monitoring_intervals
+            ),
+        ),
+        check(
+            "shadow_candidate_evidence",
+            shadow_trace_valid
+                && shadow_candidates_valid
+                && shadow_sysfs_lifecycle_valid
+                && shadow.stats.nr_tried.unwrap_or(0) > 0
+                && shadow.stats.sz_tried.unwrap_or(0) > 0,
+            format!(
+                "trace={:?}, candidates={}, sysfs_cross_check_regions={}, timestamps={:?}",
+                shadow.trace,
+                shadow.candidates.len(),
+                shadow.stats.tried_region_samples.len(),
+                shadow.sysfs_timestamps_ns
+            ),
+        ),
+        check(
+            "shadow_first_eligibility",
+            shadow.stats.first_tried_snapshot_index.is_some()
+                && shadow.stats.first_tried_region_age.is_some()
+                && shadow.stats.first_tried_timestamp_ns.is_some(),
+            format!(
+                "snapshot={:?}, age={:?}, timestamp={:?}",
+                shadow.stats.first_tried_snapshot_index,
+                shadow.stats.first_tried_region_age,
+                shadow.stats.first_tried_timestamp_ns
+            ),
+        ),
+        check(
+            "shadow_session_passed",
+            shadow.stats.nr_tried.unwrap_or(0) > 0
+                && shadow.stats.sz_tried.unwrap_or(0) > 0
+                && shadow_trace_valid
+                && shadow_candidates_valid
+                && shadow
+                    .candidates
+                    .iter()
+                    .all(|event| event.range.start >= cold.start && event.range.end <= cold.end),
+            format!("{:?}", shadow.stats),
+        ),
+        check(
+            "shadow_hot_overlap_zero",
+            shadow
+                .candidates
+                .iter()
+                .all(|event| event.range.overlap(hot) == 0),
+            "no tried HOT overlap".into(),
+        ),
+        check(
+            "shadow_warm_overlap_zero",
+            shadow
+                .candidates
+                .iter()
+                .all(|event| event.range.overlap(warm) == 0),
+            "no tried WARM overlap".into(),
+        ),
+        check(
+            "shadow_cleanup",
+            shadow.cleaned,
+            "owned stat session removed".into(),
+        ),
+    ]);
+    if shadow.capability.live_pageout_ready().is_err()
+        || !shadow.fence_readback
+        || !shadow.access_pattern.readback
+        || !shadow.monitoring_intervals.readback
+        || !shadow_trace_valid
+        || !shadow_candidates_valid
+        || !shadow_sysfs_lifecycle_valid
+        || shadow.stats.first_tried_snapshot_index.is_none()
+        || shadow.stats.first_tried_region_age.is_none()
+        || shadow.candidates.is_empty()
+    {
+        evidence.failure_class = Some("shadow_failure".into());
+        bail!("shadow safety gate failed");
+    }
+    let decision_id = format!("manual-validation-decision-{}", now_ns()?);
+    let plan_id = format!("damos-plan-{}", now_ns()?);
+    evidence.decision_id = Some(decision_id.clone());
+    evidence.plan_id = Some(plan_id.clone());
+    let decision_record = serde_json::json!({
+        "policy_decision_id": decision_id.clone(),
+        "action_plan_id": plan_id.clone(),
+        "target_pid": child.id(),
+        "target_start_ticks": child.start_ticks,
+        "reason": "manual_validation",
+        "pressure_state": "PRESSURE",
+        "cold_range": cold,
+        "timestamp_ns": now_ns()?,
+    });
+    let decision_path = Path::new(STATE_DIR).join("damos-decision.json");
+    fs::write(&decision_path, serde_json::to_vec_pretty(&decision_record)?)?;
+    evidence.checks.push(check(
+        "policy_decision_recorded",
+        decision_path.is_file(),
+        format!("decision_id={decision_id}; reason=manual_validation"),
+    ));
+    quota.validate(5, 268_435_456)?;
+    evidence.quota_requested = Some(quota.clone());
+    let plan = damos::DamosPlan {
+        decision_id: decision_id.clone(),
+        plan_id: plan_id.clone(),
+        session_id: format!("nemor-validation-damos-live-{}", now_ns()?),
+        scheme_id: 0,
+        target: damos::StableTargetIdentity {
+            pid: child.id(),
+            start_ticks: child.start_ticks,
+            stable_key: format!("synthetic:{}", child.start_ticks),
+            owned: true,
+        },
+        action: damos::DamosAction::Pageout,
+        pattern_accesses_min: access_pattern.nr_accesses.min,
+        pattern_accesses_max: access_pattern.nr_accesses.max,
+        pattern_age_min: access_pattern.age.min,
+        pattern_age_max: access_pattern.age.max,
+        apply_interval_us: 500_000,
+        quota: quota.clone(),
+        fence: shadow.filter_spec.clone(),
+        max_nr_snapshots: Some(max_nr_snapshots),
+        dry_run: false,
+    };
+    plan.validate(5, 268_435_456)?;
+    plan.fence.validate(cold)?;
+    evidence.checks.push(check(
+        "plan_audited",
+        true,
+        format!(
+            "decision_id={decision_id}, plan_id={plan_id}, session_id={}",
+            plan.session_id
+        ),
+    ));
+    evidence
+        .checks
+        .push(check("quota_within_ceiling", true, format!("{quota:?}")));
+    evidence.checks.extend([
+        check(
+            "quota_reset_after_session",
+            damos::VALIDATION_LIVE_DEADLINE_MS < quota.reset_interval_ms,
+            format!(
+                "live_deadline_ms={}, reset_interval_ms={}, margin_ms={}",
+                damos::VALIDATION_LIVE_DEADLINE_MS,
+                quota.reset_interval_ms,
+                quota
+                    .reset_interval_ms
+                    .saturating_sub(damos::VALIDATION_LIVE_DEADLINE_MS)
+            ),
+        ),
+        check(
+            "snapshot_ceiling_allows_eligibility",
+            shadow
+                    .stats
+                    .first_tried_snapshot_index
+                    .is_some_and(|first| max_nr_snapshots > first),
+            format!(
+                "configured_age_min={configured_age_min}, empirical_shadow_first={:?}, max={max_nr_snapshots}",
+                shadow.stats.first_tried_snapshot_index
+            ),
+        ),
+    ]);
+    let live_id = plan.session_id.clone();
+    evidence.live_session_id = Some(live_id.clone());
+    evidence.checks.push(check(
+        "live_session_independent",
+        live_id != shadow_id,
+        format!("shadow={shadow_id}, live={live_id}"),
+    ));
+    let smaps_before = fs::read_to_string(format!("/proc/{}/smaps", child.id()))?;
+    let vma_before = damon::parse_smaps_zone(&smaps_before, cold)?;
+    let hot_residency_before = read_range_residency(child.id(), child.start_ticks, hot)?;
+    let warm_residency_before = read_range_residency(child.id(), child.start_ticks, warm)?;
+    let cold_residency_before = read_range_residency(child.id(), child.start_ticks, cold)?;
+    let pagemap_capable = [
+        &hot_residency_before,
+        &warm_residency_before,
+        &cold_residency_before,
+    ]
+    .into_iter()
+    .all(|snapshot| snapshot.validate().is_ok());
+    evidence.checks.push(check(
+        "pagemap_range_evidence",
+        pagemap_capable,
+        format!(
+            "source=proc_pagemap, hot={hot_residency_before:?}, warm={warm_residency_before:?}, cold={cold_residency_before:?}"
+        ),
+    ));
+    if !pagemap_capable {
+        evidence.failure_class = Some("capability_failure".into());
+        bail!("exact owned-range pagemap evidence unavailable");
+    }
+    let progress_before = read_progress()?;
+    let control_before = process_cpu_ns()?;
+    let oom_before = oom_kill_count();
+    let live = run_owned_damos_session(DamosSessionSpec {
+        session_id: &live_id,
+        admin,
+        child_pid: child.id(),
+        child_start_ticks: child.start_ticks,
+        ranges: &ranges,
+        hot,
+        warm,
+        cold,
+        action: damos::DamosAction::Pageout,
+        duration: Duration::from_millis(damos::VALIDATION_LIVE_MONITOR_MS),
+        validated_filter: Some(&shadow.filter_spec),
+        access_pattern: &access_pattern,
+        monitoring_intervals: &monitoring_intervals,
+        quota: &quota,
+        max_nr_snapshots: Some(max_nr_snapshots),
+    })?;
+    let control_after = process_cpu_ns()?;
+    let progress_after = read_progress()?;
+    let smaps_after_pageout = fs::read_to_string(format!("/proc/{}/smaps", child.id()))?;
+    let vma_after_pageout = damon::parse_smaps_zone(&smaps_after_pageout, cold)?;
+    // This snapshot is intentionally taken after state=off/stats/trace drain and
+    // before the synthetic child is allowed to touch COLD for refault.
+    let hot_residency_after_pageout = read_range_residency(child.id(), child.start_ticks, hot)?;
+    let warm_residency_after_pageout = read_range_residency(child.id(), child.start_ticks, warm)?;
+    let cold_residency_after_pageout = read_range_residency(child.id(), child.start_ticks, cold)?;
+    evidence.quota_effective = Some(live.quota.clone());
+    evidence.live_access_pattern = Some(live.access_pattern.clone());
+    evidence.live_monitoring_intervals = Some(live.monitoring_intervals.clone());
+    evidence.live_stats = Some(live.stats.clone());
+    evidence.live_trace = Some(live.trace.clone());
+    evidence.live_candidates = live.candidates.clone();
+    evidence.effective_max_nr_snapshots = live.stats.max_nr_snapshots;
+    let mut reclaim = damos::ReclaimEvidence {
+        stats: live.stats.clone(),
+        vma: damos::VmaReclaimEvidence {
+            containing_vma_start: vma_before.containing_vma_start.unwrap_or(0),
+            containing_vma_end: vma_before.containing_vma_end.unwrap_or(0),
+            containing_vma_shared,
+            rss_before: vma_before.rss_kib * 1024,
+            rss_after_pageout: vma_after_pageout.rss_kib * 1024,
+            pss_before: vma_before.pss_kib * 1024,
+            pss_after_pageout: vma_after_pageout.pss_kib * 1024,
+            swap_before: vma_before.swap_kib * 1024,
+            swap_after_pageout: vma_after_pageout.swap_kib * 1024,
+        },
+        ranges: damos::RangeReclaimEvidence {
+            hot: damos::ZoneRangeEvidence {
+                before: hot_residency_before,
+                after_pageout: hot_residency_after_pageout,
+                after_refault: None,
+            },
+            warm: damos::ZoneRangeEvidence {
+                before: warm_residency_before,
+                after_pageout: warm_residency_after_pageout,
+                after_refault: None,
+            },
+            cold: damos::ZoneRangeEvidence {
+                before: cold_residency_before,
+                after_pageout: cold_residency_after_pageout,
+                after_refault: None,
+            },
+        },
+    };
+    let applied = live.stats.sz_applied.unwrap_or(0);
+    let hard_byte_ceiling_respected = damos::hard_byte_ceiling_respected(
+        &live.stats,
+        quota.bytes,
+        quota.reset_interval_ms,
+        damos::VALIDATION_LIVE_DEADLINE_MS,
+    );
+    let tried_region_size_sum = live
+        .stats
+        .tried_region_samples
+        .iter()
+        .map(|region| region.size)
+        .sum::<u64>();
+    let quota_respected = hard_byte_ceiling_respected
+        && live
+            .stats
+            .nr_snapshots
+            .is_some_and(|value| value <= max_nr_snapshots)
+        && damos::VALIDATION_LIVE_DEADLINE_MS < quota.reset_interval_ms;
+    evidence.reclaim = Some(reclaim.clone());
+    let hot_cycles = progress_after
+        .hot_cycles
+        .saturating_sub(progress_before.hot_cycles);
+    let expected_hot = (progress.hot_cycles as f64 / 1.6
+        * (damos::VALIDATION_LIVE_MONITOR_MS as f64 / 1_000.0))
+        .max(1.0);
+    let slowdown = ((expected_hot - hot_cycles as f64) / expected_hot * 100.0).max(0.0);
+    evidence.control_slowdown_percent = Some(slowdown);
+    evidence.control_cpu_percent = Some(
+        (control_after.saturating_sub(control_before) as f64
+            / (damos::VALIDATION_LIVE_DEADLINE_MS as f64 * 1_000_000.0))
+            * 100.0,
+    );
+    evidence.kdamond_cpu_percent = Some(live.kdamond_cpu_percent);
+    let live_candidates_valid =
+        damos::validate_shadow_candidates(&live.candidates, hot, warm, cold, configured_age_min)
+            .is_ok();
+    evidence.checks.extend([
+        check(
+            "live_config_readback",
+            live.access_pattern.readback && live.monitoring_intervals.readback,
+            format!(
+                "pattern={:?}, intervals={:?}",
+                live.access_pattern, live.monitoring_intervals
+            ),
+        ),
+        check(
+            "live_candidate_evidence",
+            live.trace.available
+                && live.trace.capture_worker_ready
+                && live.trace.events_parsed > 0
+                && live.trace.parse_failures == 0
+                && live.trace.timestamp_failures == 0
+                && live_candidates_valid,
+            format!(
+                "trace={:?}, candidates={}, sysfs_cross_check_regions={}",
+                live.trace,
+                live.candidates.len(),
+                live.stats.tried_region_samples.len()
+            ),
+        ),
+        check(
+            "quota_readback",
+            live.quota == quota,
+            format!("{:?}", live.quota),
+        ),
+        check(
+            "live_snapshot_ceiling",
+            live.snapshot_ceiling_readback
+                && damos::validate_attempt2_stats(&live.stats, max_nr_snapshots).is_ok(),
+            format!(
+                "configured_age_min={configured_age_min}, requested={max_nr_snapshots}, effective={:?}, nr_snapshots={:?}",
+                live.stats.max_nr_snapshots, live.stats.nr_snapshots
+            ),
+        ),
+        check(
+            "pageout_action_readback",
+            live.action_readback,
+            "action=pageout".into(),
+        ),
+        check(
+            "kdamond_started",
+            live.started,
+            "state on and PID readback".into(),
+        ),
+        check("kdamond_stopped", live.stopped, "state off readback".into()),
+        check(
+            "damos_stats_present",
+            live.stats.nr_tried.is_some() && live.stats.sz_applied.is_some(),
+            format!("{:?}", live.stats),
+        ),
+        check(
+            "sz_applied_positive",
+            applied > 0,
+            format!("sz_applied={applied}"),
+        ),
+        check(
+            "reclaim_effect_observed",
+            reclaim.observed(),
+            format!("{reclaim:?}"),
+        ),
+        check(
+            "quota_respected",
+            quota_respected,
+            format!(
+                "applied={applied}, hard_action_ceiling={}, configured_session_total_ceiling={}",
+                damos::VALIDATION_BYTE_QUOTA,
+                quota.total_applied_bytes
+            ),
+        ),
+        check(
+            "hard_byte_ceiling_respected",
+            hard_byte_ceiling_respected,
+            format!(
+                "configured_bytes={}, reset_interval_ms={}, live_deadline_ms={}, nr_tried={:?}, sz_tried={:?}, nr_applied={:?}, sz_applied={:?}, qt_exceeds={:?}, tried_region_size_sum={}, tried_regions_semantics=bounded requested window and not assumed identical to cumulative sz_tried",
+                quota.bytes,
+                quota.reset_interval_ms,
+                damos::VALIDATION_LIVE_DEADLINE_MS,
+                live.stats.nr_tried,
+                live.stats.sz_tried,
+                live.stats.nr_applied,
+                live.stats.sz_applied,
+                live.stats.qt_exceeds,
+                tried_region_size_sum,
+            ),
+        ),
+        check(
+            "hot_not_reclaimed",
+            damos::range_not_reclaimed(
+                &reclaim.ranges.hot.before,
+                &reclaim.ranges.hot.after_pageout,
+                &live.candidates,
+                hot,
+            ),
+            format!(
+                "candidate_overlap=0 required, before={:?}, after_pageout={:?}",
+                reclaim.ranges.hot.before, reclaim.ranges.hot.after_pageout
+            ),
+        ),
+        check(
+            "warm_not_reclaimed",
+            damos::range_not_reclaimed(
+                &reclaim.ranges.warm.before,
+                &reclaim.ranges.warm.after_pageout,
+                &live.candidates,
+                warm,
+            ),
+            format!(
+                "candidate_overlap=0 required, before={:?}, after_pageout={:?}",
+                reclaim.ranges.warm.before, reclaim.ranges.warm.after_pageout
+            ),
+        ),
+        check(
+            "control_slowdown_within_budget",
+            slowdown <= 5.0,
+            format!("slowdown_percent={slowdown:.6}"),
+        ),
+        check(
+            "zero_oom",
+            oom_kill_count() == oom_before,
+            "oom_kill counter unchanged".into(),
+        ),
+        check(
+            "scheme_removed",
+            live.cleaned,
+            "owned pageout scheme/context removed".into(),
+        ),
+    ]);
+    let successful_reclaim = applied > 0 && reclaim.observed();
+    if successful_reclaim {
+        signal_damon_target("damon-refault")?;
+        let refault_path = Path::new(STATE_DIR).join("damon-refault-result");
+        wait_for_path(&refault_path, Duration::from_secs(5))?;
+        let fingerprint = read_trimmed(&refault_path)?.parse::<u64>()?;
+        reclaim.ranges.hot.after_refault =
+            Some(read_range_residency(child.id(), child.start_ticks, hot)?);
+        reclaim.ranges.warm.after_refault =
+            Some(read_range_residency(child.id(), child.start_ticks, warm)?);
+        reclaim.ranges.cold.after_refault =
+            Some(read_range_residency(child.id(), child.start_ticks, cold)?);
+        evidence.reclaim = Some(reclaim.clone());
+        let refault = damos::RefaultEvidence {
+            action_id: format!("action-{plan_id}"),
+            target_key: plan.target.stable_key.clone(),
+            region_signature: format!("{:x}-{:x}", cold.start, cold.end),
+            applied_bytes: applied,
+            action_timestamp_ns: now_ns()?.saturating_sub(1_000_000),
+            first_access_timestamp_ns: Some(now_ns()?),
+            rss_or_swap_evidence: reclaim.observed(),
+            content_valid: fingerprint > 0,
+        };
+        let refault_state = refault.state(true, 30_000_000_000);
+        let detected = refault_state == damos::RefaultState::Observed;
+        evidence.refault_state = Some(refault_state);
+        evidence.refault = Some(refault.clone());
+        evidence.checks.push(check(
+            "refault_content_valid",
+            fingerprint > 0,
+            format!("fingerprint={fingerprint}"),
+        ));
+        evidence
+            .checks
+            .push(check("refault_detected", detected, format!("{refault:?}")));
+        if let Some(blacklist) = damos::blacklist_for_refault(
+            refault,
+            successful_reclaim,
+            now_ns()?,
+            now_ns()? + 300_000_000_000,
+            30_000_000_000,
+        ) {
+            evidence.blacklist = Some(blacklist.clone());
+            evidence.checks.push(check(
+                "blacklist_created",
+                blacklist.active(blacklist.created_at_ns),
+                "early refault cooldown active".into(),
+            ));
+            let mut blocked_input = protected_eligibility(child.id(), child.start_ticks, cold);
+            blocked_input.blacklisted = true;
+            let blocked = damos::evaluate_eligibility(&blocked_input);
+            evidence.checks.push(check(
+                "blacklist_blocks_next_plan",
+                blocked
+                    .reasons
+                    .iter()
+                    .any(|r| r == "early_refault_blacklist"),
+                format!("{:?}", blocked.reasons),
+            ));
+        } else {
+            evidence.checks.push(check(
+                "blacklist_created",
+                false,
+                "not evaluated: early refault was not observed".into(),
+            ));
+            evidence.checks.push(check(
+                "blacklist_blocks_next_plan",
+                false,
+                "not evaluated: no blacklist exists".into(),
+            ));
+        }
+    } else {
+        evidence.refault_state = Some(damos::RefaultState::NotEvaluated);
+        evidence.checks.extend([
+            check(
+                "refault_content_valid",
+                false,
+                "not evaluated: no successful target-attributable reclaim".into(),
+            ),
+            check(
+                "refault_detected",
+                false,
+                "not evaluated: no successful target-attributable reclaim".into(),
+            ),
+            check(
+                "blacklist_created",
+                false,
+                "not evaluated: applied bytes/reclaim evidence absent".into(),
+            ),
+            check(
+                "blacklist_blocks_next_plan",
+                false,
+                "not evaluated: no blacklist or second plan created".into(),
+            ),
+        ]);
+    }
+    signal_damon_target("damon-stop")?;
+    child.wait_for_exit(Duration::from_secs(5))?;
+    evidence.checks.push(check(
+        "cleanup",
+        read_trimmed(&admin.join("nr_kdamonds"))? == "0"
+            && trace_instances()? == baseline_instances,
+        "child, scheme, context, kdamond, tracing resources absent".into(),
+    ));
+    let mut recovered = damos::OwnedSession {
+        session_id: live_id,
+        target: plan.target,
+        kdamond_index: 0,
+        scheme_id: 0,
+        state_on: false,
+        interrupted: true,
+    };
+    let first = damos::recover_owned(&mut recovered, "nemor-validation-")?;
+    let second = damos::recover_owned(&mut recovered, "nemor-validation-")?;
+    evidence.checks.push(check(
+        "recovery",
+        first,
+        "owned interrupted record recovered".into(),
+    ));
+    evidence.checks.push(check(
+        "recovery_idempotent",
+        !second,
+        "second recovery no-op".into(),
+    ));
+    if live.stats.nr_tried == Some(0) {
+        evidence.failure_class = Some("action_failure".into());
+        evidence.failure_reason = Some("no_live_regions_tried".into());
+    } else if applied == 0 {
+        evidence.failure_class = Some("action_failure".into());
+        evidence.failure_reason = Some("no_pageout_applied".into());
+    } else if !reclaim.observed() {
+        evidence.failure_class = Some("reclaim_evidence_failure".into());
+        evidence.failure_reason = Some("no_target_attributable_reclaim_effect".into());
+    }
+    Ok(())
+}
+
+fn mark_shared_vma_group(backing: &mut BTreeMap<String, damon::ZoneBacking>) -> bool {
+    let Some(first) = backing.values().next() else {
+        return false;
+    };
+    let start = first.containing_vma_start;
+    let end = first.containing_vma_end;
+    let shared = backing.len() > 1
+        && start.is_some()
+        && end.is_some()
+        && backing
+            .values()
+            .all(|zone| zone.containing_vma_start == start && zone.containing_vma_end == end);
+    if shared {
+        let group = format!("{:x}-{:x}", start.unwrap_or(0), end.unwrap_or(0));
+        for zone in backing.values_mut() {
+            zone.shared_vma = true;
+            zone.shared_vma_group = Some(group.clone());
+        }
+    }
+    shared
+}
+
+fn protected_eligibility(
+    pid: u32,
+    start_ticks: u64,
+    cold: damon::AddressRange,
+) -> damos::EligibilityInput {
+    damos::EligibilityInput {
+        identity: Some(damos::StableTargetIdentity {
+            pid,
+            start_ticks,
+            stable_key: format!("synthetic:{start_ticks}"),
+            owned: true,
+        }),
+        identity_fresh: true,
+        background: true,
+        foreground: false,
+        gaming: false,
+        critical: false,
+        protected: false,
+        known_classification: true,
+        pressure: policy_engine::PressureState::Pressure,
+        cold_observations: (0..3)
+            .map(|_| damos::ColdObservation {
+                complete: true,
+                nr_accesses: 0,
+                age: 3,
+                range: cold,
+            })
+            .collect(),
+        valid_age_evidence: true,
+        recent_refault: false,
+        blacklisted: false,
+        safety_conflict: false,
+    }
+}
+
+struct DamosSessionSpec<'a> {
+    session_id: &'a str,
+    admin: &'a Path,
+    child_pid: u32,
+    child_start_ticks: u64,
+    ranges: &'a damon::InitialRegionPlan,
+    hot: damon::AddressRange,
+    warm: damon::AddressRange,
+    cold: damon::AddressRange,
+    action: damos::DamosAction,
+    duration: Duration,
+    validated_filter: Option<&'a damos::AddressFence>,
+    access_pattern: &'a damos::AccessPattern,
+    monitoring_intervals: &'a damos::MonitoringIntervals,
+    quota: &'a damos::DamosQuota,
+    max_nr_snapshots: Option<u64>,
+}
+struct DamosSessionResult {
+    capability: damos::DamosCapability,
+    stats: damos::DamosStats,
+    quota: damos::DamosQuota,
+    access_pattern: damos::Readback<damos::AccessPattern>,
+    monitoring_intervals: damos::Readback<damos::MonitoringIntervals>,
+    trace: DamosTraceDiagnostic,
+    candidates: Vec<damos::DamosBeforeApplyEvent>,
+    sysfs_timestamps_ns: BTreeMap<String, u128>,
+    fence_readback: bool,
+    filter_spec: damos::AddressFence,
+    action_readback: bool,
+    snapshot_ceiling_readback: bool,
+    started: bool,
+    stopped: bool,
+    cleaned: bool,
+    kdamond_cpu_percent: f64,
+}
+
+fn run_owned_damos_session(spec: DamosSessionSpec<'_>) -> Result<DamosSessionResult> {
+    if !spec.session_id.starts_with("nemor-validation-damos-")
+        || proc_start_ticks(spec.child_pid)? != Some(spec.child_start_ticks)
+    {
+        bail!("DAMOS owned session or target identity guard failed");
+    }
+    let trace_instance = tracefs_root()?.join("instances").join(spec.session_id);
+    fs::create_dir(&trace_instance)?;
+    let mut cleanup = DamonCleanup::new_for_event(
+        spec.admin.to_path_buf(),
+        trace_instance.clone(),
+        "damos_before_apply",
+    );
+    cleanup.trace_created = true;
+    let event_enable = trace_instance.join("events/damon/damos_before_apply/enable");
+    if !event_enable.exists() {
+        bail!("damon:damos_before_apply unavailable in owned tracefs instance");
+    }
+    let trace_clock = configure_owned_trace_clock(&trace_instance)?;
+    write_readback(&event_enable, "1")?;
+    cleanup.trace_enabled = true;
+    write_readback(&trace_instance.join("tracing_on"), "1")?;
+    cleanup.tracing_on = true;
+    let capture = DamosTraceCaptureWorker::start(&trace_instance, trace_clock)?;
+
+    write_readback(&spec.admin.join("nr_kdamonds"), "1")?;
+    cleanup.kdamond_created = true;
+    let kd = spec.admin.join("0");
+    write_readback(&kd.join("contexts/nr_contexts"), "1")?;
+    let context = kd.join("contexts/0");
+    write_readback(&context.join("operations"), "vaddr")?;
+    for (path, value) in [
+        (
+            "monitoring_attrs/intervals/sample_us",
+            spec.monitoring_intervals.sample_us.to_string(),
+        ),
+        (
+            "monitoring_attrs/intervals/aggr_us",
+            spec.monitoring_intervals.aggr_us.to_string(),
+        ),
+        (
+            "monitoring_attrs/intervals/update_us",
+            spec.monitoring_intervals.update_us.to_string(),
+        ),
+        ("monitoring_attrs/nr_regions/min", "10".to_owned()),
+        ("monitoring_attrs/nr_regions/max", "1000".to_owned()),
+    ] {
+        write_readback(&context.join(path), &value)?;
+    }
+    write_readback(&context.join("targets/nr_targets"), "1")?;
+    write_readback(
+        &context.join("targets/0/pid_target"),
+        &spec.child_pid.to_string(),
+    )?;
+    let regions = context.join("targets/0/regions");
+    write_readback(&regions.join("nr_regions"), "3")?;
+    for (index, range) in spec.ranges.ranges.iter().enumerate() {
+        write_readback(
+            &regions.join(index.to_string()).join("start"),
+            &range.start.to_string(),
+        )?;
+        write_readback(
+            &regions.join(index.to_string()).join("end"),
+            &range.end.to_string(),
+        )?;
+    }
+    write_readback(&context.join("schemes/nr_schemes"), "1")?;
+    let scheme = context.join("schemes/0");
+    let mut capability = damos::inspect_scheme_root(&scheme, true, false, false);
+    let action = match spec.action {
+        damos::DamosAction::Stat => "stat",
+        damos::DamosAction::Pageout => "pageout",
+    };
+    if matches!(spec.action, damos::DamosAction::Stat) {
+        // Capability probe while kdamond is off: configure then restore, never apply.
+        write_readback(&scheme.join("action"), "pageout")?;
+        capability.actions.insert("pageout".into());
+    }
+    write_readback(&scheme.join("action"), action)?;
+    let action_readback = read_trimmed(&scheme.join("action"))? == action;
+    capability.actions.insert(action.into());
+    for (path, value) in [
+        ("apply_interval_us", "500000".into()),
+        (
+            "access_pattern/sz/min",
+            spec.access_pattern.size.min.to_string(),
+        ),
+        (
+            "access_pattern/sz/max",
+            spec.access_pattern.size.max.to_string(),
+        ),
+        (
+            "access_pattern/nr_accesses/min",
+            spec.access_pattern.nr_accesses.min.to_string(),
+        ),
+        (
+            "access_pattern/nr_accesses/max",
+            spec.access_pattern.nr_accesses.max.to_string(),
+        ),
+        (
+            "access_pattern/age/min",
+            spec.access_pattern.age.min.to_string(),
+        ),
+        (
+            "access_pattern/age/max",
+            spec.access_pattern.age.max.to_string(),
+        ),
+        ("quotas/ms", spec.quota.time_ms.to_string()),
+        ("quotas/bytes", spec.quota.bytes.to_string()),
+        (
+            "quotas/reset_interval_ms",
+            spec.quota.reset_interval_ms.to_string(),
+        ),
+        ("watermarks/metric", "none".into()),
+    ] {
+        let full = scheme.join(path);
+        if full.exists() {
+            write_readback(&full, &value)?;
+        } else if matches!(
+            path,
+            "quotas/ms" | "quotas/bytes" | "quotas/reset_interval_ms"
+        ) {
+            bail!("mandatory quota field missing: {path}");
+        }
+    }
+    let filter_root = scheme.join("core_filters");
+    if !filter_root.join("nr_filters").exists() {
+        bail!("core address filters unavailable; deprecated generic filters are not accepted");
+    }
+    write_readback(&filter_root.join("nr_filters"), "1")?;
+    let filter = filter_root.join("0");
+    let api = if filter.join("allow").exists() {
+        damos::FilterApi::MatchingAllow
+    } else {
+        damos::FilterApi::LegacyMatchingOnly
+    };
+    let filter_spec = damos::AddressFence {
+        range: spec.cold,
+        layer: "core".into(),
+        filter_type: "addr".into(),
+        api,
+        matching: filter.join("allow").exists(),
+        allow: filter.join("allow").exists().then_some(true),
+    };
+    if let Some(validated) = spec.validated_filter {
+        if validated != &filter_spec {
+            bail!("live filter API/spec differs from validated shadow specification");
+        }
+    }
+    filter_spec.validate(spec.cold)?;
+    write_readback(&filter.join("type"), "addr")?;
+    let matching_value = if filter_spec.matching { "Y" } else { "N" };
+    write_readback(&filter.join("matching"), matching_value)?;
+    if let Some(allow) = filter_spec.allow {
+        write_readback(&filter.join("allow"), if allow { "Y" } else { "N" })?;
+    }
+    let start_path = filter.join("addr_start");
+    let end_path = filter.join("addr_end");
+    if !start_path.exists() || !end_path.exists() {
+        bail!("core addr filter range ABI unavailable");
+    }
+    write_readback(&start_path, &spec.cold.start.to_string())?;
+    write_readback(&end_path, &spec.cold.end.to_string())?;
+    let fence_readback = read_trimmed(&filter.join("type"))? == "addr"
+        && read_trimmed(&filter.join("matching"))? == matching_value
+        && match filter_spec.allow {
+            Some(value) => read_trimmed(&filter.join("allow"))? == if value { "Y" } else { "N" },
+            None => !filter.join("allow").exists(),
+        }
+        && read_trimmed(&start_path)?.parse::<u64>()? == spec.cold.start
+        && read_trimmed(&end_path)?.parse::<u64>()? == spec.cold.end;
+    capability.address_fence_supported = fence_readback;
+    capability.filter_allow_supported = filter.join("allow").exists();
+    capability.filter_types.insert("addr".into());
+    capability.quota_fields.insert("ms".into(), true);
+    capability.quota_fields.insert("bytes".into(), true);
+    capability
+        .quota_fields
+        .insert("reset_interval_ms".into(), true);
+    let quota = damos::DamosQuota {
+        time_ms: read_trimmed(&scheme.join("quotas/ms"))?.parse()?,
+        bytes: read_trimmed(&scheme.join("quotas/bytes"))?.parse()?,
+        reset_interval_ms: read_trimmed(&scheme.join("quotas/reset_interval_ms"))?.parse()?,
+        total_applied_bytes: damos::VALIDATION_TOTAL_APPLIED_CEILING,
+    };
+    let read_u64 = |path: &Path| -> Result<u64> { Ok(read_trimmed(path)?.parse()?) };
+    let effective_pattern = damos::AccessPattern {
+        size: damos::InclusiveRange {
+            min: read_u64(&scheme.join("access_pattern/sz/min"))?,
+            max: read_u64(&scheme.join("access_pattern/sz/max"))?,
+        },
+        nr_accesses: damos::InclusiveRange {
+            min: read_u64(&scheme.join("access_pattern/nr_accesses/min"))?,
+            max: read_u64(&scheme.join("access_pattern/nr_accesses/max"))?,
+        },
+        age: damos::InclusiveRange {
+            min: read_u64(&scheme.join("access_pattern/age/min"))?,
+            max: read_u64(&scheme.join("access_pattern/age/max"))?,
+        },
+    };
+    let access_pattern = damos::Readback {
+        requested: spec.access_pattern.clone(),
+        readback: effective_pattern == *spec.access_pattern,
+        effective: effective_pattern,
+    };
+    let effective_intervals = damos::MonitoringIntervals {
+        sample_us: read_u64(&context.join("monitoring_attrs/intervals/sample_us"))?,
+        aggr_us: read_u64(&context.join("monitoring_attrs/intervals/aggr_us"))?,
+        update_us: read_u64(&context.join("monitoring_attrs/intervals/update_us"))?,
+    };
+    let monitoring_intervals = damos::Readback {
+        requested: spec.monitoring_intervals.clone(),
+        readback: effective_intervals == *spec.monitoring_intervals,
+        effective: effective_intervals,
+    };
+    if !access_pattern.readback || !monitoring_intervals.readback || quota != *spec.quota {
+        bail!("DAMOS pattern, intervals, or quota readback mismatch");
+    }
+    let max_snapshots_path = scheme.join("stats/max_nr_snapshots");
+    let snapshot_ceiling_readback = if let Some(max_nr_snapshots) = spec.max_nr_snapshots {
+        if !max_snapshots_path.exists() {
+            bail!("secondary kernel kill-switch max_nr_snapshots unavailable");
+        }
+        write_readback(&max_snapshots_path, &max_nr_snapshots.to_string())?;
+        capability.max_nr_snapshots_supported = true;
+        read_u64(&max_snapshots_path)? == max_nr_snapshots
+    } else {
+        true
+    };
+    let cpu_before = process_cpu_ns()?;
+    write_readback(&kd.join("state"), "on")?;
+    cleanup.kdamond_on = true;
+    let kpid = wait_kdamond_started(&kd, Duration::from_secs(3))?;
+    let kcpu_before = proc_cpu_ticks(kpid)?;
+    let session_started = Instant::now();
+    let mut sysfs_timestamps_ns = BTreeMap::new();
+    if scheme.join("tried_regions").exists() {
+        fs::write(kd.join("state"), "clear_schemes_tried_regions")?;
+        sysfs_timestamps_ns.insert("clear_stale_tried_regions".into(), now_ns()?);
+        if !read_damos_stats(&scheme)?.tried_region_samples.is_empty() {
+            bail!("stale sysfs tried_regions survived clear-before-arm");
+        }
+        sysfs_timestamps_ns.insert("request_arm_tried_regions".into(), now_ns()?);
+        fs::write(kd.join("state"), "update_schemes_tried_regions")?;
+        sysfs_timestamps_ns.insert("apply_interval_observation_start".into(), now_ns()?);
+        std::thread::sleep(Duration::from_micros(600_000));
+        sysfs_timestamps_ns.insert("armed_apply_interval_complete".into(), now_ns()?);
+    }
+    let mut first_eligibility = None;
+    while session_started.elapsed() < spec.duration {
+        let remaining = spec.duration.saturating_sub(session_started.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+        fs::write(kd.join("state"), "update_schemes_stats")?;
+        std::thread::sleep(Duration::from_millis(20));
+        let current = read_damos_stats(&scheme)?;
+        if current.nr_tried.unwrap_or(0) > 0 && first_eligibility.is_none() {
+            let timestamp = now_ns()?;
+            sysfs_timestamps_ns.insert("first_nr_tried_increment".into(), timestamp);
+            first_eligibility = Some((current.nr_snapshots, timestamp));
+        }
+    }
+    let kcpu_after = proc_cpu_ticks(kpid)?;
+    fs::write(kd.join("state"), "update_schemes_stats")?;
+    std::thread::sleep(Duration::from_millis(50));
+    if scheme.join("quotas/effective_bytes").exists() {
+        fs::write(kd.join("state"), "update_schemes_effective_quotas")?;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut stats = read_damos_stats(&scheme)?;
+    sysfs_timestamps_ns.insert("tried_regions_read".into(), now_ns()?);
+    if scheme.join("tried_regions").exists() {
+        fs::write(kd.join("state"), "clear_schemes_tried_regions")?;
+        sysfs_timestamps_ns.insert("final_clear_tried_regions".into(), now_ns()?);
+    }
+    if let Some((snapshot, timestamp)) = first_eligibility {
+        stats.first_tried_snapshot_index = snapshot;
+        stats.first_tried_timestamp_ns = Some(timestamp);
+    }
+    write_readback(&kd.join("state"), "off")?;
+    cleanup.kdamond_on = false;
+    sysfs_timestamps_ns.insert("shadow_or_live_stop".into(), now_ns()?);
+    let stopped = read_trimmed(&kd.join("state"))? == "off";
+    let bytes_at_stop = capture.bytes_read()?;
+    let (trace, candidates) = capture.drain_and_stop(bytes_at_stop)?;
+    if let Some(first) = candidates.iter().min_by_key(|event| event.timestamp_ns) {
+        stats.first_tried_region_age = Some(first.age);
+        stats.first_tried_timestamp_ns = Some(first.timestamp_ns);
+    }
+    let _ = (spec.hot, spec.warm);
+    let hertz = clock_ticks_per_second()? as f64;
+    let kdamond_cpu_percent =
+        (kcpu_after.saturating_sub(kcpu_before) as f64 / hertz / spec.duration.as_secs_f64())
+            * 100.0;
+    let _control_cpu = process_cpu_ns()?.saturating_sub(cpu_before);
+    cleanup.cleanup()?;
+    Ok(DamosSessionResult {
+        capability,
+        stats,
+        quota,
+        access_pattern,
+        monitoring_intervals,
+        trace,
+        candidates,
+        sysfs_timestamps_ns,
+        fence_readback,
+        filter_spec,
+        action_readback,
+        snapshot_ceiling_readback,
+        started: true,
+        stopped,
+        cleaned: read_trimmed(&spec.admin.join("nr_kdamonds"))? == "0",
+        kdamond_cpu_percent,
+    })
+}
+
+fn read_damos_stats(scheme: &Path) -> Result<damos::DamosStats> {
+    let read = |name: &str| -> Option<u64> {
+        read_trimmed(&scheme.join("stats").join(name))
+            .ok()?
+            .parse()
+            .ok()
+    };
+    let mut tried_regions = Vec::new();
+    let mut tried_region_samples = Vec::new();
+    let mut tried_regions_total_bytes = None;
+    for root in [
+        scheme.join("tried_regions"),
+        scheme.join("stats/tried_regions"),
+    ] {
+        if tried_regions_total_bytes.is_none() {
+            tried_regions_total_bytes = read_trimmed(&root.join("total_bytes"))
+                .ok()
+                .and_then(|value| value.parse().ok());
+        }
+        let mut count = read_trimmed(&root.join("nr_regions"))
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if count == 0 {
+            count = fs::read_dir(&root)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit())
+                })
+                .count();
+        }
+        for index in 0..count {
+            let item = root.join(index.to_string());
+            if let (Ok(start), Ok(end)) = (
+                read_trimmed(&item.join("start")).and_then(|v| v.parse().map_err(Into::into)),
+                read_trimmed(&item.join("end")).and_then(|v| v.parse().map_err(Into::into)),
+            ) {
+                let range = damon::AddressRange { start, end };
+                tried_regions.push(range);
+                let optional = |name: &str| {
+                    read_trimmed(&item.join(name))
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                };
+                tried_region_samples.push(damos::TriedRegionSample {
+                    range,
+                    size: range.end.saturating_sub(range.start),
+                    nr_accesses: optional("nr_accesses"),
+                    age: optional("age"),
+                    sz_filter_passed: optional("sz_filter_passed"),
+                });
+            }
+        }
+    }
+    let effective_quota_raw = read_trimmed(&scheme.join("quotas/effective_bytes")).ok();
+    let effective_quota_bytes = effective_quota_raw
+        .as_deref()
+        .and_then(|value| value.parse().ok());
+    let effective_quota_interpretation = effective_quota_raw.as_ref().map(|raw| {
+        if raw == "0" {
+            "kernel-reported effective size quota is zero after explicit refresh; this is not interpreted as disabled quota because configured ms/bytes are nonzero".to_owned()
+        } else {
+            "kernel-reported effective size quota after explicit refresh".to_owned()
+        }
+    });
+    Ok(damos::DamosStats {
+        effective_quota_bytes,
+        nr_tried: read("nr_tried"),
+        sz_tried: read("sz_tried"),
+        nr_applied: read("nr_applied"),
+        sz_applied: read("sz_applied"),
+        sz_ops_filter_passed: read("sz_ops_filter_passed"),
+        qt_exceeds: read("qt_exceeds"),
+        nr_snapshots: read("nr_snapshots"),
+        max_nr_snapshots: read("max_nr_snapshots"),
+        tried_regions,
+        tried_region_samples,
+        tried_regions_total_bytes,
+        effective_quota_raw,
+        effective_quota_interpretation,
+        ..Default::default()
+    })
+}
+
+fn read_range_residency(
+    pid: u32,
+    expected_start_ticks: u64,
+    range: damon::AddressRange,
+) -> Result<damos::RangeResidencySnapshot> {
+    const PAGE_SIZE: u64 = 4096;
+    const PAGEMAP_ENTRY_BYTES: u64 = 8;
+    if proc_start_ticks(pid)? != Some(expected_start_ticks) {
+        bail!("stale target identity before pagemap snapshot");
+    }
+    let size = range
+        .end
+        .checked_sub(range.start)
+        .ok_or_else(|| anyhow!("invalid pagemap range"))?;
+    if size == 0 || range.start % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 {
+        bail!("pagemap range is not base-page aligned");
+    }
+    let total_pages = size / PAGE_SIZE;
+    if total_pages > (32 * 1024 * 1024 / PAGE_SIZE) {
+        bail!("pagemap range exceeds bounded synthetic COLD size");
+    }
+    let offset = (range.start / PAGE_SIZE)
+        .checked_mul(PAGEMAP_ENTRY_BYTES)
+        .ok_or_else(|| anyhow!("pagemap offset overflow"))?;
+    let mut pagemap = OpenOptions::new()
+        .read(true)
+        .open(format!("/proc/{pid}/pagemap"))
+        .with_context(|| format!("open exact-range pagemap for owned PID {pid}"))?;
+    pagemap.seek(SeekFrom::Start(offset))?;
+    let mut present_pages = 0_u64;
+    let mut swapped_pages = 0_u64;
+    let mut none_pages = 0_u64;
+    for _ in 0..total_pages {
+        let mut raw = [0_u8; 8];
+        pagemap.read_exact(&mut raw)?;
+        let state = damos::parse_pagemap_entry(u64::from_ne_bytes(raw));
+        match (state.present, state.swapped) {
+            (true, false) => present_pages += 1,
+            (false, true) => swapped_pages += 1,
+            (false, false) => none_pages += 1,
+            (true, true) => bail!("invalid pagemap entry has present and swapped set"),
+        }
+    }
+    if proc_start_ticks(pid)? != Some(expected_start_ticks) {
+        bail!("stale target identity after pagemap snapshot");
+    }
+    let snapshot = damos::RangeResidencySnapshot {
+        range_start: range.start,
+        range_end: range.end,
+        range_size_bytes: size,
+        page_size: PAGE_SIZE,
+        total_pages,
+        present_pages,
+        present_bytes: present_pages * PAGE_SIZE,
+        swapped_pages,
+        swapped_bytes: swapped_pages * PAGE_SIZE,
+        not_present_not_swapped_pages: none_pages,
+        read_errors: 0,
+        timestamp_ns: now_ns()?,
+        source: "proc_pagemap".into(),
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn oom_kill_count() -> u64 {
+    fs::read_to_string("/proc/vmstat")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some("oom_kill"))
+                    .then(|| fields.next()?.parse().ok())
+                    .flatten()
+            })
+        })
+        .unwrap_or(0)
+}
+
 fn damon_required_gates(evidence: &DamonEvidence) -> bool {
     evidence.zero_damos
         && DAMON_REQUIRED_GATES.iter().all(|required| {
@@ -2637,6 +4380,59 @@ fn damon_required_gates(evidence: &DamonEvidence) -> bool {
                 .iter()
                 .any(|check| check.name == *required && check.passed)
         })
+}
+
+fn required_checks_pass(checks: &[Check], required: &[&str]) -> bool {
+    required.iter().all(|name| {
+        checks
+            .iter()
+            .any(|check| check.name == *name && check.passed)
+    })
+}
+
+fn ensure_damos_failure_taxonomy(evidence: &mut DamosEvidence) {
+    if evidence.failure_class.is_none() {
+        evidence.failure_class = Some("validation_failure".to_owned());
+    }
+    if evidence.failure_reason.is_none() {
+        let failed = DAMOS_REQUIRED_GATES
+            .iter()
+            .filter(|required| {
+                evidence
+                    .checks
+                    .iter()
+                    .any(|item| item.name == **required && item.state == GateState::Fail)
+            })
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        evidence.failure_reason = Some(format!("mandatory_gates_failed:{failed}"));
+    }
+}
+
+fn tried_regions_lifecycle(
+    timestamps: &BTreeMap<String, u128>,
+) -> Option<damos::TriedRegionsLifecycle> {
+    Some(damos::TriedRegionsLifecycle {
+        stale_clear_ns: *timestamps.get("clear_stale_tried_regions")?,
+        arm_ns: *timestamps.get("request_arm_tried_regions")?,
+        observed_interval_start_ns: *timestamps.get("apply_interval_observation_start")?,
+        read_ns: *timestamps.get("tried_regions_read")?,
+        final_clear_ns: *timestamps.get("final_clear_tried_regions")?,
+    })
+}
+
+fn fill_damos_not_evaluated_gates(evidence: &mut DamosEvidence) {
+    for required in DAMOS_REQUIRED_GATES {
+        if !evidence.checks.iter().any(|item| item.name == *required) {
+            evidence.checks.push(Check {
+                name: (*required).to_owned(),
+                passed: false,
+                state: GateState::NotEvaluated,
+                detail: "not reached after earlier validation abort".to_owned(),
+            });
+        }
+    }
 }
 
 fn synthetic_lifecycle_order_valid(timeline: &BTreeMap<String, u128>) -> bool {
@@ -2688,11 +4484,23 @@ fn workload_window_progress(
 }
 
 fn trace_timestamp_ns(line: &str) -> Option<u128> {
-    let prefix = line
-        .split_once("damon:damon_aggregated:")
-        .or_else(|| line.split_once("damon_aggregated:"))?
-        .0;
-    let token = prefix.split_whitespace().last()?.trim_end_matches(':');
+    trace_timestamp_ns_for(line, "damon_aggregated:")
+}
+
+fn trace_timestamp_ns_for(line: &str, marker: &str) -> Option<u128> {
+    let prefix = line.split_once(marker)?.0;
+    let token = prefix
+        .split_whitespace()
+        .rev()
+        .map(|token| token.trim_end_matches(':'))
+        .find(|token| {
+            token.split_once('.').is_some_and(|(seconds, fraction)| {
+                !seconds.is_empty()
+                    && !fraction.is_empty()
+                    && seconds.bytes().all(|byte| byte.is_ascii_digit())
+                    && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })?;
     let (seconds, fraction) = token.split_once('.')?;
     let seconds = seconds.parse::<u128>().ok()?;
     let mut nanoseconds = fraction
@@ -3461,6 +5269,11 @@ fn check(name: &str, passed: bool, detail: String) -> Check {
     Check {
         name: name.to_owned(),
         passed,
+        state: if passed {
+            GateState::Pass
+        } else {
+            GateState::Fail
+        },
         detail,
     }
 }
@@ -3548,6 +5361,7 @@ struct DamonCleanup {
     trace_created: bool,
     trace_enabled: bool,
     tracing_on: bool,
+    trace_event: String,
 }
 
 impl DamonCleanup {
@@ -3560,7 +5374,14 @@ impl DamonCleanup {
             trace_created: false,
             trace_enabled: false,
             tracing_on: false,
+            trace_event: "damon_aggregated".to_owned(),
         }
+    }
+
+    fn new_for_event(admin: PathBuf, trace_instance: PathBuf, trace_event: &str) -> Self {
+        let mut cleanup = Self::new(admin, trace_instance);
+        cleanup.trace_event = trace_event.to_owned();
+        cleanup
     }
 
     fn cleanup(&mut self) -> Result<()> {
@@ -3579,7 +5400,9 @@ impl DamonCleanup {
         if self.trace_enabled {
             fs::write(
                 self.trace_instance
-                    .join("events/damon/damon_aggregated/enable"),
+                    .join("events/damon")
+                    .join(&self.trace_event)
+                    .join("enable"),
                 "0",
             )?;
             self.trace_enabled = false;
@@ -3924,6 +5747,14 @@ fn spawn_damon_target(
     zone_bytes: u64,
     backing_profile: damon::PageBackingProfile,
 ) -> Result<RegisteredChild> {
+    spawn_synthetic_target(zone_bytes, zone_bytes, backing_profile)
+}
+
+fn spawn_synthetic_target(
+    zone_bytes: u64,
+    cold_zone_bytes: u64,
+    backing_profile: damon::PageBackingProfile,
+) -> Result<RegisteredChild> {
     let executable = std::env::current_exe()?.canonicalize()?;
     for name in [
         "damon-target.json",
@@ -3933,6 +5764,9 @@ fn spawn_damon_target(
         "damon-stop",
         "damon-zone-bytes",
         "damon-backing-profile",
+        "damon-cold-zone-bytes",
+        "damon-refault",
+        "damon-refault-result",
     ] {
         let path = Path::new(STATE_DIR).join(name);
         if path.exists() {
@@ -3945,6 +5779,13 @@ fn spawn_damon_target(
     fs::write(
         Path::new(STATE_DIR).join("damon-zone-bytes"),
         zone_bytes.to_string(),
+    )?;
+    if cold_zone_bytes == 0 || cold_zone_bytes > damon::MAX_DIAGNOSTIC_ZONE_BYTES {
+        bail!("COLD target zone size is outside bound");
+    }
+    fs::write(
+        Path::new(STATE_DIR).join("damon-cold-zone-bytes"),
+        cold_zone_bytes.to_string(),
     )?;
     fs::write(
         Path::new(STATE_DIR).join("damon-backing-profile"),
@@ -3967,6 +5808,14 @@ fn spawn_damon_target(
     Ok(RegisteredChild::new(child, start_ticks))
 }
 
+fn spawn_damos_target() -> Result<RegisteredChild> {
+    spawn_synthetic_target(
+        8 * 1024 * 1024,
+        32 * 1024 * 1024,
+        damon::PageBackingProfile::BasePageNoHuge,
+    )
+}
+
 fn write_workload_progress(progress: &WorkloadProgress) -> Result<()> {
     let staged = Path::new(STATE_DIR).join("damon-progress.next");
     let final_path = Path::new(STATE_DIR).join("damon-progress");
@@ -3982,7 +5831,7 @@ fn read_progress() -> Result<WorkloadProgress> {
 }
 
 fn signal_damon_target(name: &str) -> Result<()> {
-    if !matches!(name, "damon-start" | "damon-stop") {
+    if !matches!(name, "damon-start" | "damon-stop" | "damon-refault") {
         bail!("invalid synthetic lifecycle signal");
     }
     fs::write(Path::new(STATE_DIR).join(name), b"1")?;
@@ -4102,6 +5951,7 @@ mod tests {
             zram: ZramEvidence::default(),
             tiering: TieringEvidence::default(),
             damon: DamonEvidence::default(),
+            damos: DamosEvidence::default(),
             host_unchanged: true,
             errors: Vec::new(),
         };
@@ -4110,6 +5960,170 @@ mod tests {
         assert!(!json.contains("hostname"));
         assert!(!json.contains("username"));
         assert!(!json.contains("machine_id"));
+    }
+
+    #[test]
+    fn damos_success_requires_every_mandatory_gate() {
+        let mut checks: Vec<Check> = DAMOS_REQUIRED_GATES
+            .iter()
+            .map(|name| check(name, true, "fixture".into()))
+            .collect();
+        assert!(required_checks_pass(&checks, DAMOS_REQUIRED_GATES));
+        checks
+            .iter_mut()
+            .find(|item| item.name == "cold_address_fence")
+            .unwrap()
+            .passed = false;
+        assert!(!required_checks_pass(&checks, DAMOS_REQUIRED_GATES));
+    }
+
+    #[test]
+    fn damos_modern_and_legacy_cold_fences_are_explicit() {
+        let cold = damon::AddressRange {
+            start: 0x1000,
+            end: 0x3000,
+        };
+        assert!(damos::AddressFence {
+            range: cold,
+            layer: "core".into(),
+            filter_type: "addr".into(),
+            api: damos::FilterApi::MatchingAllow,
+            matching: true,
+            allow: Some(true),
+        }
+        .validate(cold)
+        .is_ok());
+        assert!(damos::AddressFence {
+            range: cold,
+            layer: "core".into(),
+            filter_type: "addr".into(),
+            api: damos::FilterApi::MatchingAllow,
+            matching: false,
+            allow: Some(true),
+        }
+        .validate(cold)
+        .is_err());
+    }
+
+    #[test]
+    fn damos_failure_always_has_class_and_reason() {
+        let mut evidence = DamosEvidence {
+            required_gates_passed: false,
+            checks: vec![check("shadow_candidate_evidence", false, "fixture".into())],
+            ..Default::default()
+        };
+        fill_damos_not_evaluated_gates(&mut evidence);
+        ensure_damos_failure_taxonomy(&mut evidence);
+        assert!(evidence.failure_class.is_some());
+        assert!(evidence.failure_reason.is_some());
+        assert!(evidence
+            .checks
+            .iter()
+            .any(|gate| gate.name == "live_candidate_evidence"
+                && gate.state == GateState::NotEvaluated));
+        assert!(evidence
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("shadow_candidate_evidence")));
+        assert!(!evidence
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("live_candidate_evidence")));
+    }
+
+    #[test]
+    fn nohugepage_request_and_vma_ownership_are_independent() {
+        let mut zone = damon::ZoneBacking {
+            start: 0x1000,
+            end: 0x3000,
+            anon_huge_pages_kib: 0,
+            thp_eligible: Some(false),
+            vm_flags: vec!["nh".into()],
+            containing_vma_start: Some(0x1000),
+            containing_vma_end: Some(0x9000),
+            explicit_nohugepage_requested: true,
+            ..Default::default()
+        };
+        zone.explicit_nohugepage_verified = zone.explicit_nohugepage_requested
+            && zone.anon_huge_pages_kib == 0
+            && (zone.thp_eligible == Some(false) || zone.vm_flags.iter().any(|flag| flag == "nh"));
+        assert!(zone.explicit_nohugepage_verified);
+        assert_ne!(zone.end, zone.containing_vma_end.unwrap());
+    }
+
+    #[test]
+    fn merged_containing_vma_marks_each_owned_zone_shared_without_changing_range_size() {
+        let mut zones = BTreeMap::from([
+            (
+                "hot".into(),
+                damon::ZoneBacking {
+                    start: 0x1000,
+                    end: 0x3000,
+                    range_size_bytes: 0x2000,
+                    containing_vma_start: Some(0x1000),
+                    containing_vma_end: Some(0x9000),
+                    containing_vma_size_kib: 32,
+                    ..Default::default()
+                },
+            ),
+            (
+                "cold".into(),
+                damon::ZoneBacking {
+                    start: 0x3000,
+                    end: 0x9000,
+                    range_size_bytes: 0x6000,
+                    containing_vma_start: Some(0x1000),
+                    containing_vma_end: Some(0x9000),
+                    containing_vma_size_kib: 32,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert!(mark_shared_vma_group(&mut zones));
+        assert!(zones.values().all(|zone| zone.shared_vma));
+        assert_eq!(zones["hot"].range_size_bytes, 0x2000);
+        assert_eq!(zones["hot"].containing_vma_size_kib, 32);
+    }
+
+    #[test]
+    fn pagemap_unavailable_or_stale_identity_fails_before_range_read() {
+        let range = damon::AddressRange {
+            start: 0x1000,
+            end: 0x3000,
+        };
+        assert!(read_range_residency(u32::MAX, 1, range).is_err());
+        let current = proc_start_ticks(std::process::id())
+            .unwrap()
+            .expect("test process exists");
+        assert!(
+            read_range_residency(std::process::id(), current.saturating_add(1), range).is_err()
+        );
+    }
+
+    #[test]
+    fn shadow_eligibility_metadata_does_not_transfer_live_age() {
+        let shadow = damos::DamosStats {
+            first_tried_snapshot_index: Some(3),
+            first_tried_region_age: Some(3),
+            ..Default::default()
+        };
+        let live = damos::DamosStats::default();
+        assert_eq!(shadow.first_tried_snapshot_index, Some(3));
+        assert_eq!(live.first_tried_snapshot_index, None);
+        assert_eq!(live.first_tried_region_age, None);
+    }
+
+    #[test]
+    fn phase_seven_gate_still_requires_zero_damos() {
+        let evidence = DamonEvidence {
+            zero_damos: false,
+            checks: DAMON_REQUIRED_GATES
+                .iter()
+                .map(|name| check(name, true, "fixture".into()))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!damon_required_gates(&evidence));
     }
 
     #[test]
