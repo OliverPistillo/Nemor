@@ -15,6 +15,7 @@ Nemor recognizes only these managed groups:
 nemor-foreground.slice
 nemor-background.slice
 nemor-test-<sanitized>.scope
+nemor-validation-<sanitized>.scope
 ```
 
 They are separate from `nemord.service`, so stopping the daemon cannot kill
@@ -83,10 +84,12 @@ The simulated backend provides deterministic capability, failure injection,
 readback, rollback, recovery, ownership, and observe-invariant tests. It is a
 Rust test utility and cannot be selected by production configuration.
 
-The Linux backend performs real read-only capability inspection of CachyOS
-cgroup v2. Mutations require a complete memory interface and a hierarchy that
-is actually writable by the daemon. If delegation is unavailable, it returns
-a structured capability error and performs no mutation.
+The Linux backend performs real capability inspection of CachyOS cgroup v2.
+The dedicated privileged harness validated create, `memory.low`,
+`memory.high`, child attachment, readback, rollback, idempotence, and
+cross-process recovery on temporary `nemor-validation-*` groups. Normal daemon
+mutations still require a complete memory interface and writable hierarchy;
+the default service has neither delegation nor mutation enabled.
 
 `nemorctl cgroups status [--json]` is read-only and reports capabilities,
 configuration, backend, managed state, pending rollback, stale recovery state,

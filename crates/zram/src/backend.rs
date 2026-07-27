@@ -46,6 +46,33 @@ impl LinuxZramBackend {
         }
     }
 
+    /// Re-registers a hot-added device after a validation worker restart.
+    ///
+    /// The caller must supply the device names captured before the original
+    /// hot-add. Existing devices and zram0 are never eligible.
+    pub fn resume_isolated_managed_device(
+        &mut self,
+        name: &str,
+        baseline_names: &BTreeSet<String>,
+    ) -> Result<DeviceInventory, ZramError> {
+        if !valid_name(name) || name == "zram0" || baseline_names.contains(name) {
+            return Err(ZramError::Blocked(
+                "recovery device was present at baseline or is protected".to_owned(),
+            ));
+        }
+        if !self
+            .path(&format!("/sys/block/{name}"))
+            .canonicalize()
+            .is_ok_and(|path| path.ends_with(format!("block/{name}")))
+        {
+            return Err(ZramError::Blocked(
+                "recovery device is not a live canonical zram device".to_owned(),
+            ));
+        }
+        self.owned.insert(name.to_owned());
+        self.verify(name)
+    }
+
     fn path(&self, absolute: &str) -> PathBuf {
         self.root.join(absolute.trim_start_matches('/'))
     }
@@ -98,6 +125,16 @@ impl LinuxZramBackend {
             return Err(ZramError::Blocked(
                 "device path is not canonical zram".to_owned(),
             ));
+        }
+        let deadline = Instant::now() + self.command_timeout;
+        while !device.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !device.exists() {
+            return Err(ZramError::Backend {
+                operation: "wait_for_device_node",
+                message: format!("{} did not appear", device.display()),
+            });
         }
         let mut child = Command::new(executable)
             .args(extra)
@@ -223,7 +260,23 @@ impl ZramBackend for LinuxZramBackend {
         if device.active_swap {
             return Err(ZramError::Blocked("never reset active swap".to_owned()));
         }
-        self.write_owned(name, "reset", "1")
+        self.require_owned(name)?;
+        let path = self.path(&format!("/sys/block/{name}/reset"));
+        let deadline = Instant::now() + self.command_timeout;
+        loop {
+            match fs::write(&path, b"1") {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(16) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    return Err(ZramError::Backend {
+                        operation: "reset",
+                        message: error.to_string(),
+                    })
+                }
+            }
+        }
     }
 
     fn remove_managed_device(&mut self, name: &str) -> Result<(), ZramError> {

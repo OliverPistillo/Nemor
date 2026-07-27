@@ -53,9 +53,10 @@ write/read throughput, logical/effective ratio, and allocated memory are
 nullable measured outputs. Fixtures carry an explicit simulated marker and
 cannot qualify as real evidence.
 
-Creating an isolated device requires kernel delegation unavailable to the
-ordinary validation user. Nemor never invokes `sudo`; therefore no real
-algorithm benchmark is claimed for Phase 5 on this host.
+The dedicated privileged harness validated this model on a hot-added 64 MiB
+device with three deterministic 16 MiB datasets and three measured rounds per
+dataset. The normal daemon never invokes `sudo` and remains read-only; the
+privileged evidence belongs only to the isolated validation harness.
 
 ## Transaction and recovery
 

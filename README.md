@@ -13,9 +13,9 @@ not AI.
 | Phase 0 | daemon, config, SQLite, lifecycle | ✅ Validated on CachyOS |
 | Phase 1 | Linux telemetry and reporting | ✅ Validated on CachyOS |
 | Phase 2 | process/workload classification | ✅ Validated on CachyOS |
-| Phase 3 | cgroup v2 protection primitives | 🟡 Dev complete — privileged mutation validation pending |
+| Phase 3 | cgroup v2 protection primitives | ✅ Validated on CachyOS |
 | Phase 4 | deterministic policy engine | ✅ Validated on CachyOS |
-| Phase 5 | safe zram backend and profiles | 🟡 Dev complete — privileged mutation validation pending |
+| Phase 5 | safe zram backend and profiles | ✅ Validated on CachyOS |
 | Phase 6 | disk-backed compression/tiering | ⚪ Planned |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -29,14 +29,15 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 10 |
-| Tests defined / executed | 140 / 140 |
-| Passed / failed / ignored | 140 / 0 / 0 |
+| Tests defined / executed | 148 / 148 |
+| Passed / failed / ignored | 148 / 0 / 0 |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
-| Validated implementation | current `main` (Phase 5 implementation commit) |
+| Validated implementation | current `main` (privileged validation gate) |
 
 Linux tests include real `/proc`/`/sys` reads and real SIGINT/SIGTERM delivery.
-Privileged cgroup mutation is explicitly outside this validated snapshot.
+The dedicated bounded harness additionally validates isolated privileged
+cgroup and zram mutations; the normal runtime remains observe-only.
 
 ## Performance snapshot
 
@@ -59,11 +60,12 @@ The mean CPU is unchanged within measurement noise; memory increased modestly.
 - process identity, foreground tri-state, gaming protection and workload
   classification;
 - cgroup v2 capability inspection, guarded planning, snapshot, rollback and
-  crash-recovery machinery;
+  crash-recovery machinery, validated on temporary real kernel cgroups;
 - deterministic six-state pressure engine with explicit time, hysteresis,
   versioned explanations and a closed action planner;
 - zram inventory, real compression metrics, safe/gaming/capacity plans,
-  bounded benchmark machinery, ownership/headroom guards, rollback and recovery;
+  real isolated bounded benchmark, ownership/headroom guards, replacement-first
+  swap transaction, rollback and recovery;
 - SQLite WAL audit, retention, deduplicated policy decisions, and bounded
   read-only history;
 - foreground daemon with clean SIGINT/SIGTERM lifecycle;
@@ -78,7 +80,9 @@ The mean CPU is unchanged within measurement noise; memory increased modestly.
 - actuator writes require snapshot, one mutation, readback, verify and rollback;
 - policy dry-run stops before actuator apply;
 - every crate forbids unsafe Rust;
-- no destructive or unvalidated action is exposed.
+- `/dev/zram0` is external/protected and never eligible for validation
+  ownership;
+- no privileged mutation is exposed through the daemon or `nemorctl`.
 
 See [the safety model](docs/safety-model.md).
 
@@ -123,21 +127,20 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 
 ## Known limitations
 
-- Phase 3 privileged systemd/cgroup mutations have not been validated and are
-  not enabled by the default service;
+- privileged cgroup/zram validation is available only through the dedicated
+  test harness and is not enabled by the default service;
 - gaming detection is not validated against every live
   Steam/Proton/Wine/Gamescope combination;
 - SteamOS is not supported;
 - policy operation is dry-run only;
-- isolated Phase 5 benchmark and mutations lack delegated kernel privileges;
 - no ML or GUI exists;
 - zswap, writeback/backing devices, disk tiering, and Phase 6 are unavailable.
 
 ## Roadmap
 
-- Completed and validated: Phases 0–2 and deterministic Phase 4 observe logic.
-- Validation pending: isolated privileged Phase 3 cgroup and Phase 5 zram
-  mutations.
+- Completed and validated on CachyOS: Phases 0–5.
+- The runtime default remains observe-only despite isolated privileged
+  validation of Phases 3 and 5.
 - Next: Phase 6 only after a separate approved scope.
 - Future work remains unavailable until implemented and measured.
 
@@ -152,12 +155,14 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - [Safety model](docs/safety-model.md)
 - [Database](docs/database.md)
 - [CachyOS validation](docs/cachyos-validation.md)
+- [Privileged validation](docs/privileged-validation.md)
 
 ## Validation history
 
 | Phase | Tests after phase | Platform validation | Commit |
 |---|---:|---|---|
 | 0–2 | 90 | CachyOS | `ae06b19` |
-| 3 | 106 | Partial — privileged mutations pending | `b335e2c` |
+| 3 | 106 | CachyOS read-only baseline | `b335e2c` |
 | 4 | 122 | CachyOS observe validation | `7a1d180` |
-| 5 | 140 | CachyOS read-only; privileged mutations pending | current implementation commit |
+| 5 | 140 | CachyOS read-only baseline | `fcb21a9` |
+| 3 + 5 gate | 148 | CachyOS privileged isolated validation | current validation commit |

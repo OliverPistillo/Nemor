@@ -267,6 +267,8 @@ fn ownership_and_names_reject_external_groups_and_injection() {
     assert!(is_managed_name(FOREGROUND_GROUP));
     assert!(is_managed_name(BACKGROUND_GROUP));
     assert!(is_managed_name("nemor-test-123.scope"));
+    assert!(is_managed_name("nemor-validation-123.scope"));
+    assert!(!is_managed_name("nemor-validation-123.slice"));
 }
 
 #[test]

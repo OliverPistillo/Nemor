@@ -456,7 +456,7 @@ pub fn recover<B: CgroupBackend, S: SnapshotStore>(
 #[must_use]
 pub fn is_managed_name(name: &str) -> bool {
     matches!(name, FOREGROUND_GROUP | BACKGROUND_GROUP)
-        || (name.starts_with("nemor-test-")
+        || ((name.starts_with("nemor-test-") || name.starts_with("nemor-validation-"))
             && name.ends_with(".scope")
             && name
                 .bytes()
@@ -537,9 +537,10 @@ impl CgroupBackend for LinuxCgroupBackend {
                 .write(true)
                 .open(self.root.join("cgroup.procs"))
                 .is_ok(),
-            memory_low: probe.join("memory.low").exists() || self.root.join("memory.low").exists(),
-            memory_high: probe.join("memory.high").exists()
-                || self.root.join("memory.high").exists(),
+            memory_low: controllers.split_whitespace().any(|item| item == "memory")
+                && (probe.join("memory.low").exists() || !probe.exists()),
+            memory_high: controllers.split_whitespace().any(|item| item == "memory")
+                && (probe.join("memory.high").exists() || !probe.exists()),
             attach: probe.join("cgroup.procs").exists() || self.root.join("cgroup.procs").exists(),
         })
     }

@@ -562,10 +562,16 @@ dependencies = [
 name = "nemor-test-support"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
+ "nemor-actuator",
  "nemor-classifier",
  "nemor-collector",
  "nemor-common",
  "nemor-storage",
+ "nemor-zram",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

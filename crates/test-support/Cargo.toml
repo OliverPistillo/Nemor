@@ -5,11 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+actuator = { package = "nemor-actuator", path = "../actuator" }
+anyhow.workspace = true
+clap.workspace = true
 collector = { package = "nemor-collector", path = "../collector" }
 classifier = { package = "nemor-classifier", path = "../classifier" }
 common = { package = "nemor-common", path = "../common" }
+serde.workspace = true
+serde_json.workspace = true
 storage = { package = "nemor-storage", path = "../storage" }
 tempfile.workspace = true
+zram = { package = "nemor-zram", path = "../zram" }
 
 [lints]
 workspace = true
