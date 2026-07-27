@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const MIGRATION_VERSION: i64 = 4;
+pub const MIGRATION_VERSION: i64 = 5;
 pub const INITIAL_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0001_initial.sql"
@@ -34,6 +34,10 @@ pub const CLASSIFIER_MIGRATION: &str = include_str!(concat!(
 pub const CGROUP_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0004_cgroups.sql"
+));
+pub const DAMON_MIGRATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0005_damon.sql"
 ));
 
 pub struct Storage {
@@ -236,7 +240,8 @@ impl Storage {
         self.apply_migration(1, INITIAL_MIGRATION, true)?;
         self.apply_migration(2, TELEMETRY_MIGRATION, false)?;
         self.apply_migration(3, CLASSIFIER_MIGRATION, false)?;
-        self.apply_migration(4, CGROUP_MIGRATION, false)
+        self.apply_migration(4, CGROUP_MIGRATION, false)?;
+        self.apply_migration(5, DAMON_MIGRATION, false)
     }
 
     pub fn migrate_source(&mut self, source: &str) -> Result<()> {
@@ -1626,6 +1631,9 @@ mod tests {
         "cgroup_managed_groups",
         "cgroup_snapshots",
         "configuration_snapshots",
+        "damon_overhead_samples",
+        "damon_region_samples",
+        "damon_sessions",
         "hosts",
         "model_registry",
         "policy_decisions",
@@ -1785,6 +1793,7 @@ mod tests {
                 (2, migration_checksum(TELEMETRY_MIGRATION)),
                 (3, migration_checksum(CLASSIFIER_MIGRATION)),
                 (4, migration_checksum(CGROUP_MIGRATION)),
+                (5, migration_checksum(DAMON_MIGRATION)),
             ]
         );
     }
@@ -1801,7 +1810,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration count");
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
         let journal: String = storage
             .connection()
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))

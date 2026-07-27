@@ -77,3 +77,11 @@ paths, helper executable/argv allow-lists, no-swap-loss, write budgets and
 rollback are fail-closed. `/dev/zram0` remains external and protected. Zswap is
 kernel-global, so live desktop validation never enables it merely to satisfy a
 test. Persistent boot plans require separate explicit approval.
+
+Phase 7 preserves the same observe invariant: the daemon never creates,
+configures, starts or stops `kdamond`, never enables tracepoints and never
+writes DAMON sysfs. The manual validation path accepts only its synthetic child
+and owned `nemor-validation-*` objects. It verifies `nr_schemes=0`; there is no
+DAMOS, reclaim, pageout, LRU or migration implementation. Mapping-local
+`MADV_NOHUGEPAGE` is restricted to the synthetic A/B validation control and is
+not a runtime workload policy.

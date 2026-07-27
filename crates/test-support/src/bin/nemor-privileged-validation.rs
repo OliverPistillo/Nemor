@@ -7,12 +7,19 @@ use actuator::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
+use memmap2::{Advice, MmapMut, MmapOptions};
+use nix::time::{clock_gettime, ClockId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiering::{
     apply_swapfile, inspect_storage, parse_block_stat, rollback_swapfile, FilesystemKind,
@@ -32,6 +39,38 @@ const TEST_SWAP_PRIORITY_A: i32 = 10;
 const TEST_SWAP_PRIORITY_B: i32 = 11;
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(180);
 const TIERING_SWAP_BYTES: u64 = 64 * 1024 * 1024;
+const DAMON_REQUIRED_GATES: &[&str] = &[
+    "capability",
+    "available_operations",
+    "vaddr_selected",
+    "attrs_readback",
+    "target_identity",
+    "synthetic_workload_ready",
+    "target_regions_readback",
+    "base_page_backing_verified",
+    "zero_damos_before_start",
+    "trace_instance_isolated",
+    "final_trace_instance_ready",
+    "kdamond_started",
+    "aggregated_trace_bytes_received",
+    "damon_payloads_parsed",
+    "trace_clock_compatible",
+    "timestamp_values_parsed",
+    "timestamp_correlation_valid",
+    "raw_regions_present",
+    "synthetic_workload_active",
+    "post_run_fingerprint",
+    "hot_cold_evidence",
+    "warm_evidence",
+    "overhead_budget",
+    "dataset_jsonl",
+    "dataset_csv",
+    "kdamond_stopped",
+    "cleanup",
+    "recovery",
+    "recovery_idempotent",
+    "host_unchanged",
+];
 
 #[derive(Debug, Clone, Copy)]
 enum Scope {
@@ -39,6 +78,7 @@ enum Scope {
     Cgroups,
     Zram,
     Tiering,
+    Damon,
     All,
 }
 
@@ -53,6 +93,8 @@ struct Cli {
     zram: bool,
     #[arg(long)]
     tiering: bool,
+    #[arg(long)]
+    damon: bool,
     #[arg(long)]
     all: bool,
     #[arg(long)]
@@ -71,6 +113,7 @@ impl Cli {
             (self.cgroups, Scope::Cgroups),
             (self.zram, Scope::Zram),
             (self.tiering, Scope::Tiering),
+            (self.damon, Scope::Damon),
             (self.all, Scope::All),
         ];
         let values: Vec<_> = selected
@@ -79,7 +122,9 @@ impl Cli {
             .collect();
         match values.as_slice() {
             [scope] => Ok(*scope),
-            _ => bail!("select exactly one of --preflight, --cgroups, --zram, --tiering, or --all"),
+            _ => bail!(
+                "select exactly one of --preflight, --cgroups, --zram, --tiering, --damon, or --all"
+            ),
         }
     }
 }
@@ -89,6 +134,8 @@ enum InternalWorker {
     CgroupCrash,
     ZramCrash,
     NemorValidationSleeper,
+    DamonTarget,
+    DamonCrash,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +236,410 @@ struct TieringEvidence {
     boot_validation_required: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DamonEvidence {
+    attempted: bool,
+    checks: Vec<Check>,
+    capability: Option<damon::DamonCapability>,
+    target_pid: Option<u32>,
+    target_start_ticks: Option<u64>,
+    attrs_requested: Option<damon::MonitoringAttrs>,
+    attrs_effective: Option<damon::MonitoringAttrs>,
+    raw_regions: u64,
+    aggregation_windows: u64,
+    region_sample_bytes: Option<u64>,
+    snapshot_observed_bytes: Option<u64>,
+    requested_target_bytes: u64,
+    target_ranges: BTreeMap<String, damon::AddressRange>,
+    observed_target_bytes_per_snapshot: Option<u64>,
+    outside_requested_bytes: Option<u64>,
+    outside_requested_ratio: Option<f64>,
+    hot_snapshot_overlap_bytes: Option<u64>,
+    warm_snapshot_overlap_bytes: Option<u64>,
+    cold_snapshot_overlap_bytes: Option<u64>,
+    overhead: Option<damon::OverheadSample>,
+    dataset_jsonl: bool,
+    dataset_csv: bool,
+    dataset_jsonl_path: Option<String>,
+    dataset_csv_path: Option<String>,
+    zero_damos: bool,
+    recovery_idempotent: bool,
+    signal: Option<damon::SignalEvidence>,
+    workload_progress: Vec<WorkloadWindowProgress>,
+    window_alignment: Vec<AlignedWindowDiagnostic>,
+    lifecycle_timeline_ns: BTreeMap<String, u128>,
+    zone_backing: BTreeMap<String, damon::ZoneBacking>,
+    post_run_fingerprints: BTreeMap<String, u64>,
+    tlb_diagnostic: TlbDiagnostic,
+    probe_session_ids: Vec<String>,
+    final_session_id: Option<String>,
+    final_trace: Option<TraceCaptureDiagnostic>,
+    validation_failure_class: ValidationFailureClass,
+    lifecycle_clock_domain: String,
+    workload_clock_domain: String,
+    trace_clock_domain: String,
+    instrumentation_failure_reason: Option<String>,
+    signal_failure_reason: Option<String>,
+    required_gates_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum ValidationFailureClass {
+    #[default]
+    None,
+    SafetyFailure,
+    InstrumentationFailure,
+    SignalFailure,
+    OverheadFailure,
+    DatasetFailure,
+}
+
+fn classify_capture(diagnostic: &TraceCaptureDiagnostic) -> ValidationFailureClass {
+    if diagnostic.trace_bytes_read == 0
+        || diagnostic.damon_event_lines_seen == 0
+        || diagnostic.damon_events_parsed == 0
+        || diagnostic.parse_failures > 0
+        || diagnostic.timestamp_failures > 0
+        || !diagnostic.trace_clock_readback
+        || !diagnostic.timestamp_correlation_valid
+    {
+        ValidationFailureClass::InstrumentationFailure
+    } else {
+        ValidationFailureClass::None
+    }
+}
+
+fn sessions_are_independent(probes: &[String], final_session: &str) -> bool {
+    !final_session.is_empty()
+        && probes.iter().all(|probe| probe != final_session)
+        && probes.iter().collect::<BTreeSet<_>>().len() == probes.len()
+}
+
+fn record_validated_operation(capability: &mut damon::DamonCapability, operation: &str) {
+    if !capability
+        .available_operations
+        .iter()
+        .any(|item| item == operation)
+    {
+        capability.available_operations.push(operation.to_owned());
+    }
+    if operation == "vaddr" {
+        capability.vaddr_supported = true;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TraceCaptureDiagnostic {
+    session_id: String,
+    instance_path: String,
+    event_enable: bool,
+    tracing_on: bool,
+    capture_worker_ready: bool,
+    trace_bytes_read: u64,
+    trace_lines_read: u64,
+    damon_event_lines_seen: u64,
+    damon_events_parsed: u64,
+    timestamp_values_parsed: u64,
+    parse_failures: u64,
+    timestamp_failures: u64,
+    incomplete_lines: u64,
+    bytes_after_kdamond_stop: u64,
+    available_trace_clocks: Vec<String>,
+    requested_trace_clock: Option<String>,
+    effective_trace_clock: Option<String>,
+    userspace_clock: Option<String>,
+    trace_clock_readback: bool,
+    timestamp_correlation_valid: bool,
+    trace_events_total: u64,
+    trace_events_in_monitoring_window: u64,
+    trace_events_outside_monitoring_window: u64,
+    trace_events_unmatched: u64,
+    trace_timestamp_min: Option<u128>,
+    trace_timestamp_max: Option<u128>,
+    workload_monitoring_start_monotonic: Option<u128>,
+    workload_monitoring_end_monotonic: Option<u128>,
+    raw_first: Vec<String>,
+    raw_last: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CapturedEvent {
+    timestamp_ns: Option<u128>,
+    region: damon::TraceRegion,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum UserspaceClock {
+    Monotonic,
+    MonotonicRaw,
+    Boottime,
+}
+
+impl UserspaceClock {
+    fn report_name(self) -> &'static str {
+        match self {
+            Self::Monotonic => "CLOCK_MONOTONIC",
+            Self::MonotonicRaw => "CLOCK_MONOTONIC_RAW",
+            Self::Boottime => "CLOCK_BOOTTIME",
+        }
+    }
+
+    fn clock_id(self) -> ClockId {
+        match self {
+            Self::Monotonic => ClockId::CLOCK_MONOTONIC,
+            Self::MonotonicRaw => ClockId::CLOCK_MONOTONIC_RAW,
+            Self::Boottime => ClockId::CLOCK_BOOTTIME,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TraceClockPlan {
+    available: Vec<String>,
+    requested: String,
+    effective: String,
+    userspace_clock: UserspaceClock,
+    readback: bool,
+}
+
+struct TraceCaptureWorker {
+    stop: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+    session_id: String,
+    instance: PathBuf,
+}
+
+struct MonitorSessionSpec<'a> {
+    session_id: &'a str,
+    trace_instance: &'a Path,
+}
+
+fn run_damon_monitor_session(spec: MonitorSessionSpec<'_>) -> Result<TraceCaptureWorker> {
+    TraceCaptureWorker::start(spec.trace_instance, spec.session_id)
+}
+
+impl TraceCaptureWorker {
+    fn start(instance: &Path, session_id: &str) -> Result<Self> {
+        let enable = instance.join("events/damon/damon_aggregated/enable");
+        let tracing_on = instance.join("tracing_on");
+        if read_trimmed(&enable)? != "1" || read_trimmed(&tracing_on)? != "1" {
+            bail!("trace capture requires enabled final instance readback");
+        }
+        let trace_path = instance.join("trace");
+        let mut file = OpenOptions::new().read(true).open(&trace_path)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let worker_stop = Arc::clone(&stop);
+        let worker_ready = Arc::clone(&ready);
+        let worker_buffer = Arc::clone(&buffer);
+        let handle = thread::spawn(move || -> Result<()> {
+            worker_ready.store(true, Ordering::Release);
+            while !worker_stop.load(Ordering::Acquire) {
+                file.seek(SeekFrom::Start(0))?;
+                let mut snapshot = Vec::new();
+                file.read_to_end(&mut snapshot)?;
+                *worker_buffer
+                    .lock()
+                    .map_err(|_| anyhow!("trace capture buffer poisoned"))? = snapshot;
+                thread::sleep(Duration::from_millis(20));
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let mut snapshot = Vec::new();
+            file.read_to_end(&mut snapshot)?;
+            *worker_buffer
+                .lock()
+                .map_err(|_| anyhow!("trace capture buffer poisoned"))? = snapshot;
+            Ok(())
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !ready.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                bail!("trace capture worker readiness timeout");
+            }
+            thread::yield_now();
+        }
+        Ok(Self {
+            stop,
+            ready,
+            buffer,
+            handle: Some(handle),
+            session_id: session_id.to_owned(),
+            instance: instance.to_path_buf(),
+        })
+    }
+
+    fn bytes_read(&self) -> Result<usize> {
+        Ok(self
+            .buffer
+            .lock()
+            .map_err(|_| anyhow!("trace capture buffer poisoned"))?
+            .len())
+    }
+
+    fn drain_and_stop(
+        mut self,
+        bytes_at_stop: usize,
+    ) -> Result<(TraceCaptureDiagnostic, Vec<CapturedEvent>)> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut last = self.bytes_read()?;
+        let mut stable = 0_u8;
+        while Instant::now() < deadline && stable < 2 {
+            thread::sleep(Duration::from_millis(25));
+            let current = self.bytes_read()?;
+            if current == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = current;
+            }
+        }
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| anyhow!("trace capture worker panicked"))??;
+        }
+        let bytes = self
+            .buffer
+            .lock()
+            .map_err(|_| anyhow!("trace capture buffer poisoned"))?
+            .clone();
+        parse_trace_capture(
+            &self.session_id,
+            &self.instance,
+            self.ready.load(Ordering::Acquire),
+            &bytes,
+            bytes.len().saturating_sub(bytes_at_stop),
+        )
+    }
+}
+
+fn parse_trace_capture(
+    session_id: &str,
+    instance: &Path,
+    worker_ready: bool,
+    bytes: &[u8],
+    bytes_after_stop: usize,
+) -> Result<(TraceCaptureDiagnostic, Vec<CapturedEvent>)> {
+    const RAW_LIMIT: usize = 4;
+    let text = String::from_utf8_lossy(bytes);
+    let mut events = Vec::new();
+    let mut damon_lines = Vec::new();
+    let mut parse_failures = 0_u64;
+    let mut timestamp_failures = 0_u64;
+    for line in text
+        .lines()
+        .filter(|line| line.contains("damon_aggregated:"))
+    {
+        damon_lines.push(line.to_owned());
+        match damon::parse_aggregated(line) {
+            Ok(region) => {
+                let timestamp_ns = trace_timestamp_ns(line);
+                if timestamp_ns.is_none() {
+                    timestamp_failures += 1;
+                }
+                events.push(CapturedEvent {
+                    timestamp_ns,
+                    region,
+                });
+            }
+            Err(_) => parse_failures += 1,
+        }
+    }
+    let raw_first = damon_lines.iter().take(RAW_LIMIT).cloned().collect();
+    let raw_last = damon_lines
+        .iter()
+        .rev()
+        .take(RAW_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let diagnostic = TraceCaptureDiagnostic {
+        session_id: session_id.to_owned(),
+        instance_path: instance.display().to_string(),
+        event_enable: read_trimmed(&instance.join("events/damon/damon_aggregated/enable"))
+            .ok()
+            .as_deref()
+            == Some("1"),
+        tracing_on: read_trimmed(&instance.join("tracing_on")).ok().as_deref() == Some("1"),
+        capture_worker_ready: worker_ready,
+        trace_bytes_read: bytes.len() as u64,
+        trace_lines_read: text.lines().count() as u64,
+        damon_event_lines_seen: damon_lines.len() as u64,
+        damon_events_parsed: events.len() as u64,
+        timestamp_values_parsed: events
+            .iter()
+            .filter(|event| event.timestamp_ns.is_some())
+            .count() as u64,
+        parse_failures,
+        timestamp_failures,
+        incomplete_lines: u64::from(!bytes.is_empty() && !bytes.ends_with(b"\n")),
+        bytes_after_kdamond_stop: bytes_after_stop as u64,
+        trace_events_total: events.len() as u64,
+        raw_first,
+        raw_last,
+        ..TraceCaptureDiagnostic::default()
+    };
+    Ok((diagnostic, events))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TlbDiagnostic {
+    current_zone_size: u64,
+    size_ladder_attempts: Vec<damon::ProbeEvidence>,
+    selected_size: Option<u64>,
+    selected_size_reason: Option<String>,
+    mem_available_bytes: u64,
+    headroom_bytes: u64,
+    hypothesis_status: damon::HypothesisStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WorkloadProgress {
+    hot_cycles: u64,
+    warm_cycles: u64,
+    hot_pages_touched: u64,
+    warm_pages_touched: u64,
+    cold_cycles: u64,
+    workload_started_ns: u128,
+    workload_stopped_ns: u128,
+    hot_fingerprint: u64,
+    warm_fingerprint: u64,
+    cold_fingerprint: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkloadWindowProgress {
+    window_index: u64,
+    start_ns: u128,
+    end_ns: u128,
+    hot_cycles_delta: u64,
+    warm_cycles_delta: u64,
+    hot_pages_touched_delta: u64,
+    warm_pages_touched_delta: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AlignedWindowDiagnostic {
+    window_index: u64,
+    start_uptime_ns: u64,
+    end_uptime_ns: u64,
+    partial: bool,
+    hot_cycles_delta: u64,
+    warm_cycles_delta: u64,
+    hot_pages_touched_delta: u64,
+    warm_pages_touched_delta: u64,
+    overlap_duration_ns: u128,
+    alignment_method: String,
+    alignment_estimated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ValidationReport {
     schema: &'static str,
@@ -203,6 +654,7 @@ struct ValidationReport {
     cgroups: CgroupEvidence,
     zram: ZramEvidence,
     tiering: TieringEvidence,
+    damon: DamonEvidence,
     host_unchanged: bool,
     errors: Vec<String>,
 }
@@ -301,7 +753,7 @@ fn main() -> Result<()> {
         return run_internal_worker(worker);
     }
     if cli.cleanup_owned_residue {
-        if cli.preflight || cli.cgroups || cli.zram || cli.tiering || cli.all {
+        if cli.preflight || cli.cgroups || cli.zram || cli.tiering || cli.damon || cli.all {
             bail!("--cleanup-owned-residue cannot be combined with validation modes");
         }
         return cleanup_owned_residue();
@@ -326,6 +778,7 @@ fn main() -> Result<()> {
         cgroups: CgroupEvidence::default(),
         zram: ZramEvidence::default(),
         tiering: TieringEvidence::default(),
+        damon: DamonEvidence::default(),
         host_unchanged: false,
         errors: Vec::new(),
     };
@@ -348,6 +801,12 @@ fn main() -> Result<()> {
             report.errors.push(format!("tiering: {error:#}"));
         }
     }
+    if matches!(scope, Scope::Damon | Scope::All) {
+        deadline.check("DAMON validation")?;
+        if let Err(error) = validate_damon(&mut report.damon, &deadline) {
+            report.errors.push(format!("damon: {error:#}"));
+        }
+    }
 
     report.final_snapshot = snapshot_host()?;
     report.host_unchanged = compare_host(&baseline, &report.final_snapshot).is_ok();
@@ -355,6 +814,20 @@ fn main() -> Result<()> {
         report
             .errors
             .push(format!("final host comparison: {error:#}"));
+    }
+    if matches!(scope, Scope::Damon | Scope::All) {
+        let host_check = check(
+            "host_unchanged",
+            report.host_unchanged,
+            "final structural host snapshot compared with baseline".to_owned(),
+        );
+        report.damon.checks.push(host_check);
+        report.damon.required_gates_passed = damon_required_gates(&report.damon);
+        if !report.damon.required_gates_passed {
+            report
+                .errors
+                .push("damon: one or more mandatory validation gates failed".to_owned());
+        }
     }
     report.finished_ns = now_ns()?;
     write_report(&report)?;
@@ -376,6 +849,8 @@ fn run_internal_worker(worker: InternalWorker) -> Result<()> {
             std::thread::sleep(Duration::from_secs(120));
             Ok(())
         }
+        InternalWorker::DamonTarget => damon_target_worker(),
+        InternalWorker::DamonCrash => damon_crash_worker(),
     }
 }
 
@@ -417,6 +892,8 @@ fn run_worker(worker: InternalWorker) -> Result<()> {
         InternalWorker::CgroupCrash => "cgroup-crash",
         InternalWorker::ZramCrash => "zram-crash",
         InternalWorker::NemorValidationSleeper => "nemor-validation-sleeper",
+        InternalWorker::DamonTarget => "damon-target",
+        InternalWorker::DamonCrash => "damon-crash",
     };
     let executable = std::env::current_exe()?.canonicalize()?;
     let status = Command::new(executable)
@@ -1099,6 +1576,1402 @@ fn snapshot_host() -> Result<HostSnapshot> {
     })
 }
 
+fn damon_target_worker() -> Result<()> {
+    let zone_bytes: usize = read_trimmed(&Path::new(STATE_DIR).join("damon-zone-bytes"))?
+        .parse()
+        .context("invalid bounded DAMON zone size")?;
+    if zone_bytes == 0 || zone_bytes > damon::MAX_DIAGNOSTIC_ZONE_BYTES as usize {
+        bail!("DAMON zone size is outside bounded ladder");
+    }
+    let backing_profile: damon::PageBackingProfile = serde_json::from_slice(&fs::read(
+        Path::new(STATE_DIR).join("damon-backing-profile"),
+    )?)?;
+    let zone = zone_bytes;
+    let mut hot = owned_anonymous_zone(zone, backing_profile)?;
+    let mut warm = owned_anonymous_zone(zone, backing_profile)?;
+    let mut cold = owned_anonymous_zone(zone, backing_profile)?;
+    hot.fill(1);
+    warm.fill(2);
+    cold.fill(3);
+    let hot_range = [hot.as_ptr() as usize, hot.as_ptr() as usize + hot.len()];
+    let warm_range = [warm.as_ptr() as usize, warm.as_ptr() as usize + warm.len()];
+    let cold_range = [cold.as_ptr() as usize, cold.as_ptr() as usize + cold.len()];
+    let allocations_complete_ns = now_ns()?;
+    let active = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let hot_ready = Arc::new(AtomicBool::new(false));
+    let warm_ready = Arc::new(AtomicBool::new(false));
+    let hot_cycles = Arc::new(AtomicU64::new(0));
+    let warm_cycles = Arc::new(AtomicU64::new(0));
+    let hot_pages = Arc::new(AtomicU64::new(0));
+    let warm_pages = Arc::new(AtomicU64::new(0));
+
+    let hot_thread = {
+        let active = Arc::clone(&active);
+        let stop = Arc::clone(&stop);
+        let ready = Arc::clone(&hot_ready);
+        let cycles = Arc::clone(&hot_cycles);
+        let pages = Arc::clone(&hot_pages);
+        thread::spawn(move || {
+            let mut zone = hot;
+            ready.store(true, Ordering::Release);
+            while !stop.load(Ordering::Acquire) {
+                if !active.load(Ordering::Acquire) {
+                    thread::yield_now();
+                    continue;
+                }
+                let (touched, _) = touch_zone(&mut zone);
+                pages.fetch_add(touched, Ordering::Relaxed);
+                cycles.fetch_add(1, Ordering::Release);
+            }
+            let (_, fingerprint) = touch_zone(&mut zone);
+            (zone, fingerprint)
+        })
+    };
+    let warm_thread = {
+        let active = Arc::clone(&active);
+        let stop = Arc::clone(&stop);
+        let ready = Arc::clone(&warm_ready);
+        let cycles = Arc::clone(&warm_cycles);
+        let pages = Arc::clone(&warm_pages);
+        thread::spawn(move || {
+            let mut zone = warm;
+            ready.store(true, Ordering::Release);
+            while !stop.load(Ordering::Acquire) {
+                if !active.load(Ordering::Acquire) {
+                    thread::yield_now();
+                    continue;
+                }
+                let (touched, _) = touch_zone(&mut zone);
+                pages.fetch_add(touched, Ordering::Relaxed);
+                cycles.fetch_add(1, Ordering::Release);
+                thread::sleep(Duration::from_millis(100));
+            }
+            let (_, fingerprint) = touch_zone(&mut zone);
+            (zone, fingerprint)
+        })
+    };
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !(hot_ready.load(Ordering::Acquire) && warm_ready.load(Ordering::Acquire)) {
+        if Instant::now() >= ready_deadline {
+            bail!("synthetic worker readiness timeout");
+        }
+        thread::yield_now();
+    }
+    let workers_ready_ns = now_ns()?;
+    let metadata = serde_json::json!({
+        "pid": std::process::id(),
+        "start_ticks": proc_start_ticks(std::process::id())?,
+        "state": "ready",
+        "allocations_complete_ns": allocations_complete_ns,
+        "workers_ready_ns": workers_ready_ns,
+        "hot": hot_range,
+        "warm": warm_range,
+        "cold": cold_range,
+        "backing_profile": backing_profile
+    });
+    fs::write(
+        Path::new(STATE_DIR).join("damon-target.json"),
+        serde_json::to_vec(&metadata)?,
+    )?;
+    write_workload_progress(&WorkloadProgress::default())?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !Path::new(STATE_DIR).join("damon-start").exists() {
+        if Instant::now() >= deadline {
+            bail!("synthetic START barrier timeout");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let started_ns = now_ns()?;
+    active.store(true, Ordering::Release);
+    while !Path::new(STATE_DIR).join("damon-stop").exists() {
+        write_workload_progress(&WorkloadProgress {
+            hot_cycles: hot_cycles.load(Ordering::Acquire),
+            warm_cycles: warm_cycles.load(Ordering::Acquire),
+            hot_pages_touched: hot_pages.load(Ordering::Acquire),
+            warm_pages_touched: warm_pages.load(Ordering::Acquire),
+            cold_cycles: 0,
+            workload_started_ns: started_ns,
+            workload_stopped_ns: 0,
+            hot_fingerprint: 0,
+            warm_fingerprint: 0,
+            cold_fingerprint: 0,
+        })?;
+        thread::sleep(Duration::from_millis(20));
+    }
+    active.store(false, Ordering::Release);
+    stop.store(true, Ordering::Release);
+    let (hot, hot_fingerprint) = hot_thread
+        .join()
+        .map_err(|_| anyhow!("HOT worker panicked"))?;
+    let (warm, warm_fingerprint) = warm_thread
+        .join()
+        .map_err(|_| anyhow!("WARM worker panicked"))?;
+    let cold_fingerprint = fingerprint_zone(&cold);
+    write_workload_progress(&WorkloadProgress {
+        hot_cycles: hot_cycles.load(Ordering::Acquire),
+        warm_cycles: warm_cycles.load(Ordering::Acquire),
+        hot_pages_touched: hot_pages.load(Ordering::Acquire),
+        warm_pages_touched: warm_pages.load(Ordering::Acquire),
+        cold_cycles: 0,
+        workload_started_ns: started_ns,
+        workload_stopped_ns: now_ns()?,
+        hot_fingerprint,
+        warm_fingerprint,
+        cold_fingerprint,
+    })?;
+    std::hint::black_box((hot, warm, cold));
+    Ok(())
+}
+
+fn owned_anonymous_zone(bytes: usize, profile: damon::PageBackingProfile) -> Result<MmapMut> {
+    let mapping = MmapOptions::new().len(bytes).map_anon()?;
+    if profile == damon::PageBackingProfile::BasePageNoHuge {
+        if !Advice::NoHugePage.is_supported() {
+            bail!("MADV_NOHUGEPAGE is not supported by this kernel");
+        }
+        mapping
+            .advise(Advice::NoHugePage)
+            .context("MADV_NOHUGEPAGE failed for owned synthetic mapping")?;
+    }
+    Ok(mapping)
+}
+
+fn touch_zone(zone: &mut [u8]) -> (u64, u64) {
+    let mut fingerprint = 0_u64;
+    let mut touched = 0_u64;
+    for index in (0..zone.len()).step_by(4096) {
+        let updated = zone[index].wrapping_add(1).max(4);
+        zone[index] = updated;
+        fingerprint = fingerprint.wrapping_add(u64::from(updated));
+        touched = touched.saturating_add(1);
+    }
+    std::hint::black_box(fingerprint);
+    (touched, fingerprint)
+}
+
+fn fingerprint_zone(zone: &[u8]) -> u64 {
+    let fingerprint = (0..zone.len())
+        .step_by(4096)
+        .fold(0_u64, |sum, index| sum.wrapping_add(u64::from(zone[index])));
+    std::hint::black_box(fingerprint)
+}
+
+fn validate_damon(evidence: &mut DamonEvidence, deadline: &Deadline) -> Result<()> {
+    evidence.attempted = true;
+    evidence.zero_damos = true;
+    evidence.lifecycle_clock_domain = "realtime".to_owned();
+    evidence.workload_clock_domain = "monotonic".to_owned();
+    let capability = damon::inspect_linux(
+        Path::new("/"),
+        Some(read_command("/usr/bin/uname", &["-r"])?),
+    );
+    evidence.checks.push(check(
+        "capability",
+        capability.supported,
+        format!(
+            "admin={}, tracefs={}, tracepoint={}",
+            capability.sysfs_admin_available,
+            capability.tracefs_available,
+            capability.aggregated_tracepoint_available
+        ),
+    ));
+    if capability.active_external_session || capability.special_module_conflict {
+        bail!("external DAMON session or special-purpose module conflict");
+    }
+    if !capability.writable || !capability.aggregated_tracepoint_available {
+        bail!("DAMON admin or isolated tracepoint is unavailable");
+    }
+    evidence.capability = Some(capability);
+    let attrs = damon::MonitoringAttrs {
+        operation: "vaddr".to_owned(),
+        sample_us: 25_000,
+        aggr_us: 500_000,
+        update_us: 10_000_000,
+        min_regions: 10,
+        max_regions: 1_000,
+        addr_unit: None,
+    };
+    attrs.validate()?;
+    evidence.attrs_requested = Some(attrs.clone());
+
+    let baseline_instances = trace_instances()?;
+    let admin = Path::new("/sys/kernel/mm/damon/admin/kdamonds");
+    if read_trimmed(&admin.join("nr_kdamonds"))? != "0" {
+        bail!("existing kdamond objects make ownership ambiguous");
+    }
+    let trace_root = tracefs_root()?;
+    const HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
+    let mem_available_bytes = mem_available_bytes()?;
+    let base_page_ladder = damon::bounded_size_ladder(mem_available_bytes, HEADROOM_BYTES)
+        .into_iter()
+        .filter(|size| *size <= 64 * 1024 * 1024)
+        .collect::<Vec<_>>();
+    evidence.tlb_diagnostic.mem_available_bytes = mem_available_bytes;
+    evidence.tlb_diagnostic.headroom_bytes = HEADROOM_BYTES;
+    if !base_page_ladder.contains(&(8 * 1024 * 1024)) {
+        evidence.validation_failure_class = ValidationFailureClass::SafetyFailure;
+        bail!("MemAvailable cannot preserve one-GiB headroom for the A/B probe");
+    }
+    evidence.tlb_diagnostic.hypothesis_status =
+        damon::HypothesisStatus::InconclusiveDueToThpBacking;
+    let thp_reference = run_damon_probe(
+        8 * 1024 * 1024,
+        &attrs,
+        damon::PageBackingProfile::ThpReference,
+    )?;
+    evidence
+        .probe_session_ids
+        .push(thp_reference.session_id.clone());
+    if let Some(capability) = evidence.capability.as_mut() {
+        record_validated_operation(capability, "vaddr");
+    }
+    evidence
+        .tlb_diagnostic
+        .size_ladder_attempts
+        .push(thp_reference.clone());
+    for zone_size in base_page_ladder {
+        deadline.check("DAMON bounded TLB diagnostic probe")?;
+        let attempt =
+            match run_damon_probe(zone_size, &attrs, damon::PageBackingProfile::BasePageNoHuge) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    evidence.validation_failure_class =
+                        ValidationFailureClass::InstrumentationFailure;
+                    return Err(error);
+                }
+            };
+        if let Some(capability) = evidence.capability.as_mut() {
+            record_validated_operation(capability, "vaddr");
+        }
+        evidence.probe_session_ids.push(attempt.session_id.clone());
+        evidence.tlb_diagnostic.size_ladder_attempts.push(attempt);
+        if evidence
+            .tlb_diagnostic
+            .size_ladder_attempts
+            .last()
+            .is_some_and(|attempt| {
+                attempt.backing_profile == damon::PageBackingProfile::BasePageNoHuge
+                    && attempt.stable_enough()
+            })
+        {
+            break;
+        }
+    }
+    let Some((selected_zone_size, selected_reason)) =
+        damon::select_base_page_probe(&evidence.tlb_diagnostic.size_ladder_attempts)
+    else {
+        evidence.tlb_diagnostic.hypothesis_status = evidence
+            .tlb_diagnostic
+            .size_ladder_attempts
+            .iter()
+            .find(|attempt| {
+                attempt.zone_size_bytes == 8 * 1024 * 1024
+                    && attempt.backing_profile == damon::PageBackingProfile::BasePageNoHuge
+            })
+            .map_or(damon::HypothesisStatus::NotTested, |base| {
+                damon::compare_page_backing(&thp_reference, base)
+            });
+        evidence.validation_failure_class = ValidationFailureClass::SignalFailure;
+        evidence.signal_failure_reason = Some("no_stable_working_set".to_owned());
+        bail!("no bounded DAMON zone size produced stable HOT detection");
+    };
+    evidence.tlb_diagnostic.current_zone_size = selected_zone_size;
+    evidence.tlb_diagnostic.selected_size = Some(selected_zone_size);
+    evidence.tlb_diagnostic.selected_size_reason = Some(selected_reason);
+    evidence.tlb_diagnostic.hypothesis_status = evidence
+        .tlb_diagnostic
+        .size_ladder_attempts
+        .iter()
+        .find(|attempt| {
+            attempt.zone_size_bytes == 8 * 1024 * 1024
+                && attempt.backing_profile == damon::PageBackingProfile::BasePageNoHuge
+        })
+        .map_or(damon::HypothesisStatus::NotTested, |base| {
+            damon::compare_page_backing(&thp_reference, base)
+        });
+
+    let trace_name = format!("nemor-validation-{}", now_ns()?);
+    evidence.final_session_id = Some(trace_name.clone());
+    if !sessions_are_independent(&evidence.probe_session_ids, &trace_name) {
+        bail!("final session id reused a probe session id");
+    }
+    let trace_instance = trace_root.join("instances").join(&trace_name);
+    let mut cleanup = DamonCleanup::new(admin.to_path_buf(), trace_instance.clone());
+
+    let mut baseline_child = spawn_damon_target(
+        selected_zone_size,
+        damon::PageBackingProfile::BasePageNoHuge,
+    )?;
+    signal_damon_target("damon-start")?;
+    let baseline_start = read_progress()?;
+    std::thread::sleep(Duration::from_secs(2));
+    let baseline_end = read_progress()?;
+    signal_damon_target("damon-stop")?;
+    baseline_child.terminate()?;
+    let baseline_rate = baseline_end
+        .hot_cycles
+        .saturating_sub(baseline_start.hot_cycles) as f64
+        / 2.0;
+
+    let child_spawn_ns = now_ns()?;
+    let mut child = spawn_damon_target(
+        selected_zone_size,
+        damon::PageBackingProfile::BasePageNoHuge,
+    )?;
+    let child_start_ticks = child.start_ticks;
+    evidence.target_pid = Some(child.id());
+    evidence.target_start_ticks = Some(child_start_ticks);
+    let zones: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(STATE_DIR).join("damon-target.json"))?)?;
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t0_child_spawn".to_owned(), child_spawn_ns);
+    evidence.lifecycle_timeline_ns.insert(
+        "t1_allocations_complete".to_owned(),
+        zones["allocations_complete_ns"]
+            .as_u64()
+            .map_or(0, u128::from),
+    );
+    evidence.lifecycle_timeline_ns.insert(
+        "t2_workers_ready".to_owned(),
+        zones["workers_ready_ns"].as_u64().map_or(0, u128::from),
+    );
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t3_parent_received_ready".to_owned(), now_ns()?);
+    if zones["pid"].as_u64() != Some(u64::from(child.id()))
+        || zones["start_ticks"].as_u64() != Some(child_start_ticks)
+        || proc_start_ticks(child.id())? != Some(child_start_ticks)
+    {
+        bail!("synthetic child metadata identity mismatch");
+    }
+    let workload_ready = zones["state"].as_str() == Some("ready");
+    evidence.checks.push(check(
+        "synthetic_workload_ready",
+        workload_ready,
+        "HOT and WARM workers reached READY before DAMON start".to_owned(),
+    ));
+    if !workload_ready {
+        bail!("synthetic workload readiness barrier failed");
+    }
+    let zone_range = |name: &str| -> Result<damon::AddressRange> {
+        let pair = zones[name]
+            .as_array()
+            .ok_or_else(|| anyhow!("missing {name} zone"))?;
+        Ok(damon::AddressRange {
+            start: pair[0].as_u64().ok_or_else(|| anyhow!("invalid zone"))?,
+            end: pair[1].as_u64().ok_or_else(|| anyhow!("invalid zone"))?,
+        })
+    };
+    let hot_range = zone_range("hot")?;
+    let warm_range = zone_range("warm")?;
+    let cold_range = zone_range("cold")?;
+    let smaps = fs::read_to_string(format!("/proc/{}/smaps", child.id()))?;
+    let mut backing = [
+        damon::parse_smaps_zone(&smaps, hot_range)?,
+        damon::parse_smaps_zone(&smaps, warm_range)?,
+        damon::parse_smaps_zone(&smaps, cold_range)?,
+    ];
+    for item in &mut backing {
+        item.explicit_nohugepage_requested = true;
+        item.explicit_nohugepage_verified = item.anon_huge_pages_kib == 0
+            && (item.thp_eligible == Some(false) || item.vm_flags.iter().any(|flag| flag == "nh"));
+    }
+    let same_vma = backing.iter().all(|item| {
+        item.containing_vma_start == backing[0].containing_vma_start
+            && item.containing_vma_end == backing[0].containing_vma_end
+    });
+    if same_vma {
+        let group = format!(
+            "{:x}-{:x}",
+            backing[0].containing_vma_start.unwrap_or(0),
+            backing[0].containing_vma_end.unwrap_or(0)
+        );
+        for item in &mut backing {
+            item.shared_vma = true;
+            item.shared_vma_group = Some(group.clone());
+        }
+    }
+    for (name, item) in ["hot", "warm", "cold"].into_iter().zip(backing) {
+        evidence.zone_backing.insert(name.to_owned(), item);
+    }
+    let final_base_page_verified = damon::verify_base_page_backing(&evidence.zone_backing);
+    evidence.checks.push(check(
+        "base_page_backing_verified",
+        final_base_page_verified,
+        format!("zones={:?}", evidence.zone_backing),
+    ));
+    if !final_base_page_verified {
+        bail!("final synthetic target did not retain verified base-page backing");
+    }
+    let initial_regions = damon::InitialRegionPlan::new(
+        vec![hot_range, warm_range, cold_range],
+        &proc_mapped_ranges(child.id())?,
+    )?;
+    evidence.requested_target_bytes = initial_regions.requested_bytes();
+    evidence.target_ranges = BTreeMap::from([
+        ("hot".to_owned(), hot_range),
+        ("warm".to_owned(), warm_range),
+        ("cold".to_owned(), cold_range),
+    ]);
+
+    fs::create_dir(&trace_instance)?;
+    cleanup.trace_created = true;
+    let trace_clock = configure_owned_trace_clock(&trace_instance)?;
+    evidence.trace_clock_domain = trace_clock.effective.clone();
+    evidence.workload_clock_domain = trace_clock.userspace_clock.report_name().to_owned();
+    evidence.checks.push(check(
+        "trace_clock_compatible",
+        trace_clock.readback,
+        format!(
+            "available={:?}, requested={}, effective={}, userspace_clock={}, readback={}",
+            trace_clock.available,
+            trace_clock.requested,
+            trace_clock.effective,
+            trace_clock.userspace_clock.report_name(),
+            trace_clock.readback
+        ),
+    ));
+    evidence.checks.push(check(
+        "trace_instance_isolated",
+        trace_instance.starts_with(trace_root.join("instances"))
+            && trace_name.starts_with("nemor-validation-"),
+        trace_instance.display().to_string(),
+    ));
+    let enable = trace_instance.join("events/damon/damon_aggregated/enable");
+    if !enable.exists() {
+        bail!("isolated damon_aggregated tracepoint is unavailable");
+    }
+    write_readback(&enable, "1")?;
+    cleanup.trace_enabled = true;
+    write_readback(&trace_instance.join("tracing_on"), "1")?;
+    cleanup.tracing_on = true;
+    let capture = run_damon_monitor_session(MonitorSessionSpec {
+        session_id: &trace_name,
+        trace_instance: &trace_instance,
+    })?;
+    evidence.checks.push(check(
+        "final_trace_instance_ready",
+        trace_instance.is_dir()
+            && read_trimmed(&enable)? == "1"
+            && read_trimmed(&trace_instance.join("tracing_on"))? == "1",
+        format!(
+            "path={}, event_enable=1, tracing_on=1, capture_worker_ready=true",
+            trace_instance.display()
+        ),
+    ));
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t4_trace_capture_ready".to_owned(), now_ns()?);
+
+    write_readback(&admin.join("nr_kdamonds"), "1")?;
+    cleanup.kdamond_created = true;
+    let kd = admin.join("0");
+    write_readback(&kd.join("contexts/nr_contexts"), "1")?;
+    let context = kd.join("contexts/0");
+    let operations = read_trimmed(&context.join("avail_operations"))?;
+    if !operations.split_whitespace().any(|item| item == "vaddr") {
+        bail!("created context does not expose vaddr");
+    }
+    if let Some(capability) = evidence.capability.as_mut() {
+        capability.available_operations =
+            operations.split_whitespace().map(str::to_owned).collect();
+        capability.vaddr_supported = capability
+            .available_operations
+            .iter()
+            .any(|item| item == "vaddr");
+        capability.fvaddr_supported = capability
+            .available_operations
+            .iter()
+            .any(|item| item == "fvaddr");
+        capability.paddr_supported = capability
+            .available_operations
+            .iter()
+            .any(|item| item == "paddr");
+    }
+    evidence.checks.push(check(
+        "available_operations",
+        operations.split_whitespace().any(|item| item == "vaddr"),
+        operations.clone(),
+    ));
+    write_readback(&context.join("operations"), "vaddr")?;
+    evidence.checks.push(check(
+        "vaddr_selected",
+        read_trimmed(&context.join("operations"))? == "vaddr",
+        "operation readback=vaddr".to_owned(),
+    ));
+    write_readback(
+        &context.join("monitoring_attrs/intervals/sample_us"),
+        &attrs.sample_us.to_string(),
+    )?;
+    write_readback(
+        &context.join("monitoring_attrs/intervals/aggr_us"),
+        &attrs.aggr_us.to_string(),
+    )?;
+    write_readback(
+        &context.join("monitoring_attrs/intervals/update_us"),
+        &attrs.update_us.to_string(),
+    )?;
+    write_readback(
+        &context.join("monitoring_attrs/nr_regions/min"),
+        &attrs.min_regions.to_string(),
+    )?;
+    write_readback(
+        &context.join("monitoring_attrs/nr_regions/max"),
+        &attrs.max_regions.to_string(),
+    )?;
+    evidence.checks.push(check(
+        "attrs_readback",
+        true,
+        format!(
+            "sample_us={}, aggr_us={}, update_us={}, regions={}..={}",
+            attrs.sample_us, attrs.aggr_us, attrs.update_us, attrs.min_regions, attrs.max_regions
+        ),
+    ));
+    evidence.attrs_effective = Some(attrs.clone());
+    write_readback(&context.join("targets/nr_targets"), "1")?;
+    if proc_start_ticks(child.id())? != Some(child_start_ticks) {
+        bail!("synthetic child identity changed before DAMON attach");
+    }
+    evidence.checks.push(check(
+        "target_identity",
+        true,
+        format!("pid={}, start_ticks={child_start_ticks}", child.id()),
+    ));
+    write_readback(
+        &context.join("targets/0/pid_target"),
+        &child.id().to_string(),
+    )?;
+    let regions_root = context.join("targets/0/regions");
+    write_readback(&regions_root.join("nr_regions"), "3")?;
+    for (index, range) in initial_regions.ranges.iter().enumerate() {
+        let root = regions_root.join(index.to_string());
+        write_readback(&root.join("start"), &range.start.to_string())?;
+        write_readback(&root.join("end"), &range.end.to_string())?;
+    }
+    let readback_regions = (0..3)
+        .map(|index| {
+            let root = regions_root.join(index.to_string());
+            Ok(damon::AddressRange {
+                start: read_trimmed(&root.join("start"))?.parse()?,
+                end: read_trimmed(&root.join("end"))?.parse()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let regions_match = initial_regions.matches_readback(&readback_regions);
+    evidence.checks.push(check(
+        "target_regions_readback",
+        regions_match,
+        format!(
+            "requested={:?}, effective={readback_regions:?}, bytes={}",
+            initial_regions.ranges,
+            initial_regions.requested_bytes()
+        ),
+    ));
+    if !regions_match {
+        bail!("synthetic target initial regions readback mismatch");
+    }
+    write_readback(&context.join("schemes/nr_schemes"), "0")?;
+    if read_trimmed(&context.join("schemes/nr_schemes"))? != "0" {
+        bail!("zero DAMOS invariant failed");
+    }
+    evidence.checks.push(check(
+        "zero_damos_before_start",
+        true,
+        "nr_schemes=0 readback before kdamond start".to_owned(),
+    ));
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t5_damon_configured".to_owned(), now_ns()?);
+    let capture_cpu_before = process_cpu_ns()?;
+    let target_cpu_before = proc_cpu_ticks(child.id())?;
+    let monitored_progress_before = read_progress()?;
+    write_readback(&kd.join("state"), "on")?;
+    cleanup.kdamond_on = true;
+    let kdamond_pid = wait_kdamond_started(&kd, Duration::from_secs(3))?;
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t6_kdamond_started".to_owned(), now_ns()?);
+    evidence.checks.push(check(
+        "kdamond_started",
+        true,
+        format!("state=on, pid={kdamond_pid}"),
+    ));
+    let kdamond_cpu_before = proc_cpu_ticks(kdamond_pid)?;
+    let monitoring_start_uptime_ns = userspace_clock_ns(trace_clock.userspace_clock)?;
+    signal_damon_target("damon-start")?;
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t7_workload_start_sent".to_owned(), now_ns()?);
+    deadline.check("DAMON monitoring window")?;
+    let mut progress_points = vec![(
+        userspace_clock_ns(trace_clock.userspace_clock)?,
+        monitored_progress_before.clone(),
+    )];
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(500));
+        progress_points.push((
+            userspace_clock_ns(trace_clock.userspace_clock)?,
+            read_progress()?,
+        ));
+    }
+    let kdamond_cpu_after = proc_cpu_ticks(kdamond_pid)?;
+    let target_cpu_after = proc_cpu_ticks(child.id())?;
+    let monitored_progress_after = read_progress()?;
+    let monitoring_end_uptime_ns = userspace_clock_ns(trace_clock.userspace_clock)?;
+    let bytes_at_kdamond_stop = capture.bytes_read()?;
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t8_monitoring_window_end".to_owned(), now_ns()?);
+    write_readback(&kd.join("state"), "off")?;
+    cleanup.kdamond_on = false;
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t9_kdamond_stopped".to_owned(), now_ns()?);
+    signal_damon_target("damon-stop")?;
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t10_workload_stop_sent".to_owned(), now_ns()?);
+    evidence.checks.push(check(
+        "kdamond_stopped",
+        read_trimmed(&kd.join("state"))? == "off",
+        "state=off readback".to_owned(),
+    ));
+    let (mut trace_diagnostic, captured_events) = capture.drain_and_stop(bytes_at_kdamond_stop)?;
+    trace_diagnostic.available_trace_clocks = trace_clock.available.clone();
+    trace_diagnostic.requested_trace_clock = Some(trace_clock.requested.clone());
+    trace_diagnostic.effective_trace_clock = Some(trace_clock.effective.clone());
+    trace_diagnostic.userspace_clock = Some(trace_clock.userspace_clock.report_name().to_owned());
+    trace_diagnostic.trace_clock_readback = trace_clock.readback;
+    trace_diagnostic.workload_monitoring_start_monotonic = Some(monitoring_start_uptime_ns);
+    trace_diagnostic.workload_monitoring_end_monotonic = Some(monitoring_end_uptime_ns);
+    trace_diagnostic.trace_timestamp_min = captured_events
+        .iter()
+        .filter_map(|event| event.timestamp_ns)
+        .min();
+    trace_diagnostic.trace_timestamp_max = captured_events
+        .iter()
+        .filter_map(|event| event.timestamp_ns)
+        .max();
+    trace_diagnostic.trace_events_in_monitoring_window = captured_events
+        .iter()
+        .filter(|event| {
+            event.timestamp_ns.is_some_and(|timestamp| {
+                timestamp >= monitoring_start_uptime_ns && timestamp <= monitoring_end_uptime_ns
+            })
+        })
+        .count() as u64;
+    trace_diagnostic.trace_events_outside_monitoring_window = captured_events
+        .iter()
+        .filter(|event| {
+            event.timestamp_ns.is_some_and(|timestamp| {
+                timestamp < monitoring_start_uptime_ns || timestamp > monitoring_end_uptime_ns
+            })
+        })
+        .count() as u64;
+    trace_diagnostic.trace_events_unmatched = trace_diagnostic
+        .trace_events_total
+        .saturating_sub(trace_diagnostic.trace_events_in_monitoring_window)
+        .saturating_sub(trace_diagnostic.trace_events_outside_monitoring_window);
+    trace_diagnostic.timestamp_correlation_valid = trace_clock.readback
+        && trace_diagnostic.timestamp_failures == 0
+        && trace_diagnostic.trace_events_in_monitoring_window > 0;
+    evidence.final_trace = Some(trace_diagnostic.clone());
+    write_readback(&trace_instance.join("tracing_on"), "0")?;
+    cleanup.tracing_on = false;
+    write_readback(&enable, "0")?;
+    cleanup.trace_enabled = false;
+    let capture_cpu_after = process_cpu_ns()?;
+
+    evidence.checks.push(check(
+        "aggregated_trace_bytes_received",
+        trace_diagnostic.trace_bytes_read > 0 && trace_diagnostic.damon_event_lines_seen > 0,
+        format!(
+            "bytes={}, lines={}, damon_lines={}, drained_bytes={}",
+            trace_diagnostic.trace_bytes_read,
+            trace_diagnostic.trace_lines_read,
+            trace_diagnostic.damon_event_lines_seen,
+            trace_diagnostic.bytes_after_kdamond_stop
+        ),
+    ));
+    evidence.checks.push(check(
+        "damon_payloads_parsed",
+        trace_diagnostic.damon_events_parsed > 0 && trace_diagnostic.parse_failures == 0,
+        format!(
+            "payloads={}, parse_failures={}",
+            trace_diagnostic.damon_events_parsed, trace_diagnostic.parse_failures
+        ),
+    ));
+    evidence.checks.push(check(
+        "timestamp_values_parsed",
+        trace_diagnostic.timestamp_values_parsed > 0 && trace_diagnostic.timestamp_failures == 0,
+        format!(
+            "timestamps={}, failures={}, min={:?}, max={:?}",
+            trace_diagnostic.timestamp_values_parsed,
+            trace_diagnostic.timestamp_failures,
+            trace_diagnostic.trace_timestamp_min,
+            trace_diagnostic.trace_timestamp_max
+        ),
+    ));
+    evidence.checks.push(check(
+        "timestamp_correlation_valid",
+        trace_diagnostic.timestamp_correlation_valid,
+        format!(
+            "total={}, in_window={}, outside={}, unmatched={}, monitoring={}..{}",
+            trace_diagnostic.trace_events_total,
+            trace_diagnostic.trace_events_in_monitoring_window,
+            trace_diagnostic.trace_events_outside_monitoring_window,
+            trace_diagnostic.trace_events_unmatched,
+            monitoring_start_uptime_ns,
+            monitoring_end_uptime_ns
+        ),
+    ));
+    let timed_regions = captured_events
+        .into_iter()
+        .filter_map(|event| {
+            event
+                .timestamp_ns
+                .map(|timestamp| (timestamp, event.region))
+        })
+        .collect::<Vec<_>>();
+    evidence.raw_regions = trace_diagnostic.damon_events_parsed;
+    evidence.checks.push(check(
+        "raw_regions_present",
+        evidence.raw_regions > 0,
+        format!("raw_regions={}", evidence.raw_regions),
+    ));
+    evidence.workload_progress = workload_window_progress(&progress_points);
+    let timed_windows = group_timed_aggregation_windows(timed_regions);
+    let (alignment, windows) = align_complete_windows(
+        timed_windows,
+        attrs.aggr_us,
+        monitoring_start_uptime_ns,
+        monitoring_end_uptime_ns,
+        &evidence.workload_progress,
+    );
+    evidence.window_alignment = alignment;
+    evidence.aggregation_windows = windows.len() as u64;
+    let workload_active = evidence
+        .workload_progress
+        .iter()
+        .all(|window| window.hot_cycles_delta > 0)
+        && evidence
+            .workload_progress
+            .iter()
+            .any(|window| window.warm_cycles_delta > 0)
+        && monitored_progress_after.cold_cycles == 0
+        && monitored_progress_after.workload_started_ns > 0
+        && monitored_progress_after.workload_stopped_ns == 0
+        && synthetic_lifecycle_order_valid(&evidence.lifecycle_timeline_ns);
+
+    evidence.checks.push(check(
+        "synthetic_workload_active",
+        workload_active,
+        format!(
+            "windows={}, hot_cycles={}..{}, warm_cycles={}..{}, cold_cycles={}",
+            evidence.workload_progress.len(),
+            monitored_progress_before.hot_cycles,
+            monitored_progress_after.hot_cycles,
+            monitored_progress_before.warm_cycles,
+            monitored_progress_after.warm_cycles,
+            monitored_progress_after.cold_cycles
+        ),
+    ));
+    let instrumentation_ok = matches!(
+        classify_capture(&trace_diagnostic),
+        ValidationFailureClass::None
+    );
+    let signal = instrumentation_ok
+        .then(|| damon::analyze_zones(&windows, &attrs, hot_range, warm_range, cold_range));
+    if let Some(signal) = signal.as_ref() {
+        evidence.region_sample_bytes = Some(signal.region_sample_bytes);
+        evidence.snapshot_observed_bytes = Some(signal.snapshot_observed_bytes_median);
+        evidence.observed_target_bytes_per_snapshot =
+            Some(signal.observed_target_bytes_per_snapshot);
+        evidence.outside_requested_bytes = Some(signal.outside_requested_bytes);
+        evidence.outside_requested_ratio = Some(signal.outside_requested_ratio);
+        evidence.hot_snapshot_overlap_bytes = Some(signal.hot.snapshot_overlap_bytes_median);
+        evidence.warm_snapshot_overlap_bytes = Some(signal.warm.snapshot_overlap_bytes_median);
+        evidence.cold_snapshot_overlap_bytes = Some(signal.cold.snapshot_overlap_bytes_median);
+    } else {
+        evidence.validation_failure_class = ValidationFailureClass::InstrumentationFailure;
+        evidence.instrumentation_failure_reason = Some(if trace_diagnostic.trace_bytes_read == 0 {
+            "capture".to_owned()
+        } else if trace_diagnostic.damon_events_parsed == 0 || trace_diagnostic.parse_failures > 0 {
+            "payload_parser".to_owned()
+        } else {
+            "trace_clock_or_timestamp_correlation".to_owned()
+        });
+    }
+    evidence.checks.push(check(
+        "hot_cold_evidence",
+        signal
+            .as_ref()
+            .is_some_and(|signal| signal.hot_cold_distinguished && signal.target_isolated),
+        signal.as_ref().map_or_else(
+            || "not evaluated: final capture instrumentation failure".to_owned(),
+            |signal| {
+                format!(
+                    "hot_p50={:.4}, cold_p50={:.4}, margin={:.4}, outside_ratio={:.4}, isolated={}",
+                    signal.hot.normalized_ratio_p50,
+                    signal.cold.normalized_ratio_p50,
+                    signal.hot_cold_margin,
+                    signal.outside_requested_ratio,
+                    signal.target_isolated
+                )
+            },
+        ),
+    ));
+    evidence.checks.push(check(
+        "warm_evidence",
+        signal.as_ref().is_some_and(|signal| signal.warm_coherent),
+        signal.as_ref().map_or_else(
+            || "not evaluated: final capture instrumentation failure".to_owned(),
+            |signal| {
+                format!(
+                    "hot_mean={:.4}, warm_mean={:.4}, cold_mean={:.4}",
+                    signal.hot.normalized_ratio_mean,
+                    signal.warm.normalized_ratio_mean,
+                    signal.cold.normalized_ratio_mean
+                )
+            },
+        ),
+    ));
+    evidence.signal = signal;
+    if matches!(
+        evidence.validation_failure_class,
+        ValidationFailureClass::None
+    ) && evidence
+        .signal
+        .as_ref()
+        .is_some_and(|signal| !signal.accepted)
+    {
+        evidence.validation_failure_class = ValidationFailureClass::SignalFailure;
+    }
+    let mut samples: Vec<_> = windows
+        .iter()
+        .flat_map(|window| {
+            window
+                .iter()
+                .map(|region| damon::normalize(region, &attrs, windows.len()))
+        })
+        .collect();
+    for sample in &mut samples {
+        sample.session_id = trace_name.clone();
+        sample.timestamp_ns = u64::try_from(now_ns()?).unwrap_or(u64::MAX);
+        sample.pid = child.id();
+        sample.stable_identity = fixed_identity();
+        sample.kernel = read_command("/usr/bin/uname", &["-r"])?;
+        let range = damon::AddressRange {
+            start: sample.region_start,
+            end: sample.region_end,
+        };
+        sample.hot_overlap_bytes = range.overlap(hot_range);
+        sample.warm_overlap_bytes = range.overlap(warm_range);
+        sample.cold_overlap_bytes = range.overlap(cold_range);
+        if sample.region_size > 0 {
+            sample.hot_overlap_fraction =
+                sample.hot_overlap_bytes as f64 / sample.region_size as f64;
+            sample.warm_overlap_fraction =
+                sample.warm_overlap_bytes as f64 / sample.region_size as f64;
+            sample.cold_overlap_fraction =
+                sample.cold_overlap_bytes as f64 / sample.region_size as f64;
+        }
+        sample.other_bytes = sample.region_size.saturating_sub(
+            sample
+                .hot_overlap_bytes
+                .saturating_add(sample.warm_overlap_bytes)
+                .saturating_add(sample.cold_overlap_bytes),
+        );
+    }
+    let monitored_rate = monitored_progress_after
+        .hot_cycles
+        .saturating_sub(monitored_progress_before.hot_cycles) as f64
+        / 5.0;
+    let clock_ticks = clock_ticks_per_second()?;
+    let kdamond_cpu = ticks_percent(kdamond_cpu_after - kdamond_cpu_before, clock_ticks, 5.0);
+    let capture_cpu = (capture_cpu_after - capture_cpu_before) as f64 / 5_000_000_000.0 * 100.0;
+    let overhead = damon::OverheadSample {
+        kdamond_cpu_percent: kdamond_cpu,
+        capture_cpu_percent: capture_cpu,
+        target_slowdown_percent: if baseline_rate == 0.0 {
+            0.0
+        } else {
+            ((baseline_rate - monitored_rate) / baseline_rate * 100.0).max(0.0)
+        },
+        events_per_second: samples.len() as f64 / 5.0,
+        regions_per_second: samples.len() as f64 / 5.0,
+        dropped_samples: 0,
+    };
+    let config = common::DamonConfig {
+        enabled: false,
+        mode: "monitor_only".to_owned(),
+        allow_monitor_session: false,
+        preferred_operation: "vaddr".to_owned(),
+        sample_us: attrs.sample_us,
+        aggr_us: attrs.aggr_us,
+        update_us: attrs.update_us,
+        min_regions: attrs.min_regions,
+        max_regions: attrs.max_regions,
+        max_cpu_overhead_percent: 1.0,
+        max_session_seconds: 120,
+        max_samples_per_session: 100_000,
+        retention_days: 7,
+        export_max_bytes: 67_108_864,
+        max_action_time_ms: 5,
+        max_action_bytes: 268_435_456,
+    };
+    let overhead_ok = damon::overhead_allowed(&overhead, &config, 5.0);
+    evidence.checks.push(check(
+        "overhead_budget",
+        overhead_ok,
+        format!(
+            "kdamond={:.4}%, capture={:.4}%, budget=1.0%",
+            overhead.kdamond_cpu_percent, overhead.capture_cpu_percent
+        ),
+    ));
+    evidence.overhead = Some(overhead);
+    if !overhead_ok
+        && matches!(
+            evidence.validation_failure_class,
+            ValidationFailureClass::None
+        )
+    {
+        evidence.validation_failure_class = ValidationFailureClass::OverheadFailure;
+    }
+    evidence.attrs_effective = Some(attrs);
+    let jsonl = PathBuf::from(format!("/tmp/nemor-damon-dataset-{trace_name}.jsonl"));
+    let csv = PathBuf::from(format!("/tmp/nemor-damon-dataset-{trace_name}.csv"));
+    let jsonl_result =
+        damon::export_dataset(&jsonl, damon::ExportFormat::Jsonl, &samples, 67_108_864);
+    let csv_result = damon::export_dataset(&csv, damon::ExportFormat::Csv, &samples, 67_108_864);
+    evidence.dataset_jsonl = jsonl_result.is_ok() && jsonl.is_file();
+    evidence.dataset_csv = csv_result.is_ok() && csv.is_file();
+    evidence.dataset_jsonl_path = Some(jsonl.display().to_string());
+    evidence.dataset_csv_path = Some(csv.display().to_string());
+    if (!evidence.dataset_jsonl || !evidence.dataset_csv)
+        && matches!(
+            evidence.validation_failure_class,
+            ValidationFailureClass::None
+        )
+    {
+        evidence.validation_failure_class = ValidationFailureClass::DatasetFailure;
+    }
+    evidence.checks.push(check(
+        "dataset_jsonl",
+        evidence.dataset_jsonl,
+        jsonl_result
+            .map(|_| "bounded versioned JSONL export created".to_owned())
+            .unwrap_or_else(|error| error.to_string()),
+    ));
+    evidence.checks.push(check(
+        "dataset_csv",
+        evidence.dataset_csv,
+        csv_result
+            .map(|_| "bounded versioned CSV export created".to_owned())
+            .unwrap_or_else(|error| error.to_string()),
+    ));
+    let _ = target_cpu_after.saturating_sub(target_cpu_before);
+    child.wait_for_exit(Duration::from_secs(2))?;
+    let final_progress = read_progress()?;
+    evidence
+        .post_run_fingerprints
+        .insert("hot".to_owned(), final_progress.hot_fingerprint);
+    evidence
+        .post_run_fingerprints
+        .insert("warm".to_owned(), final_progress.warm_fingerprint);
+    evidence
+        .post_run_fingerprints
+        .insert("cold".to_owned(), final_progress.cold_fingerprint);
+    let fingerprints_valid = final_progress.hot_fingerprint > final_progress.cold_fingerprint
+        && final_progress.warm_fingerprint > final_progress.cold_fingerprint
+        && final_progress.cold_fingerprint
+            == selected_zone_size.saturating_div(4096).saturating_mul(3);
+    evidence.checks.push(check(
+        "post_run_fingerprint",
+        fingerprints_valid,
+        format!(
+            "hot={}, warm={}, cold={}",
+            final_progress.hot_fingerprint,
+            final_progress.warm_fingerprint,
+            final_progress.cold_fingerprint
+        ),
+    ));
+    evidence
+        .lifecycle_timeline_ns
+        .insert("t11_child_exit".to_owned(), now_ns()?);
+    cleanup.cleanup()?;
+    cleanup.cleanup()?;
+    evidence.checks.push(check(
+        "cleanup",
+        !trace_instance.exists() && read_trimmed(&admin.join("nr_kdamonds"))? == "0",
+        "owned primary session removed; second cleanup harmless".to_owned(),
+    ));
+    run_worker(InternalWorker::DamonCrash)?;
+    recover_damon_crash()?;
+    evidence.checks.push(check(
+        "recovery",
+        read_trimmed(&admin.join("nr_kdamonds"))? == "0",
+        "crash worker resources recovered".to_owned(),
+    ));
+    recover_damon_crash()?;
+    evidence.recovery_idempotent = true;
+    evidence.checks.push(check(
+        "recovery_idempotent",
+        true,
+        "second recovery was a no-op".to_owned(),
+    ));
+    if trace_instances()? != baseline_instances || read_trimmed(&admin.join("nr_kdamonds"))? != "0"
+    {
+        bail!("DAMON cleanup did not restore baseline");
+    }
+    Ok(())
+}
+
+fn damon_required_gates(evidence: &DamonEvidence) -> bool {
+    evidence.zero_damos
+        && DAMON_REQUIRED_GATES.iter().all(|required| {
+            evidence
+                .checks
+                .iter()
+                .any(|check| check.name == *required && check.passed)
+        })
+}
+
+fn synthetic_lifecycle_order_valid(timeline: &BTreeMap<String, u128>) -> bool {
+    [
+        "t0_child_spawn",
+        "t1_allocations_complete",
+        "t2_workers_ready",
+        "t3_parent_received_ready",
+        "t4_trace_capture_ready",
+        "t5_damon_configured",
+        "t6_kdamond_started",
+        "t7_workload_start_sent",
+        "t8_monitoring_window_end",
+        "t9_kdamond_stopped",
+        "t10_workload_stop_sent",
+    ]
+    .windows(2)
+    .all(|pair| {
+        timeline.get(pair[0]).is_some_and(|left| {
+            timeline
+                .get(pair[1])
+                .is_some_and(|right| *left > 0 && left <= right)
+        })
+    })
+}
+
+fn workload_window_progress(
+    progress_points: &[(u128, WorkloadProgress)],
+) -> Vec<WorkloadWindowProgress> {
+    progress_points
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| WorkloadWindowProgress {
+            window_index: index as u64,
+            start_ns: pair[0].0,
+            end_ns: pair[1].0,
+            hot_cycles_delta: pair[1].1.hot_cycles.saturating_sub(pair[0].1.hot_cycles),
+            warm_cycles_delta: pair[1].1.warm_cycles.saturating_sub(pair[0].1.warm_cycles),
+            hot_pages_touched_delta: pair[1]
+                .1
+                .hot_pages_touched
+                .saturating_sub(pair[0].1.hot_pages_touched),
+            warm_pages_touched_delta: pair[1]
+                .1
+                .warm_pages_touched
+                .saturating_sub(pair[0].1.warm_pages_touched),
+        })
+        .collect()
+}
+
+fn trace_timestamp_ns(line: &str) -> Option<u128> {
+    let prefix = line
+        .split_once("damon:damon_aggregated:")
+        .or_else(|| line.split_once("damon_aggregated:"))?
+        .0;
+    let token = prefix.split_whitespace().last()?.trim_end_matches(':');
+    let (seconds, fraction) = token.split_once('.')?;
+    let seconds = seconds.parse::<u128>().ok()?;
+    let mut nanoseconds = fraction
+        .as_bytes()
+        .iter()
+        .take(9)
+        .fold(0_u128, |value, digit| {
+            value * 10 + u128::from(digit.saturating_sub(b'0'))
+        });
+    for _ in fraction.len().min(9)..9 {
+        nanoseconds *= 10;
+    }
+    Some(seconds * 1_000_000_000 + nanoseconds)
+}
+
+fn group_timed_aggregation_windows(
+    regions: Vec<(u128, damon::TraceRegion)>,
+) -> Vec<(u128, Vec<damon::TraceRegion>)> {
+    let mut windows = Vec::new();
+    let mut current = Vec::new();
+    let mut expected = 0_usize;
+    let mut end_ns = 0;
+    for (timestamp, region) in regions {
+        if current.is_empty() {
+            expected = region.nr_regions as usize;
+            end_ns = timestamp;
+        }
+        if expected == 0 || region.nr_regions as usize != expected {
+            current.clear();
+            expected = region.nr_regions as usize;
+            end_ns = timestamp;
+        }
+        current.push(region);
+        end_ns = end_ns.max(timestamp);
+        if current.len() == expected {
+            windows.push((end_ns, std::mem::take(&mut current)));
+            expected = 0;
+        }
+    }
+    windows
+}
+
+fn align_complete_windows(
+    timed_windows: Vec<(u128, Vec<damon::TraceRegion>)>,
+    aggr_us: u64,
+    monitoring_start_ns: u128,
+    monitoring_end_ns: u128,
+    progress: &[WorkloadWindowProgress],
+) -> (Vec<AlignedWindowDiagnostic>, Vec<Vec<damon::TraceRegion>>) {
+    let aggr_ns = u128::from(aggr_us) * 1_000;
+    let alignment = timed_windows
+        .iter()
+        .enumerate()
+        .map(|(index, (end_ns, _))| {
+            let start_ns = end_ns.saturating_sub(aggr_ns);
+            let partial = start_ns < monitoring_start_ns || *end_ns > monitoring_end_ns;
+            let (hot_delta, overlap_duration_ns) =
+                prorated_counter_delta(progress, start_ns, *end_ns, |point| point.hot_cycles_delta);
+            let (warm_delta, _) = prorated_counter_delta(progress, start_ns, *end_ns, |point| {
+                point.warm_cycles_delta
+            });
+            let (hot_pages_delta, _) =
+                prorated_counter_delta(progress, start_ns, *end_ns, |point| {
+                    point.hot_pages_touched_delta
+                });
+            let (warm_pages_delta, _) =
+                prorated_counter_delta(progress, start_ns, *end_ns, |point| {
+                    point.warm_pages_touched_delta
+                });
+            AlignedWindowDiagnostic {
+                window_index: index as u64,
+                start_uptime_ns: u64::try_from(start_ns).unwrap_or(u64::MAX),
+                end_uptime_ns: u64::try_from(*end_ns).unwrap_or(u64::MAX),
+                partial,
+                hot_cycles_delta: hot_delta,
+                warm_cycles_delta: warm_delta,
+                hot_pages_touched_delta: hot_pages_delta,
+                warm_pages_touched_delta: warm_pages_delta,
+                overlap_duration_ns,
+                alignment_method: "interval_overlap_prorated".to_owned(),
+                alignment_estimated: true,
+            }
+        })
+        .collect::<Vec<_>>();
+    let complete = timed_windows
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !alignment[*index].partial)
+        .map(|(_, (_, regions))| regions)
+        .collect();
+    (alignment, complete)
+}
+
+fn prorated_counter_delta(
+    progress: &[WorkloadWindowProgress],
+    window_start_ns: u128,
+    window_end_ns: u128,
+    counter: impl Fn(&WorkloadWindowProgress) -> u64,
+) -> (u64, u128) {
+    let mut estimated = 0.0_f64;
+    let mut total_overlap = 0_u128;
+    for point in progress {
+        let interval_ns = point.end_ns.saturating_sub(point.start_ns);
+        if interval_ns == 0 {
+            continue;
+        }
+        let overlap_ns = point
+            .end_ns
+            .min(window_end_ns)
+            .saturating_sub(point.start_ns.max(window_start_ns));
+        if overlap_ns == 0 {
+            continue;
+        }
+        total_overlap = total_overlap.saturating_add(overlap_ns);
+        estimated += counter(point) as f64 * overlap_ns as f64 / interval_ns as f64;
+    }
+    (estimated.round() as u64, total_overlap)
+}
+
+fn userspace_clock_ns(clock: UserspaceClock) -> Result<u128> {
+    let value = clock_gettime(clock.clock_id())?;
+    let seconds = u128::try_from(value.tv_sec()).context("negative clock seconds")?;
+    let nanoseconds = u128::try_from(value.tv_nsec()).context("negative clock nanoseconds")?;
+    Ok(seconds * 1_000_000_000 + nanoseconds)
+}
+
+fn parse_trace_clocks(value: &str) -> Result<(Vec<String>, String)> {
+    let available = value
+        .split_whitespace()
+        .map(|item| item.trim_matches(['[', ']']).to_owned())
+        .collect::<Vec<_>>();
+    let effective = value
+        .split_whitespace()
+        .find_map(|item| {
+            item.strip_prefix('[')
+                .and_then(|item| item.strip_suffix(']'))
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("trace clock selection unavailable"))?;
+    Ok((available, effective))
+}
+
+fn choose_trace_clock(available: &[String]) -> Result<(String, UserspaceClock)> {
+    [
+        ("mono", UserspaceClock::Monotonic),
+        ("mono_raw", UserspaceClock::MonotonicRaw),
+        ("boot", UserspaceClock::Boottime),
+    ]
+    .into_iter()
+    .find(|(name, _)| available.iter().any(|item| item == name))
+    .map(|(name, clock)| (name.to_owned(), clock))
+    .ok_or_else(|| anyhow!("no trace clock directly correlatable with userspace"))
+}
+
+fn configure_owned_trace_clock(instance: &Path) -> Result<TraceClockPlan> {
+    let name = instance.file_name().and_then(|name| name.to_str());
+    let allowed_root = [
+        "/sys/kernel/tracing/instances",
+        "/sys/kernel/debug/tracing/instances",
+    ]
+    .into_iter()
+    .any(|root| instance.starts_with(root));
+    if !allowed_root || !name.is_some_and(|name| name.starts_with("nemor-validation-")) {
+        bail!("trace_clock write rejected outside owned tracefs instance");
+    }
+    let path = instance.join("trace_clock");
+    let (available, _) = parse_trace_clocks(&read_trimmed(&path)?)?;
+    let (requested, userspace_clock) = choose_trace_clock(&available)?;
+    fs::write(&path, &requested).with_context(|| format!("write {}", path.display()))?;
+    let (_, effective) = parse_trace_clocks(&read_trimmed(&path)?)?;
+    let readback = effective == requested;
+    if !readback {
+        bail!("owned trace clock readback mismatch");
+    }
+    Ok(TraceClockPlan {
+        available,
+        requested,
+        effective,
+        userspace_clock,
+        readback,
+    })
+}
+
+fn proc_mapped_ranges(pid: u32) -> Result<Vec<damon::AddressRange>> {
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))?;
+    maps.lines()
+        .map(|line| {
+            let range = line
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| anyhow!("malformed proc maps line"))?;
+            let (start, end) = range
+                .split_once('-')
+                .ok_or_else(|| anyhow!("malformed proc maps range"))?;
+            Ok(damon::AddressRange {
+                start: u64::from_str_radix(start, 16)?,
+                end: u64::from_str_radix(end, 16)?,
+            })
+        })
+        .collect()
+}
+
+fn damon_crash_worker() -> Result<()> {
+    let admin = Path::new("/sys/kernel/mm/damon/admin/kdamonds");
+    if read_trimmed(&admin.join("nr_kdamonds"))? != "0" {
+        bail!("crash worker baseline ownership is ambiguous");
+    }
+    let trace_name = format!("nemor-validation-recovery-{}", now_ns()?);
+    let trace_instance = tracefs_root()?.join("instances").join(&trace_name);
+    let mut cleanup = DamonCleanup::new(admin.to_path_buf(), trace_instance.clone());
+    fs::create_dir(&trace_instance)?;
+    cleanup.trace_created = true;
+    write_readback(&admin.join("nr_kdamonds"), "1")?;
+    cleanup.kdamond_created = true;
+    let kd = admin.join("0");
+    write_readback(&kd.join("contexts/nr_contexts"), "1")?;
+    let context = kd.join("contexts/0");
+    write_readback(&context.join("operations"), "vaddr")?;
+    write_readback(&context.join("targets/nr_targets"), "1")?;
+    write_readback(
+        &context.join("targets/0/pid_target"),
+        &std::process::id().to_string(),
+    )?;
+    write_readback(&context.join("schemes/nr_schemes"), "0")?;
+    fs::write(
+        Path::new(STATE_DIR).join("damon-recovery.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "trace_instance": trace_instance,
+            "worker_pid": std::process::id(),
+            "worker_start_ticks": proc_start_ticks(std::process::id())?,
+            "zero_damos": true
+        }))?,
+    )?;
+    write_readback(&kd.join("state"), "on")?;
+    cleanup.kdamond_on = true;
+    let _ = wait_kdamond_started(&kd, Duration::from_secs(3))?;
+    std::mem::forget(cleanup);
+    Ok(())
+}
+
+fn recover_damon_crash() -> Result<()> {
+    let state_path = Path::new(STATE_DIR).join("damon-recovery.json");
+    if !state_path.exists() {
+        return Ok(());
+    }
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+    if state["zero_damos"] != true {
+        bail!("recovery state does not prove zero DAMOS");
+    }
+    let trace = PathBuf::from(
+        state["trace_instance"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing recovery trace instance"))?,
+    );
+    if !trace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("nemor-validation-recovery-"))
+        || trace.parent() != Some(tracefs_root()?.join("instances").as_path())
+    {
+        bail!("recovery trace ownership is invalid");
+    }
+    let admin = Path::new("/sys/kernel/mm/damon/admin/kdamonds");
+    if admin.join("0").exists() {
+        if read_trimmed(&admin.join("0/state")).ok().as_deref() == Some("on") {
+            fs::write(admin.join("0/state"), "off")?;
+        }
+        if read_trimmed(&admin.join("0/contexts/0/schemes/nr_schemes"))? != "0" {
+            bail!("recovery refuses non-zero schemes");
+        }
+        fs::write(admin.join("nr_kdamonds"), "0")?;
+    }
+    if trace.exists() {
+        fs::remove_dir(&trace)?;
+    }
+    fs::remove_file(state_path)?;
+    Ok(())
+}
+
 fn validate_tiering(
     baseline: &HostSnapshot,
     evidence: &mut TieringEvidence,
@@ -1465,6 +3338,10 @@ impl RegisteredChild {
         }
     }
 
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     fn terminate(&mut self) -> Result<()> {
         let pid = self.child.id();
         if proc_start_ticks(pid)? != Some(self.start_ticks) {
@@ -1474,6 +3351,18 @@ impl RegisteredChild {
         let _status = self.child.wait()?;
         self.terminated = true;
         Ok(())
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.child.try_wait()?.is_some() {
+                self.terminated = true;
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.terminate()
     }
 }
 
@@ -1601,14 +3490,44 @@ impl Drop for StateDir {
 
 fn write_report(report: &ValidationReport) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(report)?;
-    let staged = Path::new(STATE_DIR).join("report.json");
-    fs::write(&staged, bytes)?;
-    fs::rename(staged, REPORT_PATH)?;
+    let archive = report_archive_path(report.started_ns);
+    write_archived_report(
+        &bytes,
+        &archive,
+        Path::new(REPORT_PATH),
+        Path::new(STATE_DIR),
+    )
+}
+
+fn report_archive_path(run_id: u128) -> PathBuf {
+    PathBuf::from(format!(
+        "/tmp/nemor-privileged-validation-report-{run_id}.json"
+    ))
+}
+
+fn write_archived_report(
+    bytes: &[u8],
+    archive: &Path,
+    latest: &Path,
+    staging_dir: &Path,
+) -> Result<()> {
+    let staged_archive = staging_dir.join("report-archive.json");
+    fs::write(&staged_archive, bytes)?;
+    if archive.exists() {
+        bail!("run-scoped report already exists");
+    }
+    fs::rename(&staged_archive, archive)?;
+    let staged_latest = staging_dir.join("report-latest.json");
+    fs::write(&staged_latest, bytes)?;
+    fs::rename(staged_latest, latest)?;
     Ok(())
 }
 
 fn read_command(executable: &str, args: &[&str]) -> Result<String> {
-    if !matches!(executable, "/usr/bin/git" | "/usr/bin/uname") {
+    if !matches!(
+        executable,
+        "/usr/bin/git" | "/usr/bin/uname" | "/usr/bin/getconf"
+    ) {
         bail!("read-only executable is not allow-listed");
     }
     let output = Command::new(executable)
@@ -1619,6 +3538,479 @@ fn read_command(executable: &str, args: &[&str]) -> Result<String> {
         bail!("{executable} failed");
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+struct DamonCleanup {
+    admin: PathBuf,
+    trace_instance: PathBuf,
+    kdamond_created: bool,
+    kdamond_on: bool,
+    trace_created: bool,
+    trace_enabled: bool,
+    tracing_on: bool,
+}
+
+impl DamonCleanup {
+    fn new(admin: PathBuf, trace_instance: PathBuf) -> Self {
+        Self {
+            admin,
+            trace_instance,
+            kdamond_created: false,
+            kdamond_on: false,
+            trace_created: false,
+            trace_enabled: false,
+            tracing_on: false,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        if self.kdamond_on {
+            fs::write(self.admin.join("0/state"), "off")?;
+            self.kdamond_on = false;
+        }
+        if self.kdamond_created {
+            fs::write(self.admin.join("nr_kdamonds"), "0")?;
+            self.kdamond_created = false;
+        }
+        if self.tracing_on {
+            fs::write(self.trace_instance.join("tracing_on"), "0")?;
+            self.tracing_on = false;
+        }
+        if self.trace_enabled {
+            fs::write(
+                self.trace_instance
+                    .join("events/damon/damon_aggregated/enable"),
+                "0",
+            )?;
+            self.trace_enabled = false;
+        }
+        if self.trace_created && self.trace_instance.exists() {
+            fs::remove_dir(&self.trace_instance)?;
+            self.trace_created = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DamonCleanup {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+fn tracefs_root() -> Result<PathBuf> {
+    ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.join("instances").is_dir())
+        .ok_or_else(|| anyhow!("tracefs instances are unavailable"))
+}
+
+fn trace_instances() -> Result<BTreeSet<String>> {
+    let root = tracefs_root()?.join("instances");
+    Ok(fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect())
+}
+
+fn read_trimmed(path: &Path) -> Result<String> {
+    Ok(fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .trim()
+        .to_owned())
+}
+
+fn write_readback(path: &Path, value: &str) -> Result<()> {
+    fs::write(path, value).with_context(|| format!("write {}", path.display()))?;
+    if read_trimmed(path)? != value {
+        bail!("readback mismatch for {}", path.display());
+    }
+    Ok(())
+}
+
+fn wait_kdamond_started(path: &Path, timeout: Duration) -> Result<u32> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if read_trimmed(&path.join("state")).ok().as_deref() == Some("on") {
+            if let Ok(pid) = read_trimmed(&path.join("pid")).and_then(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|error| anyhow!(error.to_string()))
+            }) {
+                return Ok(pid);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    bail!("kdamond start readback failed")
+}
+
+fn run_damon_probe(
+    zone_size: u64,
+    attrs: &damon::MonitoringAttrs,
+    backing_profile: damon::PageBackingProfile,
+) -> Result<damon::ProbeEvidence> {
+    let admin = Path::new("/sys/kernel/mm/damon/admin/kdamonds");
+    if read_trimmed(&admin.join("nr_kdamonds"))? != "0" {
+        bail!("probe refuses existing kdamond objects");
+    }
+    let trace_root = tracefs_root()?;
+    let trace_name = format!("nemor-validation-probe-{}", now_ns()?);
+    let trace_instance = trace_root.join("instances").join(&trace_name);
+    let mut cleanup = DamonCleanup::new(admin.to_path_buf(), trace_instance.clone());
+    let mut child = spawn_damon_target(zone_size, backing_profile)?;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(Path::new(STATE_DIR).join("damon-target.json"))?)?;
+    let [hot, warm, cold] = target_ranges_from_metadata(&metadata)?;
+    let smaps = fs::read_to_string(format!("/proc/{}/smaps", child.id()))?;
+    let mut zone_backing = BTreeMap::from([
+        ("hot".to_owned(), damon::parse_smaps_zone(&smaps, hot)?),
+        ("warm".to_owned(), damon::parse_smaps_zone(&smaps, warm)?),
+        ("cold".to_owned(), damon::parse_smaps_zone(&smaps, cold)?),
+    ]);
+    for backing in zone_backing.values_mut() {
+        backing.explicit_nohugepage_requested =
+            backing_profile == damon::PageBackingProfile::BasePageNoHuge;
+        backing.explicit_nohugepage_verified = backing.explicit_nohugepage_requested
+            && backing.anon_huge_pages_kib == 0
+            && (backing.thp_eligible == Some(false)
+                || backing.vm_flags.iter().any(|flag| flag == "nh"));
+    }
+    let base_page_backing_verified = damon::verify_base_page_backing(&zone_backing);
+    if backing_profile == damon::PageBackingProfile::BasePageNoHuge && !base_page_backing_verified {
+        bail!("owned synthetic mapping did not verify base-page backing");
+    }
+    let hot_backing = zone_backing
+        .get("hot")
+        .ok_or_else(|| anyhow!("HOT backing metadata missing"))?;
+    let plan =
+        damon::InitialRegionPlan::new(vec![hot, warm, cold], &proc_mapped_ranges(child.id())?)?;
+
+    fs::create_dir(&trace_instance)?;
+    cleanup.trace_created = true;
+    let trace_clock = configure_owned_trace_clock(&trace_instance)?;
+    let enable = trace_instance.join("events/damon/damon_aggregated/enable");
+    write_readback(&enable, "1")?;
+    cleanup.trace_enabled = true;
+    write_readback(&trace_instance.join("tracing_on"), "1")?;
+    cleanup.tracing_on = true;
+    let capture = run_damon_monitor_session(MonitorSessionSpec {
+        session_id: &trace_name,
+        trace_instance: &trace_instance,
+    })?;
+    write_readback(&admin.join("nr_kdamonds"), "1")?;
+    cleanup.kdamond_created = true;
+    let kd = admin.join("0");
+    write_readback(&kd.join("contexts/nr_contexts"), "1")?;
+    let context = kd.join("contexts/0");
+    if !read_trimmed(&context.join("avail_operations"))?
+        .split_whitespace()
+        .any(|operation| operation == "vaddr")
+    {
+        bail!("probe context has no vaddr operation");
+    }
+    write_readback(&context.join("operations"), "vaddr")?;
+    for (path, value) in [
+        (
+            "monitoring_attrs/intervals/sample_us",
+            attrs.sample_us.to_string(),
+        ),
+        (
+            "monitoring_attrs/intervals/aggr_us",
+            attrs.aggr_us.to_string(),
+        ),
+        (
+            "monitoring_attrs/intervals/update_us",
+            attrs.update_us.to_string(),
+        ),
+        (
+            "monitoring_attrs/nr_regions/min",
+            attrs.min_regions.to_string(),
+        ),
+        (
+            "monitoring_attrs/nr_regions/max",
+            attrs.max_regions.to_string(),
+        ),
+    ] {
+        write_readback(&context.join(path), &value)?;
+    }
+    write_readback(&context.join("targets/nr_targets"), "1")?;
+    write_readback(
+        &context.join("targets/0/pid_target"),
+        &child.id().to_string(),
+    )?;
+    let regions = context.join("targets/0/regions");
+    write_readback(&regions.join("nr_regions"), "3")?;
+    for (index, range) in plan.ranges.iter().enumerate() {
+        write_readback(
+            &regions.join(index.to_string()).join("start"),
+            &range.start.to_string(),
+        )?;
+        write_readback(
+            &regions.join(index.to_string()).join("end"),
+            &range.end.to_string(),
+        )?;
+    }
+    write_readback(&context.join("schemes/nr_schemes"), "0")?;
+    if read_trimmed(&context.join("schemes/nr_schemes"))? != "0" {
+        bail!("probe zero DAMOS invariant failed");
+    }
+    let capture_before = process_cpu_ns()?;
+    write_readback(&kd.join("state"), "on")?;
+    cleanup.kdamond_on = true;
+    let kdamond_pid = wait_kdamond_started(&kd, Duration::from_secs(3))?;
+    let kdamond_before = proc_cpu_ticks(kdamond_pid)?;
+    let progress_before = read_progress()?;
+    let monitoring_start_ns = userspace_clock_ns(trace_clock.userspace_clock)?;
+    signal_damon_target("damon-start")?;
+    let duration = Duration::from_millis(5_100);
+    std::thread::sleep(duration);
+    let progress_after = read_progress()?;
+    let monitoring_end_ns = userspace_clock_ns(trace_clock.userspace_clock)?;
+    let kdamond_after = proc_cpu_ticks(kdamond_pid)?;
+    let bytes_at_stop = capture.bytes_read()?;
+    write_readback(&kd.join("state"), "off")?;
+    cleanup.kdamond_on = false;
+    signal_damon_target("damon-stop")?;
+    let (capture_diagnostic, captured_events) = capture.drain_and_stop(bytes_at_stop)?;
+    write_readback(&trace_instance.join("tracing_on"), "0")?;
+    cleanup.tracing_on = false;
+    write_readback(&enable, "0")?;
+    cleanup.trace_enabled = false;
+    let capture_after = process_cpu_ns()?;
+    let capture_integrity = capture_diagnostic.trace_bytes_read > 0
+        && capture_diagnostic.damon_event_lines_seen > 0
+        && capture_diagnostic.damon_events_parsed > 0
+        && capture_diagnostic.parse_failures == 0
+        && trace_clock.readback;
+    if !capture_integrity {
+        bail!("probe capture instrumentation failure");
+    }
+    let timed = captured_events
+        .into_iter()
+        .filter_map(|event| {
+            event
+                .timestamp_ns
+                .map(|timestamp| (timestamp, event.region))
+        })
+        .collect();
+    let timed_windows = group_timed_aggregation_windows(timed);
+    let (_, windows) = align_complete_windows(
+        timed_windows,
+        attrs.aggr_us,
+        monitoring_start_ns,
+        monitoring_end_ns,
+        &[],
+    );
+    let signal = damon::analyze_zones(&windows, attrs, hot, warm, cold);
+    let hot_nonzero_windows = signal
+        .window_diagnostics
+        .iter()
+        .filter(|window| window.hot_raw_accesses > 0)
+        .count() as u64;
+    let warm_nonzero_windows = signal
+        .window_diagnostics
+        .iter()
+        .filter(|window| window.warm_raw_accesses > 0)
+        .count() as u64;
+    let cold_nonzero_windows = signal
+        .window_diagnostics
+        .iter()
+        .filter(|window| window.cold_raw_accesses > 0)
+        .count() as u64;
+    child.wait_for_exit(Duration::from_secs(2))?;
+    cleanup.cleanup()?;
+    let seconds = duration.as_secs_f64();
+    Ok(damon::ProbeEvidence {
+        session_id: trace_name,
+        source: "current_probe".to_owned(),
+        backing_profile,
+        zone_size_bytes: zone_size,
+        windows: windows.len() as u64,
+        hot_nonzero_windows,
+        hot_zero_windows: windows.len() as u64 - hot_nonzero_windows,
+        warm_nonzero_windows,
+        cold_nonzero_windows,
+        hot_ratio_mean: signal.hot.normalized_ratio_mean,
+        hot_ratio_p25: signal.hot.normalized_ratio_p25,
+        hot_ratio_p50: signal.hot.normalized_ratio_p50,
+        hot_ratio_p75: signal.hot.normalized_ratio_p75,
+        hot_ratio_p95: signal.hot.normalized_ratio_p95,
+        hot_raw_accesses_per_window: signal
+            .window_diagnostics
+            .iter()
+            .map(|window| window.hot_raw_accesses)
+            .collect(),
+        warm_ratio_mean: signal.warm.normalized_ratio_mean,
+        warm_ratio_p25: signal.warm.normalized_ratio_p25,
+        warm_ratio_p50: signal.warm.normalized_ratio_p50,
+        warm_ratio_p75: signal.warm.normalized_ratio_p75,
+        warm_ratio_p95: signal.warm.normalized_ratio_p95,
+        warm_raw_accesses_per_window: signal
+            .window_diagnostics
+            .iter()
+            .map(|window| window.warm_raw_accesses)
+            .collect(),
+        cold_ratio_mean: signal.cold.normalized_ratio_mean,
+        cold_ratio_p25: signal.cold.normalized_ratio_p25,
+        cold_ratio_p50: signal.cold.normalized_ratio_p50,
+        cold_ratio_p75: signal.cold.normalized_ratio_p75,
+        cold_ratio_p95: signal.cold.normalized_ratio_p95,
+        cold_raw_accesses_per_window: signal
+            .window_diagnostics
+            .iter()
+            .map(|window| window.cold_raw_accesses)
+            .collect(),
+        outside_requested_ratio: signal.outside_requested_ratio,
+        kdamond_cpu_percent: ticks_percent(
+            kdamond_after.saturating_sub(kdamond_before),
+            clock_ticks_per_second()?,
+            seconds,
+        ),
+        capture_cpu_percent: capture_after.saturating_sub(capture_before) as f64
+            / duration.as_nanos() as f64
+            * 100.0,
+        backing_page_size_kib: hot_backing.kernel_page_size_kib,
+        anon_huge_pages_kib: hot_backing.anon_huge_pages_kib,
+        thp_eligible: hot_backing.thp_eligible,
+        target_isolated: signal.target_isolated,
+        workload_active: progress_after.hot_cycles > progress_before.hot_cycles
+            && progress_after.warm_cycles > progress_before.warm_cycles
+            && progress_after.cold_cycles == 0,
+        capture_integrity,
+        overhead_within_budget: ticks_percent(
+            kdamond_after.saturating_sub(kdamond_before),
+            clock_ticks_per_second()?,
+            seconds,
+        ) + (capture_after.saturating_sub(capture_before) as f64
+            / duration.as_nanos() as f64
+            * 100.0)
+            <= 1.0,
+        base_page_backing_verified,
+        zone_backing,
+    })
+}
+
+fn target_ranges_from_metadata(value: &serde_json::Value) -> Result<[damon::AddressRange; 3]> {
+    let range = |name: &str| -> Result<damon::AddressRange> {
+        let pair = value[name]
+            .as_array()
+            .ok_or_else(|| anyhow!("missing {name} zone"))?;
+        Ok(damon::AddressRange {
+            start: pair[0].as_u64().ok_or_else(|| anyhow!("invalid zone"))?,
+            end: pair[1].as_u64().ok_or_else(|| anyhow!("invalid zone"))?,
+        })
+    };
+    Ok([range("hot")?, range("warm")?, range("cold")?])
+}
+
+fn mem_available_bytes() -> Result<u64> {
+    let text = fs::read_to_string("/proc/meminfo")?;
+    let kib = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("MemAvailable:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .ok_or_else(|| anyhow!("MemAvailable unavailable"))?;
+    kib.checked_mul(1024)
+        .ok_or_else(|| anyhow!("MemAvailable overflow"))
+}
+
+fn spawn_damon_target(
+    zone_bytes: u64,
+    backing_profile: damon::PageBackingProfile,
+) -> Result<RegisteredChild> {
+    let executable = std::env::current_exe()?.canonicalize()?;
+    for name in [
+        "damon-target.json",
+        "damon-progress",
+        "damon-progress.next",
+        "damon-start",
+        "damon-stop",
+        "damon-zone-bytes",
+        "damon-backing-profile",
+    ] {
+        let path = Path::new(STATE_DIR).join(name);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    if !damon::DIAGNOSTIC_ZONE_SIZES.contains(&zone_bytes) {
+        bail!("synthetic target zone size is outside deterministic ladder");
+    }
+    fs::write(
+        Path::new(STATE_DIR).join("damon-zone-bytes"),
+        zone_bytes.to_string(),
+    )?;
+    fs::write(
+        Path::new(STATE_DIR).join("damon-backing-profile"),
+        serde_json::to_vec(&backing_profile)?,
+    )?;
+    let mut child = Command::new(executable)
+        .args(["--internal-worker", "damon-target"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let metadata = Path::new(STATE_DIR).join("damon-target.json");
+    if wait_for_path(&metadata, Duration::from_secs(5)).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("DAMON target metadata unavailable");
+    }
+    let start_ticks =
+        proc_start_ticks(child.id())?.ok_or_else(|| anyhow!("synthetic child vanished"))?;
+    Ok(RegisteredChild::new(child, start_ticks))
+}
+
+fn write_workload_progress(progress: &WorkloadProgress) -> Result<()> {
+    let staged = Path::new(STATE_DIR).join("damon-progress.next");
+    let final_path = Path::new(STATE_DIR).join("damon-progress");
+    fs::write(&staged, serde_json::to_vec(progress)?)?;
+    fs::rename(staged, final_path)?;
+    Ok(())
+}
+
+fn read_progress() -> Result<WorkloadProgress> {
+    let path = Path::new(STATE_DIR).join("damon-progress");
+    wait_for_path(&path, Duration::from_secs(5))?;
+    serde_json::from_slice(&fs::read(path)?).context("invalid DAMON progress")
+}
+
+fn signal_damon_target(name: &str) -> Result<()> {
+    if !matches!(name, "damon-start" | "damon-stop") {
+        bail!("invalid synthetic lifecycle signal");
+    }
+    fs::write(Path::new(STATE_DIR).join(name), b"1")?;
+    Ok(())
+}
+
+fn proc_cpu_ticks(pid: u32) -> Result<u64> {
+    let value = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let close = value
+        .rfind(')')
+        .ok_or_else(|| anyhow!("invalid proc stat"))?;
+    let fields: Vec<_> = value[close + 1..].split_whitespace().collect();
+    Ok(fields
+        .get(11)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        + fields
+            .get(12)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0))
+}
+
+fn clock_ticks_per_second() -> Result<f64> {
+    Ok(read_command("/usr/bin/getconf", &["CLK_TCK"])?.parse()?)
+}
+
+fn ticks_percent(delta: u64, ticks_per_second: f64, seconds: f64) -> f64 {
+    delta as f64 / ticks_per_second / seconds * 100.0
 }
 
 fn read_os_id() -> Result<String> {
@@ -1709,6 +4101,7 @@ mod tests {
             cgroups: CgroupEvidence::default(),
             zram: ZramEvidence::default(),
             tiering: TieringEvidence::default(),
+            damon: DamonEvidence::default(),
             host_unchanged: true,
             errors: Vec::new(),
         };
@@ -1734,6 +4127,466 @@ mod tests {
             CandidateKind::Child
         )
         .is_err());
+    }
+
+    #[test]
+    fn damon_success_requires_every_gate_and_real_signal() {
+        let mut evidence = DamonEvidence {
+            zero_damos: true,
+            ..DamonEvidence::default()
+        };
+        for name in DAMON_REQUIRED_GATES {
+            evidence.checks.push(check(name, true, String::new()));
+        }
+        assert!(damon_required_gates(&evidence));
+        evidence.hot_snapshot_overlap_bytes = Some(0);
+        evidence.cold_snapshot_overlap_bytes = Some(100);
+        evidence
+            .checks
+            .iter_mut()
+            .find(|item| item.name == "hot_cold_evidence")
+            .unwrap()
+            .passed = false;
+        assert!(!damon_required_gates(&evidence));
+    }
+
+    #[test]
+    fn damon_nonfatal_signal_failure_keeps_complete_gate_contract() {
+        assert_eq!(DAMON_REQUIRED_GATES.len(), 30);
+        assert!(DAMON_REQUIRED_GATES.contains(&"trace_clock_compatible"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"damon_payloads_parsed"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"timestamp_values_parsed"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"timestamp_correlation_valid"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"synthetic_workload_ready"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"synthetic_workload_active"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"target_regions_readback"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"base_page_backing_verified"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"overhead_budget"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"dataset_jsonl"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"dataset_csv"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"cleanup"));
+        assert!(DAMON_REQUIRED_GATES.contains(&"recovery_idempotent"));
+        let checks = DAMON_REQUIRED_GATES
+            .iter()
+            .map(|name| check(name, *name != "hot_cold_evidence", String::new()))
+            .collect::<Vec<_>>();
+        let evidence = DamonEvidence {
+            checks,
+            zero_damos: true,
+            overhead: Some(damon::OverheadSample {
+                kdamond_cpu_percent: 0.1,
+                capture_cpu_percent: 0.1,
+                target_slowdown_percent: 0.1,
+                events_per_second: 1.0,
+                regions_per_second: 1.0,
+                dropped_samples: 0,
+            }),
+            dataset_jsonl: true,
+            dataset_csv: true,
+            recovery_idempotent: true,
+            ..DamonEvidence::default()
+        };
+        assert_eq!(evidence.checks.len(), 30);
+        assert!(!damon_required_gates(&evidence));
+    }
+
+    #[test]
+    fn synthetic_lifecycle_requires_exact_ready_start_monitor_stop_order() {
+        let names = [
+            "t0_child_spawn",
+            "t1_allocations_complete",
+            "t2_workers_ready",
+            "t3_parent_received_ready",
+            "t4_trace_capture_ready",
+            "t5_damon_configured",
+            "t6_kdamond_started",
+            "t7_workload_start_sent",
+            "t8_monitoring_window_end",
+            "t9_kdamond_stopped",
+            "t10_workload_stop_sent",
+        ];
+        let timeline = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ((*name).to_owned(), index as u128 + 1))
+            .collect::<BTreeMap<_, _>>();
+        assert!(synthetic_lifecycle_order_valid(&timeline));
+        let mut stopped_early = timeline.clone();
+        stopped_early.insert("t10_workload_stop_sent".to_owned(), 8);
+        assert!(!synthetic_lifecycle_order_valid(&stopped_early));
+        let mut started_early = timeline;
+        started_early.insert("t7_workload_start_sent".to_owned(), 5);
+        assert!(!synthetic_lifecycle_order_valid(&started_early));
+    }
+
+    #[test]
+    fn workload_progress_proves_hot_each_window_warm_periodic_and_cold_absent() {
+        let points = (0..=3)
+            .map(|index| {
+                (
+                    index * 500,
+                    WorkloadProgress {
+                        hot_cycles: index as u64 * 10,
+                        warm_cycles: index as u64 * 2,
+                        hot_pages_touched: index as u64 * 20_480,
+                        warm_pages_touched: index as u64 * 4_096,
+                        cold_cycles: 0,
+                        workload_started_ns: 1,
+                        workload_stopped_ns: 0,
+                        hot_fingerprint: 0,
+                        warm_fingerprint: 0,
+                        cold_fingerprint: 0,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let windows = workload_window_progress(&points);
+        assert_eq!(windows.len(), 3);
+        assert!(windows.iter().all(|window| window.hot_cycles_delta == 10));
+        assert!(windows.iter().all(|window| window.warm_cycles_delta == 2));
+        assert!(points.iter().all(|(_, point)| point.cold_cycles == 0));
+        let mut stalled = points;
+        stalled[2].1.hot_cycles = stalled[1].1.hot_cycles;
+        assert!(workload_window_progress(&stalled)
+            .iter()
+            .any(|window| window.hot_cycles_delta == 0));
+    }
+
+    #[test]
+    fn hot_and_warm_share_memory_touch_path_and_fingerprint_after_store() {
+        let mut hot = vec![1_u8; 8192];
+        let mut warm = vec![1_u8; 8192];
+        let (hot_pages, hot_fingerprint) = touch_zone(&mut hot);
+        let (warm_pages, warm_fingerprint) = touch_zone(&mut warm);
+        assert_eq!((hot_pages, hot_fingerprint), (2, 8));
+        assert_eq!((hot_pages, hot_fingerprint), (warm_pages, warm_fingerprint));
+        assert_eq!(hot[0], 4);
+        assert_eq!(hot[4096], 4);
+        assert_eq!(fingerprint_zone(&hot), hot_fingerprint);
+    }
+
+    #[test]
+    fn temporal_matching_excludes_partial_boundaries() {
+        let region = damon::TraceRegion {
+            target_id: 0,
+            nr_regions: 1,
+            start: 1,
+            end: 2,
+            nr_accesses: 1,
+            age: 1,
+        };
+        let timed = vec![
+            (1_100_000_000, vec![region.clone()]),
+            (1_600_000_000, vec![region.clone()]),
+            (2_100_000_000, vec![region]),
+        ];
+        let progress = vec![WorkloadWindowProgress {
+            window_index: 0,
+            start_ns: 1_000_000_000,
+            end_ns: 2_000_000_000,
+            hot_cycles_delta: 100,
+            warm_cycles_delta: 5,
+            hot_pages_touched_delta: 100,
+            warm_pages_touched_delta: 5,
+        }];
+        let (alignment, complete) =
+            align_complete_windows(timed, 500_000, 1_000_000_000, 2_000_000_000, &progress);
+        assert!(alignment[0].partial);
+        assert!(!alignment[1].partial);
+        assert!(alignment[2].partial);
+        assert_eq!(alignment[1].hot_cycles_delta, 50);
+        assert!(alignment[1].alignment_estimated);
+        assert_eq!(alignment[1].alignment_method, "interval_overlap_prorated");
+        assert_eq!(complete.len(), 1);
+        assert_eq!(
+            trace_timestamp_ns(
+                "kdamond.0 [1] 1.600000000: damon:damon_aggregated: target_id=0 nr_regions=1 1-2: 1 1"
+            ),
+            Some(1_600_000_000)
+        );
+    }
+
+    #[test]
+    fn temporal_alignment_prorates_partial_overlap_without_double_counting() {
+        let progress = vec![
+            WorkloadWindowProgress {
+                window_index: 0,
+                start_ns: 0,
+                end_ns: 500,
+                hot_cycles_delta: 100,
+                warm_cycles_delta: 50,
+                hot_pages_touched_delta: 1_000,
+                warm_pages_touched_delta: 500,
+            },
+            WorkloadWindowProgress {
+                window_index: 1,
+                start_ns: 500,
+                end_ns: 1_000,
+                hot_cycles_delta: 100,
+                warm_cycles_delta: 50,
+                hot_pages_touched_delta: 1_000,
+                warm_pages_touched_delta: 500,
+            },
+        ];
+        let (hot, overlap) =
+            prorated_counter_delta(&progress, 490, 990, |point| point.hot_cycles_delta);
+        assert_eq!(hot, 100);
+        assert_eq!(overlap, 500);
+        assert_eq!(
+            prorated_counter_delta(&progress, 499, 500, |point| point.hot_cycles_delta),
+            (0, 1)
+        );
+        assert_eq!(
+            prorated_counter_delta(&progress, 500, 500, |point| point.hot_cycles_delta),
+            (0, 0)
+        );
+        assert_eq!(
+            prorated_counter_delta(&progress, 0, 500, |point| point.hot_cycles_delta),
+            (100, 500)
+        );
+        assert_eq!(
+            prorated_counter_delta(&progress, 100, 400, |point| point.hot_cycles_delta),
+            (60, 300)
+        );
+        assert_eq!(
+            prorated_counter_delta(&progress, 250, 750, |point| point.hot_cycles_delta),
+            (100, 500)
+        );
+    }
+
+    #[test]
+    fn capture_diagnostics_separate_no_bytes_parser_failure_and_zero_access_sample() {
+        let empty = TraceCaptureDiagnostic::default();
+        assert!(matches!(
+            classify_capture(&empty),
+            ValidationFailureClass::InstrumentationFailure
+        ));
+        let parser_failure = TraceCaptureDiagnostic {
+            trace_bytes_read: 10,
+            damon_event_lines_seen: 1,
+            parse_failures: 1,
+            ..TraceCaptureDiagnostic::default()
+        };
+        assert!(matches!(
+            classify_capture(&parser_failure),
+            ValidationFailureClass::InstrumentationFailure
+        ));
+        let zero_access_line = b"kdamond.0 [001] 1.500000000: damon:damon_aggregated: target_id=0 nr_regions=1 4096-8192: 0 4\n";
+        let root = tempfile::tempdir().unwrap();
+        let event = root.path().join("events/damon/damon_aggregated");
+        fs::create_dir_all(&event).unwrap();
+        fs::write(event.join("enable"), "1\n").unwrap();
+        fs::write(root.path().join("tracing_on"), "1\n").unwrap();
+        let (diagnostic, events) =
+            parse_trace_capture("final", root.path(), true, zero_access_line, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].region.nr_accesses, 0);
+        let diagnostic = TraceCaptureDiagnostic {
+            trace_clock_readback: true,
+            timestamp_correlation_valid: true,
+            ..diagnostic
+        };
+        assert!(matches!(
+            classify_capture(&diagnostic),
+            ValidationFailureClass::None
+        ));
+    }
+
+    #[test]
+    fn probe_cleanup_final_session_model_rejects_stale_identity_and_clock_domain() {
+        let probes = vec!["probe-8".to_owned(), "probe-32".to_owned()];
+        assert!(sessions_are_independent(&probes, "final-64"));
+        assert!(!sessions_are_independent(&probes, "probe-32"));
+        assert!(!sessions_are_independent(
+            &["probe-8".to_owned(), "probe-8".to_owned()],
+            "final"
+        ));
+        assert_eq!(
+            choose_trace_clock(&["local".to_owned(), "mono".to_owned()]).unwrap(),
+            ("mono".to_owned(), UserspaceClock::Monotonic)
+        );
+        assert!(choose_trace_clock(&["local".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn trace_clock_parser_and_selector_follow_compatible_preference() {
+        let (available, effective) =
+            parse_trace_clocks("local global counter uptime perf mono [mono_raw] boot").unwrap();
+        assert_eq!(effective, "mono_raw");
+        assert_eq!(
+            choose_trace_clock(&available).unwrap(),
+            ("mono".to_owned(), UserspaceClock::Monotonic)
+        );
+        assert_eq!(
+            choose_trace_clock(&["local".to_owned(), "mono_raw".to_owned()]).unwrap(),
+            ("mono_raw".to_owned(), UserspaceClock::MonotonicRaw)
+        );
+        assert_eq!(
+            choose_trace_clock(&["boot".to_owned()]).unwrap(),
+            ("boot".to_owned(), UserspaceClock::Boottime)
+        );
+        assert!(choose_trace_clock(&["local".to_owned(), "uptime".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn real_trace_timestamp_format_correlates_in_monotonic_domain() {
+        let line = "kdamond.0-93054 [000] ..... 19057.333325: damon_aggregated: target_id=0 nr_regions=1 4096-8192: 3 1";
+        let timestamp = trace_timestamp_ns(line).unwrap();
+        assert_eq!(timestamp, 19_057_333_325_000);
+        let monitoring_start = 19_057_000_000_000;
+        let monitoring_end = 19_058_000_000_000;
+        assert!(timestamp >= monitoring_start && timestamp <= monitoring_end);
+        assert_ne!(timestamp / 1_000_000_000, 19_868);
+    }
+
+    #[test]
+    fn payload_and_timestamp_parsing_are_independent() {
+        let valid_payload_bad_timestamp =
+            "kdamond.0 [000] local: damon_aggregated: target_id=0 nr_regions=1 1-2: 1 1";
+        assert!(damon::parse_aggregated(valid_payload_bad_timestamp).is_ok());
+        assert!(trace_timestamp_ns(valid_payload_bad_timestamp).is_none());
+        let valid_timestamp_bad_payload =
+            "kdamond.0 [000] 19057.333325: damon_aggregated: malformed";
+        assert!(trace_timestamp_ns(valid_timestamp_bad_payload).is_some());
+        assert!(damon::parse_aggregated(valid_timestamp_bad_payload).is_err());
+    }
+
+    #[test]
+    fn requested_metadata_survives_signal_not_evaluated() {
+        let ranges = BTreeMap::from([
+            (
+                "hot".to_owned(),
+                damon::AddressRange {
+                    start: 0,
+                    end: 8 * 1024 * 1024,
+                },
+            ),
+            (
+                "warm".to_owned(),
+                damon::AddressRange {
+                    start: 8 * 1024 * 1024,
+                    end: 16 * 1024 * 1024,
+                },
+            ),
+        ]);
+        let evidence = DamonEvidence {
+            requested_target_bytes: 16 * 1024 * 1024,
+            target_ranges: ranges,
+            ..DamonEvidence::default()
+        };
+        assert_eq!(evidence.requested_target_bytes, 16 * 1024 * 1024);
+        assert!(evidence.snapshot_observed_bytes.is_none());
+        assert!(evidence.outside_requested_ratio.is_none());
+        assert_eq!(evidence.target_ranges.len(), 2);
+    }
+
+    #[test]
+    fn successful_probe_preserves_top_level_vaddr_without_final_run() {
+        let root = tempfile::tempdir().unwrap();
+        let mut capability = damon::inspect_linux(root.path(), Some("test".to_owned()));
+        record_validated_operation(&mut capability, "vaddr");
+        record_validated_operation(&mut capability, "vaddr");
+        assert!(capability.vaddr_supported);
+        assert_eq!(capability.available_operations, vec!["vaddr"]);
+    }
+
+    #[test]
+    fn run_scoped_report_preserves_history_and_updates_latest() {
+        let root = tempfile::tempdir().unwrap();
+        let archive_one = root.path().join("report-1.json");
+        let archive_two = root.path().join("report-2.json");
+        let latest = root.path().join("latest.json");
+        write_archived_report(b"one", &archive_one, &latest, root.path()).unwrap();
+        write_archived_report(b"two", &archive_two, &latest, root.path()).unwrap();
+        assert_eq!(fs::read(&archive_one).unwrap(), b"one");
+        assert_eq!(fs::read(&archive_two).unwrap(), b"two");
+        assert_eq!(fs::read(&latest).unwrap(), b"two");
+        assert!(write_archived_report(b"again", &archive_one, &latest, root.path()).is_err());
+        assert_eq!(
+            report_archive_path(123),
+            PathBuf::from("/tmp/nemor-privileged-validation-report-123.json")
+        );
+    }
+
+    #[test]
+    fn backing_profiles_change_only_owned_mapping_advice() {
+        assert_ne!(
+            damon::PageBackingProfile::ThpReference,
+            damon::PageBackingProfile::BasePageNoHuge
+        );
+        let reference = owned_anonymous_zone(8192, damon::PageBackingProfile::ThpReference)
+            .expect("anonymous reference mapping");
+        let base = owned_anonymous_zone(8192, damon::PageBackingProfile::BasePageNoHuge)
+            .expect("anonymous nohuge mapping");
+        assert_eq!(reference.len(), base.len());
+    }
+
+    #[test]
+    fn simulated_probe_cleanup_then_final_uses_fresh_capture_and_parser_state() {
+        #[derive(Default)]
+        struct SimulatedMonitorSession {
+            owned_instance: Option<String>,
+            capture_ready: bool,
+            parser_events: u64,
+        }
+        impl SimulatedMonitorSession {
+            fn run(&mut self, id: &str, event_bytes: &[u8]) {
+                assert!(self.owned_instance.is_none());
+                assert_eq!(self.parser_events, 0);
+                self.owned_instance = Some(id.to_owned());
+                self.capture_ready = true;
+                self.parser_events = u64::from(!event_bytes.is_empty());
+            }
+            fn cleanup(&mut self) {
+                self.owned_instance = None;
+                self.capture_ready = false;
+                self.parser_events = 0;
+            }
+        }
+        let mut runner = SimulatedMonitorSession::default();
+        runner.run("probe-8", b"probe event");
+        assert_eq!(runner.parser_events, 1);
+        runner.cleanup();
+        assert!(runner.owned_instance.is_none());
+        runner.run("final-32", b"final event");
+        assert_eq!(runner.owned_instance.as_deref(), Some("final-32"));
+        assert_eq!(runner.parser_events, 1);
+        runner.cleanup();
+        assert!(runner.owned_instance.is_none());
+    }
+
+    #[test]
+    fn simulated_session_failures_never_reuse_probe_capture_state() {
+        fn simulate(failure: &str) -> std::result::Result<(), &'static str> {
+            if failure == "probe_remove" {
+                return Err("probe cleanup blocks final");
+            }
+            if failure == "final_create" {
+                return Err("final instance unavailable");
+            }
+            if failure == "event_enable" {
+                return Err("final event readback failed");
+            }
+            if failure == "capture_restart" {
+                return Err("final capture not ready");
+            }
+            if matches!(failure, "stale_fd" | "stale_session" | "stale_parser") {
+                return Err("final state is not independent");
+            }
+            Ok(())
+        }
+        for failure in [
+            "probe_remove",
+            "final_create",
+            "event_enable",
+            "capture_restart",
+            "stale_fd",
+            "stale_session",
+            "stale_parser",
+        ] {
+            assert!(simulate(failure).is_err());
+        }
+        assert!(simulate("none").is_ok());
     }
 
     #[test]

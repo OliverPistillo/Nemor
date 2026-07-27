@@ -11,6 +11,9 @@ clap.workspace = true
 collector = { package = "nemor-collector", path = "../collector" }
 classifier = { package = "nemor-classifier", path = "../classifier" }
 common = { package = "nemor-common", path = "../common" }
+damon = { package = "nemor-damon", path = "../damon" }
+memmap2.workspace = true
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 storage = { package = "nemor-storage", path = "../storage" }

@@ -17,6 +17,8 @@ not AI.
 | Phase 4 | deterministic policy engine | ✅ Validated on CachyOS |
 | Phase 5 | safe zram backend and profiles | ✅ Validated on CachyOS |
 | Phase 6 | zswap + NVMe tiering backend | 🟡 Dev complete / boot validation pending |
+| Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
+| Phase 8 | controlled DAMOS reclaim | ⚪ Planned / not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
 development; ⚪ planned.
@@ -28,20 +30,23 @@ development; ⚪ planned.
 | Platform | CachyOS Linux, x86_64 |
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
-| Workspace crates | 11 |
-| Tests defined / executed | 173 / 173 |
-| Passed / failed / ignored | 173 / 0 / 0 |
+| Workspace crates | 12 |
+| Tests defined / executed | 213 / 213 |
+| Passed / failed / ignored | 213 / 0 / 0 |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
 | Host storage | Btrfs, non-rotational SATA SSD; no NVMe evidence |
 | Phase 6 validation | read-only + live-safe swapfile; dedicated boot pending |
+| Phase 7 validation | real `vaddr` monitor-only session; 30/30 gates; host unchanged |
 
 Linux tests include real `/proc`/`/sys` reads and real SIGINT/SIGTERM delivery.
 The dedicated bounded harness additionally validates isolated privileged
 cgroup and zram mutations; the normal runtime remains observe-only.
 The Phase 6 harness additionally validated a bounded owned Btrfs swapfile
 lifecycle, write accounting and recovery without changing zswap or zram0.
+The Phase 7 harness validated an owned synthetic DAMON session, isolated
+tracefs capture, zero DAMOS, bounded datasets, cleanup and crash recovery.
 
 ## Performance snapshot
 
@@ -58,6 +63,22 @@ intervals using `/proc/<pid>/stat`, `status`, and `smaps_rollup`.
 These are host-specific validation measurements, not universal benchmarks.
 Phase 6 used the same 15 two-second interval method. Mean CPU and memory
 increased modestly; storage inventory is bounded by the normal sampling loop.
+
+Phase 7 measured the owned monitor session separately from normal daemon
+observe performance:
+
+| Phase 7 monitor metric | Result |
+|---|---:|
+| Complete aggregation windows | 9 |
+| HOT / WARM / COLD normalized mean | 1.0 / 0.261111 / 0 |
+| `kdamond` CPU | 0.0% |
+| capture CPU | 0.02308834% |
+| synthetic target slowdown | ~3.00004% |
+
+The hard Phase 7 gate covers combined `kdamond` and capture CPU against a 1%
+budget. The separately measured ~3% synthetic target slowdown is not hidden
+and is not a production overhead promise; Phase 10 must compare real workloads
+and stock behavior.
 
 ## Implemented capabilities
 
@@ -80,6 +101,12 @@ increased modestly; storage inventory is bounded by the normal sampling loop.
   estimates without invented endurance ratings;
 - deterministic zram versus zswap+NVMe recommendation, boot-plan generation,
   owned swapfile rollback/recovery and live-safe privileged validation.
+- DAMON capability discovery, `vaddr` monitor-only planning, dynamic tracepoint
+  parsing, overlap-aware region normalization, hot/warm/cold observational
+  labels, bounded SQLite persistence and JSONL/CSV export;
+- an owned privileged validation path with explicit target regions,
+  per-instance monotonic trace clock, zero DAMOS, overhead accounting and
+  idempotent cleanup/recovery.
 
 ## Safety model
 
@@ -95,6 +122,9 @@ increased modestly; storage inventory is bounded by the normal sampling loop.
 - no privileged mutation is exposed through the daemon or `nemorctl`.
 - zswap kernel-global changes and persistent boot plans require separate manual
   approval; write-budget events never turn off an active swap.
+- normal observe mode never creates, configures, starts or stops `kdamond` and
+  never mutates tracefs; unavailable or unknown DAMON capability means no
+  action.
 
 See [the safety model](docs/safety-model.md).
 
@@ -114,10 +144,16 @@ nemorctl zram report latest
 nemorctl tiering status
 nemorctl tiering recommend
 nemorctl tiering report latest
+nemorctl damon status
+nemorctl damon sessions
+nemorctl damon report latest
+nemorctl damon export --format jsonl --output <new-path>
+nemorctl damon export --format csv --output <new-path>
 ```
 
-Every command accepts `--json` at its terminal command position and reads only
-configuration, Linux capability files, or SQLite.
+Read commands accept `--json` at their terminal command position. DAMON export
+is an explicit bounded userspace database export to a new safe path; it never
+configures the kernel or overwrites an existing file.
 
 ## Build and local observe run
 
@@ -154,15 +190,21 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - full zswap+NVMe pool, writeback and comparative benchmark validation requires
   a separately approved dedicated boot;
 - the daemon and normal CLI intentionally expose no tiering apply command.
+- small synthetic DAMON access-frequency tests can be distorted by THP/TLB
+  behavior; the validation harness uses mapping-local `MADV_NOHUGEPAGE` only
+  to establish a controlled base-page comparison;
+- the validated ~3% synthetic target slowdown requires reevaluation on real
+  workloads and is not a production guarantee;
+- no DAMOS, reclaim, pageout, LRU or migration action is implemented.
 
 ## Roadmap
 
-- Completed and validated on CachyOS: Phases 0–5.
+- Completed and validated on CachyOS: Phases 0–5 and Phase 7.
 - Phase 6 implementation and live-safe swapfile validation are complete;
   dedicated zswap+NVMe boot validation remains pending.
 - The runtime default remains observe-only despite isolated privileged
-  validation of Phases 3 and 5.
-- Phase 7 remains planned and was not started.
+  validation of Phases 3, 5, 6 and 7.
+- Phase 8 controlled DAMOS reclaim is planned and not started.
 
 ## Documentation
 
@@ -173,6 +215,7 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - [Policy engine](docs/policy-engine.md)
 - [Zram backend](docs/zram.md)
 - [Zswap and storage tiering](docs/tiering.md)
+- [DAMON monitor-only telemetry](docs/damon.md)
 - [Safety model](docs/safety-model.md)
 - [Database](docs/database.md)
 - [CachyOS validation](docs/cachyos-validation.md)
@@ -188,3 +231,4 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 | 5 | 140 | CachyOS read-only baseline | `fcb21a9` |
 | 3 + 5 gate | 148 | CachyOS privileged isolated validation | current validation commit |
 | 6 development | 173 | CachyOS read-only + live-safe swapfile; boot pending | current development |
+| 7 | 213 | CachyOS real `vaddr`, 9 windows, zero DAMOS, host unchanged | current Phase 7 commit |

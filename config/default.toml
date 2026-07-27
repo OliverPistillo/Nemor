@@ -104,6 +104,18 @@ profiles = ["virtualization", "browser_heavy"]
 [damon]
 enabled = false
 mode = "monitor_only"
+allow_monitor_session = false
+preferred_operation = "vaddr"
+sample_us = 5000
+aggr_us = 100000
+update_us = 1000000
+min_regions = 10
+max_regions = 1000
+max_cpu_overhead_percent = 1.0
+max_session_seconds = 120
+max_samples_per_session = 100000
+retention_days = 7
+export_max_bytes = 67108864
 max_action_time_ms = 5
 max_action_bytes = 268435456
 

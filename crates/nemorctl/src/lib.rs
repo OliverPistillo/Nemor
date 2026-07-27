@@ -326,6 +326,46 @@ pub fn tiering_report_latest(config_path: &Path) -> Result<tiering::TieringAudit
     serde_json::from_str(&snapshot.system_values_json).context("invalid stored tiering audit JSON")
 }
 
+pub fn damon_status(config_path: &Path) -> Result<damon::DamonReport> {
+    let loaded = LoadedConfig::load(config_path).context("invalid DAMON status configuration")?;
+    Ok(damon::observe_report(
+        &loaded.config.damon,
+        Some(
+            std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        ),
+    ))
+}
+
+pub fn damon_report_latest(config_path: &Path) -> Result<damon::DamonReport> {
+    let loaded = LoadedConfig::load(config_path).context("invalid DAMON report configuration")?;
+    let snapshot = storage::latest_configuration_snapshot(
+        &loaded.config.general.database_path,
+        damon::AUDIT_REASON,
+    )?;
+    serde_json::from_str(&snapshot.system_values_json).context("invalid stored DAMON audit JSON")
+}
+
+pub fn damon_sessions(config_path: &Path) -> Result<Vec<String>> {
+    let loaded = LoadedConfig::load(config_path).context("invalid DAMON sessions configuration")?;
+    let latest = storage::latest_configuration_snapshot(
+        &loaded.config.general.database_path,
+        damon::AUDIT_REASON,
+    );
+    Ok(latest
+        .ok()
+        .map(|snapshot| vec![snapshot.created_at])
+        .unwrap_or_default())
+}
+
+pub fn damon_export(config_path: &Path, format: damon::ExportFormat, output: &Path) -> Result<u64> {
+    let loaded = LoadedConfig::load(config_path).context("invalid DAMON export configuration")?;
+    damon::export_dataset(output, format, &[], loaded.config.damon.export_max_bytes)
+        .map_err(anyhow::Error::msg)
+}
+
 fn read_memory_capacity() -> Result<(u64, u64)> {
     let input = fs::read_to_string("/proc/meminfo").context("cannot read /proc/meminfo")?;
     let read = |name: &str| -> Result<u64> {

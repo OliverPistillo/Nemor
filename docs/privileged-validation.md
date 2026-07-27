@@ -161,7 +161,9 @@ resource was touched.
 The validation proves the privileged primitives through a dedicated test
 harness; it does not enable general daemon mutation. The default service has
 no cgroup or zram mutation privileges. Live Steam/Proton/Wine/Gamescope
-coverage remains separate, and Phase 6 remains planned and unimplemented.
+coverage remains separate. Phase 6 development and live-safe validation are
+complete, while dedicated boot validation with real zswap+NVMe remains
+pending.
 
 ## Phase 6 live-safe validation
 
@@ -176,3 +178,17 @@ protected zram structure were identical.
 This proves the live-safe swapfile lifecycle and accounting path, not the full
 zswap+NVMe backend. Dedicated boot validation remains pending and requires
 separate explicit approval.
+
+## Phase 7 monitor-only validation
+
+The `--damon` path completed successfully on CachyOS
+`7.1.4-1-cachyos`. It owned only a synthetic child, temporary DAMON sysfs
+objects, an isolated tracefs instance and run-scoped report/dataset files.
+The final `vaddr` session captured nine complete aggregation windows with HOT
+1.0, WARM about 0.2611 and COLD zero. Monitor CPU stayed below the 1% budget;
+synthetic target slowdown was about 3%.
+
+Readback proved three initial target regions and `nr_schemes=0`. Stop, cleanup,
+crash recovery and a second idempotent recovery restored the structural host
+baseline. No external session, `/dev/zram0`, zswap/tiering state, persistent
+configuration or boot setting was changed.

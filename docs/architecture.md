@@ -105,3 +105,16 @@ backend-selection intent; the tiering crate validates evidence and safety.
 swapfile and zswap mutation is unavailable through the daemon and `nemorctl`.
 The separately compiled privileged harness owns bounded validation resources.
 See [tiering.md](tiering.md).
+
+## Phase 7 DAMON boundary
+
+`nemor-damon` is the twelfth workspace crate. It models capability discovery,
+monitoring attributes, raw adaptive regions, normalized observational labels,
+overhead, bounded persistence and dataset export. Normal `nemord` observe mode
+does not create or configure `kdamond` or mutate tracefs. The manual privileged
+harness alone owns bounded synthetic `vaddr` sessions with zero schemes.
+
+The pipeline is process identity → target plan → owned monitor-only session →
+`damon:damon_aggregated` → normalized hot/warm/cold evidence → SQLite/export.
+No DAMOS or memory-management action exists in Phase 7. See
+[damon.md](damon.md).

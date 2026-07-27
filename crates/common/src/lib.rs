@@ -6,8 +6,8 @@ mod output;
 mod paths;
 
 pub use config::{
-    CgroupsConfig, ClassificationConfig, CompressionConfig, Config, ConfigError, LoadedConfig,
-    PressureConfig, TelemetryConfig, TieringConfig,
+    CgroupsConfig, ClassificationConfig, CompressionConfig, Config, ConfigError, DamonConfig,
+    LoadedConfig, PressureConfig, TelemetryConfig, TieringConfig,
 };
 pub use host::{HostMetadata, HostMetadataError};
 pub use output::{

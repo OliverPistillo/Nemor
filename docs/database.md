@@ -97,3 +97,12 @@ Phase 6 reuses `configuration_snapshots` with reason
 tables. No migration 0005 is needed. Real action results remain reserved for
 explicit privileged transactions; observe-mode inventory stores only audit
 evidence.
+
+## DAMON telemetry
+
+Migration `0005_damon.sql` adds bounded `damon_sessions`,
+`damon_region_samples` and `damon_overhead_samples` storage. Sessions preserve
+kernel, operation, requested/effective attributes, source, target identity,
+overhead and clean-shutdown state. Region rows retain raw ranges/access counts
+and normalized observational evidence, never memory contents. Reads and
+exports are bounded; retention and drop accounting prevent unbounded growth.

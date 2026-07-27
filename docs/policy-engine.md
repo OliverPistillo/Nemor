@@ -41,6 +41,11 @@ Unsupported actions are structured rejections.
 There is no zswap tuning, sysctl, reclaim, freezer, process signal,
 `MemoryMax`, `MemorySwapMax`, KSM, DAMON, or future placeholder.
 
+Phase 7 may supply read-only DAMON availability and hot/cold observational
+evidence to reports. It adds no policy action and cannot cause DAMON sysfs,
+tracefs or DAMOS mutation. Controlled DAMOS intent belongs to the unstarted
+Phase 8.
+
 Policy expresses intent; concrete targets still pass the Phase 3 actuator’s
 stable identity allow-list, PID/start-tick, classification, ownership, and
 memory bounds. Unknown processes are rejected in every state. Gaming does not

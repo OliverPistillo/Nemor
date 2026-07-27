@@ -79,6 +79,9 @@ pub trait TelemetryStorage {
     ) -> Result<()> {
         Ok(())
     }
+    fn store_damon_audit(&mut self, _session_id: i64, _audit: &damon::DamonReport) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl TelemetryStorage for Storage {
@@ -134,6 +137,16 @@ impl TelemetryStorage for Storage {
             session_id,
             tiering::TIERING_AUDIT_REASON,
             &audit.recommendation,
+            audit,
+        )?;
+        Ok(())
+    }
+
+    fn store_damon_audit(&mut self, session_id: i64, audit: &damon::DamonReport) -> Result<()> {
+        self.insert_configuration_snapshot(
+            session_id,
+            damon::AUDIT_REASON,
+            &audit.capability,
             audit,
         )?;
         Ok(())
@@ -548,6 +561,19 @@ where
                                                         "tiering observe audit was unavailable"
                                                     ),
                                                 }
+                                                let damon_audit = damon::observe_report(
+                                                    &config.damon,
+                                                    std::fs::read_to_string(
+                                                        "/proc/sys/kernel/osrelease",
+                                                    )
+                                                    .ok()
+                                                    .map(|value| value.trim().to_owned()),
+                                                );
+                                                storage
+                                                    .store_damon_audit(session_id, &damon_audit)
+                                                    .context(
+                                                        "cannot persist DAMON observe audit",
+                                                    )?;
                                                 info!(
                                                     event = "policy_decision_persisted",
                                                     session_id,

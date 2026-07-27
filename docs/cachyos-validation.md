@@ -254,3 +254,18 @@ A release observe daemon sampled over 15 two-second intervals exited cleanly
 after SIGTERM. Mean CPU was 0.232293%, maximum interval CPU 0.995682%, RSS
 8,040,448 bytes and PSS 5,599,232 bytes. These host-specific values are a
 modest increase over Phase 5, not a universal performance claim.
+
+## Phase 7 privileged DAMON validation
+
+On CachyOS kernel `7.1.4-1-cachyos`, the release harness completed a real
+monitor-only `vaddr` session with exit code zero. All 30 mandatory gates passed,
+the report contained no errors, and the structural host baseline was unchanged.
+Nine complete aggregation windows measured HOT mean/P50 1.0, WARM mean
+0.261111/P50 0.25 and COLD mean/P50 zero. No DAMOS scheme existed.
+
+The controlled 8 MiB-per-zone A/B showed unreliable HOT detection with
+default THP backing (2/9 nonzero windows, mean about 0.00444) and stable
+detection with mapping-local `MADV_NOHUGEPAGE` (9/9, mean 1.0). This is a
+host-specific validation-harness finding, not a global THP policy. Final
+`kdamond` CPU was 0.0%, capture CPU 0.02308834%, and synthetic target slowdown
+about 3.00004%; the slowdown remains a Phase 10 real-workload benchmark item.

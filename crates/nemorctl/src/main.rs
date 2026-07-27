@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use nemorctl::{
-    cgroups_status, doctor, policy_latest, policy_status, render_cgroups_status, render_doctor,
-    render_policy_latest, render_policy_status, render_report, render_status, render_workload,
-    render_zram, report_latest, status, tiering_recommend, tiering_report_latest, tiering_status,
+    cgroups_status, damon_export, damon_report_latest, damon_sessions, damon_status, doctor,
+    policy_latest, policy_status, render_cgroups_status, render_doctor, render_policy_latest,
+    render_policy_status, render_report, render_status, render_workload, render_zram,
+    report_latest, status, tiering_recommend, tiering_report_latest, tiering_status,
     workload_latest, zram_profiles, zram_report_latest, zram_status, DoctorEnvironment,
 };
 use std::path::PathBuf;
@@ -54,6 +55,10 @@ enum Command {
     Tiering {
         #[command(subcommand)]
         command: TieringCommand,
+    },
+    Damon {
+        #[command(subcommand)]
+        command: DamonCommand,
     },
 }
 
@@ -135,6 +140,42 @@ enum TieringCommand {
 
 #[derive(Debug, Subcommand)]
 enum TieringReportCommand {
+    Latest {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DamonExportFormat {
+    Jsonl,
+    Csv,
+}
+
+#[derive(Debug, Subcommand)]
+enum DamonCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Sessions {
+        #[arg(long)]
+        json: bool,
+    },
+    Report {
+        #[command(subcommand)]
+        command: DamonReportCommand,
+    },
+    Export {
+        #[arg(long, value_enum)]
+        format: DamonExportFormat,
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DamonReportCommand {
     Latest {
         #[arg(long)]
         json: bool,
@@ -241,6 +282,40 @@ fn run() -> anyhow::Result<i32> {
             print!(
                 "{}",
                 render_zram(&tiering_report_latest(&cli.config)?, json)?
+            );
+            Ok(0)
+        }
+        Command::Damon {
+            command: DamonCommand::Status { json },
+        } => {
+            print!("{}", render_zram(&damon_status(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Damon {
+            command: DamonCommand::Sessions { json },
+        } => {
+            print!("{}", render_zram(&damon_sessions(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Damon {
+            command:
+                DamonCommand::Report {
+                    command: DamonReportCommand::Latest { json },
+                },
+        } => {
+            print!("{}", render_zram(&damon_report_latest(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Damon {
+            command: DamonCommand::Export { format, output },
+        } => {
+            let format = match format {
+                DamonExportFormat::Jsonl => damon::ExportFormat::Jsonl,
+                DamonExportFormat::Csv => damon::ExportFormat::Csv,
+            };
+            println!(
+                "exported_bytes={}",
+                damon_export(&cli.config, format, &output)?
             );
             Ok(0)
         }

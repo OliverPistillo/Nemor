@@ -162,6 +162,18 @@ pub struct KsmConfig {
 pub struct DamonConfig {
     pub enabled: bool,
     pub mode: String,
+    pub allow_monitor_session: bool,
+    pub preferred_operation: String,
+    pub sample_us: u64,
+    pub aggr_us: u64,
+    pub update_us: u64,
+    pub min_regions: u32,
+    pub max_regions: u32,
+    pub max_cpu_overhead_percent: f64,
+    pub max_session_seconds: u64,
+    pub max_samples_per_session: u64,
+    pub retention_days: u64,
+    pub export_max_bytes: u64,
     pub max_action_time_ms: u64,
     pub max_action_bytes: u64,
 }
@@ -629,6 +641,53 @@ impl Config {
                 "must be exactly `monitor_only` in the current implementation",
             ));
         }
+        if self.damon.allow_monitor_session {
+            return Err(validation(
+                "damon.allow_monitor_session",
+                "normal runtime must not start a monitoring session",
+            ));
+        }
+        if self.damon.preferred_operation != "vaddr" {
+            return Err(validation(
+                "damon.preferred_operation",
+                "must be vaddr for Phase 7",
+            ));
+        }
+        if self.damon.sample_us < 100
+            || self.damon.aggr_us < self.damon.sample_us
+            || self.damon.update_us < self.damon.aggr_us
+        {
+            return Err(validation(
+                "damon.sample_us",
+                "must satisfy 100 <= sample <= aggregation <= update",
+            ));
+        }
+        if self.damon.min_regions == 0
+            || self.damon.min_regions > self.damon.max_regions
+            || self.damon.max_regions > 100_000
+        {
+            return Err(validation("damon.min_regions", "invalid region bounds"));
+        }
+        if !self.damon.max_cpu_overhead_percent.is_finite()
+            || self.damon.max_cpu_overhead_percent < 0.0
+            || self.damon.max_cpu_overhead_percent > self.safety.max_cpu_overhead_percent
+        {
+            return Err(validation(
+                "damon.max_cpu_overhead_percent",
+                "must not exceed the global safety ceiling",
+            ));
+        }
+        if self.damon.max_session_seconds == 0
+            || self.damon.max_session_seconds > 180
+            || self.damon.max_samples_per_session == 0
+            || self.damon.retention_days == 0
+            || self.damon.export_max_bytes == 0
+        {
+            return Err(validation(
+                "damon.max_session_seconds",
+                "session, sample, retention, and export bounds must be non-zero and bounded",
+            ));
+        }
         Ok(())
     }
 }
@@ -976,5 +1035,31 @@ mod tests {
         ))
         .expect_err("DAMON must remain disabled");
         assert!(error.to_string().contains("damon.enabled"));
+    }
+
+    #[test]
+    fn validates_phase_seven_damon_bounds() {
+        for (from, to, field) in [
+            (
+                "preferred_operation = \"vaddr\"",
+                "preferred_operation = \"paddr\"",
+                "damon.preferred_operation",
+            ),
+            ("sample_us = 5000", "sample_us = 99", "damon.sample_us"),
+            (
+                "max_cpu_overhead_percent = 1.0",
+                "max_cpu_overhead_percent = 6.0",
+                "damon.max_cpu_overhead_percent",
+            ),
+            (
+                "max_session_seconds = 120",
+                "max_session_seconds = 181",
+                "damon.max_session_seconds",
+            ),
+        ] {
+            let error =
+                Config::from_toml(&changed(from, to)).expect_err("unsafe DAMON bounds must fail");
+            assert!(error.to_string().contains(field), "{error}");
+        }
     }
 }

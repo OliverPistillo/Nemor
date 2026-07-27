@@ -9,6 +9,7 @@ actuator = { package = "nemor-actuator", path = "../actuator" }
 anyhow.workspace = true
 clap.workspace = true
 common = { package = "nemor-common", path = "../common" }
+damon = { package = "nemor-damon", path = "../damon" }
 policy-engine = { package = "nemor-policy-engine", path = "../policy-engine" }
 serde.workspace = true
 serde_json.workspace = true
