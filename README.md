@@ -16,7 +16,7 @@ not AI.
 | Phase 3 | cgroup v2 protection primitives | ✅ Validated on CachyOS |
 | Phase 4 | deterministic policy engine | ✅ Validated on CachyOS |
 | Phase 5 | safe zram backend and profiles | ✅ Validated on CachyOS |
-| Phase 6 | disk-backed compression/tiering | ⚪ Planned |
+| Phase 6 | zswap + NVMe tiering backend | 🟡 Dev complete / boot validation pending |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
 development; ⚪ planned.
@@ -28,31 +28,36 @@ development; ⚪ planned.
 | Platform | CachyOS Linux, x86_64 |
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
-| Workspace crates | 10 |
-| Tests defined / executed | 148 / 148 |
-| Passed / failed / ignored | 148 / 0 / 0 |
+| Workspace crates | 11 |
+| Tests defined / executed | 173 / 173 |
+| Passed / failed / ignored | 173 / 0 / 0 |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
-| Validated implementation | current `main` (privileged validation gate) |
+| Host zswap | supported, disabled by kernel/provider configuration |
+| Host storage | Btrfs, non-rotational SATA SSD; no NVMe evidence |
+| Phase 6 validation | read-only + live-safe swapfile; dedicated boot pending |
 
 Linux tests include real `/proc`/`/sys` reads and real SIGINT/SIGTERM delivery.
 The dedicated bounded harness additionally validates isolated privileged
 cgroup and zram mutations; the normal runtime remains observe-only.
+The Phase 6 harness additionally validated a bounded owned Btrfs swapfile
+lifecycle, write accounting and recovery without changing zswap or zram0.
 
 ## Performance snapshot
 
 Release `nemord` was sampled on the validation host 15 times at two-second
 intervals using `/proc/<pid>/stat`, `status`, and `smaps_rollup`.
 
-| Metric | Phase 3 | Phase 4 | Phase 5 |
-|---|---:|---:|---:|
-| Mean CPU (one logical CPU) | 0.1990% | 0.199249% | 0.212940% |
-| Maximum interval CPU | 0.4976% | 0.996093% | 0.496909% |
-| Maximum RSS | ~7.03 MiB | ~7.34 MiB | ~7.32 MiB |
-| PSS | ~4.70 MiB | ~4.99 MiB | ~5.00 MiB |
+| Metric | Phase 3 | Phase 4 | Phase 5 | Phase 6 |
+|---|---:|---:|---:|---:|
+| Mean CPU (one logical CPU) | 0.1990% | 0.199249% | 0.212940% | 0.232293% |
+| Maximum interval CPU | 0.4976% | 0.996093% | 0.496909% | 0.995682% |
+| Maximum RSS | ~7.03 MiB | ~7.34 MiB | ~7.32 MiB | ~7.67 MiB |
+| PSS | ~4.70 MiB | ~4.99 MiB | ~5.00 MiB | ~5.34 MiB |
 
 These are host-specific validation measurements, not universal benchmarks.
-The mean CPU is unchanged within measurement noise; memory increased modestly.
+Phase 6 used the same 15 two-second interval method. Mean CPU and memory
+increased modestly; storage inventory is bounded by the normal sampling loop.
 
 ## Implemented capabilities
 
@@ -70,6 +75,11 @@ The mean CPU is unchanged within measurement noise; memory increased modestly.
   read-only history;
 - foreground daemon with clean SIGINT/SIGTERM lifecycle;
 - read-only JSON/text CLI.
+- zswap capability/provider inventory, swapfile filesystem and topology
+  validation, pool planning, block-I/O accounting, write budgets and TBW
+  estimates without invented endurance ratings;
+- deterministic zram versus zswap+NVMe recommendation, boot-plan generation,
+  owned swapfile rollback/recovery and live-safe privileged validation.
 
 ## Safety model
 
@@ -83,6 +93,8 @@ The mean CPU is unchanged within measurement noise; memory increased modestly.
 - `/dev/zram0` is external/protected and never eligible for validation
   ownership;
 - no privileged mutation is exposed through the daemon or `nemorctl`.
+- zswap kernel-global changes and persistent boot plans require separate manual
+  approval; write-budget events never turn off an active swap.
 
 See [the safety model](docs/safety-model.md).
 
@@ -99,6 +111,9 @@ nemorctl policy latest
 nemorctl zram status
 nemorctl zram profiles
 nemorctl zram report latest
+nemorctl tiering status
+nemorctl tiering recommend
+nemorctl tiering report latest
 ```
 
 Every command accepts `--json` at its terminal command position and reads only
@@ -134,15 +149,20 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - SteamOS is not supported;
 - policy operation is dry-run only;
 - no ML or GUI exists;
-- zswap, writeback/backing devices, disk tiering, and Phase 6 are unavailable.
+- the current host has no NVMe backing device and zswap is disabled by its
+  CachyOS boot/provider configuration;
+- full zswap+NVMe pool, writeback and comparative benchmark validation requires
+  a separately approved dedicated boot;
+- the daemon and normal CLI intentionally expose no tiering apply command.
 
 ## Roadmap
 
 - Completed and validated on CachyOS: Phases 0–5.
+- Phase 6 implementation and live-safe swapfile validation are complete;
+  dedicated zswap+NVMe boot validation remains pending.
 - The runtime default remains observe-only despite isolated privileged
   validation of Phases 3 and 5.
-- Next: Phase 6 only after a separate approved scope.
-- Future work remains unavailable until implemented and measured.
+- Phase 7 remains planned and was not started.
 
 ## Documentation
 
@@ -152,6 +172,7 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - [Cgroups](docs/cgroups.md)
 - [Policy engine](docs/policy-engine.md)
 - [Zram backend](docs/zram.md)
+- [Zswap and storage tiering](docs/tiering.md)
 - [Safety model](docs/safety-model.md)
 - [Database](docs/database.md)
 - [CachyOS validation](docs/cachyos-validation.md)
@@ -166,3 +187,4 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 | 4 | 122 | CachyOS observe validation | `7a1d180` |
 | 5 | 140 | CachyOS read-only baseline | `fcb21a9` |
 | 3 + 5 gate | 148 | CachyOS privileged isolated validation | current validation commit |
+| 6 development | 173 | CachyOS read-only + live-safe swapfile; boot pending | current development |

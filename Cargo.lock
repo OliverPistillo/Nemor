@@ -569,10 +569,23 @@ dependencies = [
  "nemor-collector",
  "nemor-common",
  "nemor-storage",
+ "nemor-tiering",
  "nemor-zram",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "nemor-tiering"
+version = "0.1.0"
+dependencies = [
+ "nemor-common",
+ "nemor-policy-engine",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -598,6 +611,7 @@ dependencies = [
  "nemor-policy-engine",
  "nemor-storage",
  "nemor-test-support",
+ "nemor-tiering",
  "nemor-zram",
  "serde",
  "serde_json",
@@ -616,6 +630,7 @@ dependencies = [
  "nemor-policy-engine",
  "nemor-storage",
  "nemor-test-support",
+ "nemor-tiering",
  "nemor-zram",
  "nemorctl",
  "nix",

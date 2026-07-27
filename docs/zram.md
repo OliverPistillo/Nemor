@@ -83,3 +83,8 @@ tiering, sysctl, reclaim, freezer, KSM, or DAMON. Recompression is detected
 read-only only. The public CLI has status, profile, and latest-report reads; it
 has no apply command. Disk-backed compression belongs to Phase 6 and is not
 implemented.
+
+Zram remains a distinct backend in Phase 6. Zswap in front of `/dev/zram0` is
+not accepted as evidence for the requested NVMe tier because it may introduce
+double compression. The principal comparison is validated zram versus zswap
+with real disk-backed NVMe swap.

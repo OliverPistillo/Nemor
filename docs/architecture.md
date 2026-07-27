@@ -1,4 +1,4 @@
-# Phase 4 architecture
+# Nemor architecture
 
 ## Crate boundaries
 
@@ -96,3 +96,12 @@ silently lost indefinitely.
 Phase 5 adds zram-only planning and guarded primitives. Observe mode never
 invokes them. It does not configure zswap, backing devices, writeback, disk
 tiering, KSM, DAMON, or any Phase 6 mechanism.
+
+## Phase 6 tiering boundary
+
+`nemor-tiering` is the eleventh workspace crate. The policy engine emits only a
+backend-selection intent; the tiering crate validates evidence and safety.
+`nemord` performs read-only inventory and persists audit snapshots. Runtime
+swapfile and zswap mutation is unavailable through the daemon and `nemorctl`.
+The separately compiled privileged harness owns bounded validation resources.
+See [tiering.md](tiering.md).

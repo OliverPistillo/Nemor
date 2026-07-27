@@ -1,5 +1,6 @@
 use crate::{
-    ActionKind, PlannedAction, PolicyInput, PressureState, RejectedAction, ZramProfileIntent,
+    ActionKind, MemoryBackendIntent, PlannedAction, PolicyInput, PressureState, RejectedAction,
+    ZramProfileIntent,
 };
 use actuator::{plan as actuator_plan, CgroupPlan, PlanInput};
 use common::CgroupsConfig;
@@ -26,6 +27,10 @@ pub fn plan_actions(state: PressureState, input: &PolicyInput, observe: bool) ->
                 ZramProfileIntent::Safe,
                 "preserve_current_zram",
             ));
+            planned.push(tiering_action(
+                MemoryBackendIntent::Zram,
+                "no_tiering_benchmark_evidence_preserves_zram",
+            ));
         }
         PressureState::Watch => {
             planned.push(action(
@@ -40,6 +45,10 @@ pub fn plan_actions(state: PressureState, input: &PolicyInput, observe: bool) ->
                     ZramProfileIntent::Safe
                 },
                 "analyze_zram_without_risky_change",
+            ));
+            planned.push(tiering_action(
+                MemoryBackendIntent::Zram,
+                "watch_state_preserves_current_backend",
             ));
         }
         PressureState::Pressure | PressureState::Critical | PressureState::Emergency => {
@@ -61,6 +70,14 @@ pub fn plan_actions(state: PressureState, input: &PolicyInput, observe: bool) ->
                 } else {
                     "critical_states_block_zram_reinitialization"
                 },
+            ));
+            planned.push(tiering_action(
+                if input.gaming || state != PressureState::Pressure {
+                    MemoryBackendIntent::Zram
+                } else {
+                    MemoryBackendIntent::ZswapNvme
+                },
+                "tiering_intent_requires_backend_safety_validation",
             ));
             planned.push(action(
                 ActionKind::ApplyBackgroundSoftLimit,
@@ -86,6 +103,10 @@ pub fn plan_actions(state: PressureState, input: &PolicyInput, observe: bool) ->
             planned.push(zram_action(
                 ZramProfileIntent::Safe,
                 "hold_zram_configuration_during_stabilization",
+            ));
+            planned.push(tiering_action(
+                MemoryBackendIntent::Zram,
+                "stabilizing_preserves_low_write_backend",
             ));
             if input.recent_safety_events > 0 {
                 reject_mutations(&mut planned, &mut rejected, "recent_cgroup_safety_event");
@@ -115,6 +136,10 @@ fn action(kind: ActionKind, reason: &str, mutating: bool) -> PlannedAction {
 
 fn zram_action(profile: ZramProfileIntent, reason: &str) -> PlannedAction {
     action(ActionKind::SelectZramProfile { profile }, reason, false)
+}
+
+fn tiering_action(backend: MemoryBackendIntent, reason: &str) -> PlannedAction {
+    action(ActionKind::SelectMemoryBackend { backend }, reason, false)
 }
 
 fn reject_mutations(

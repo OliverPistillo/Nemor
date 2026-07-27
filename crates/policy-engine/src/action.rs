@@ -8,6 +8,13 @@ pub enum ZramProfileIntent {
     Capacity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBackendIntent {
+    Zram,
+    ZswapNvme,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
@@ -17,6 +24,7 @@ pub enum ActionKind {
     ApplyBackgroundSoftLimit,
     RollbackCgroupMeasures,
     SelectZramProfile { profile: ZramProfileIntent },
+    SelectMemoryBackend { backend: MemoryBackendIntent },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

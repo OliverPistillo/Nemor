@@ -41,5 +41,8 @@ jobs:
       - name: Inspect real Nemor Linux zram interfaces read-only
         run: cargo test -p nemor-zram tests::linux_backend_inspects_real_host_read_only --all-features
 
+      - name: Inspect real Linux tiering interfaces read-only
+        run: cargo run -p nemorctl -- --config config/default.toml tiering status --json
+
       - name: Run privileged validation harness read-only preflight
         run: cargo run -p nemor-test-support --bin nemor-privileged-validation -- --preflight

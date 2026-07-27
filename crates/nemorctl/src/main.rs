@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use nemorctl::{
     cgroups_status, doctor, policy_latest, policy_status, render_cgroups_status, render_doctor,
     render_policy_latest, render_policy_status, render_report, render_status, render_workload,
-    render_zram, report_latest, status, workload_latest, zram_profiles, zram_report_latest,
-    zram_status, DoctorEnvironment,
+    render_zram, report_latest, status, tiering_recommend, tiering_report_latest, tiering_status,
+    workload_latest, zram_profiles, zram_report_latest, zram_status, DoctorEnvironment,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -50,6 +50,10 @@ enum Command {
     Zram {
         #[command(subcommand)]
         command: ZramCommand,
+    },
+    Tiering {
+        #[command(subcommand)]
+        command: TieringCommand,
     },
 }
 
@@ -107,6 +111,30 @@ enum ZramCommand {
 
 #[derive(Debug, Subcommand)]
 enum ZramReportCommand {
+    Latest {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TieringCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Recommend {
+        #[arg(long)]
+        json: bool,
+    },
+    Report {
+        #[command(subcommand)]
+        command: TieringReportCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TieringReportCommand {
     Latest {
         #[arg(long)]
         json: bool,
@@ -190,6 +218,30 @@ fn run() -> anyhow::Result<i32> {
                 },
         } => {
             print!("{}", render_zram(&zram_report_latest(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Tiering {
+            command: TieringCommand::Status { json },
+        } => {
+            print!("{}", render_zram(&tiering_status(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Tiering {
+            command: TieringCommand::Recommend { json },
+        } => {
+            print!("{}", render_zram(&tiering_recommend(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Tiering {
+            command:
+                TieringCommand::Report {
+                    command: TieringReportCommand::Latest { json },
+                },
+        } => {
+            print!(
+                "{}",
+                render_zram(&tiering_report_latest(&cli.config)?, json)?
+            );
             Ok(0)
         }
     }

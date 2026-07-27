@@ -72,6 +72,13 @@ pub trait TelemetryStorage {
     fn store_zram_audit(&mut self, _session_id: i64, _audit: &zram::ZramAuditReport) -> Result<()> {
         Ok(())
     }
+    fn store_tiering_audit(
+        &mut self,
+        _session_id: i64,
+        _audit: &tiering::TieringAuditReport,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl TelemetryStorage for Storage {
@@ -115,6 +122,20 @@ impl TelemetryStorage for Storage {
 
     fn store_zram_audit(&mut self, session_id: i64, audit: &zram::ZramAuditReport) -> Result<()> {
         self.insert_configuration_snapshot(session_id, zram::AUDIT_REASON, &audit.plans, audit)?;
+        Ok(())
+    }
+
+    fn store_tiering_audit(
+        &mut self,
+        session_id: i64,
+        audit: &tiering::TieringAuditReport,
+    ) -> Result<()> {
+        self.insert_configuration_snapshot(
+            session_id,
+            tiering::TIERING_AUDIT_REASON,
+            &audit.recommendation,
+            audit,
+        )?;
         Ok(())
     }
 }
@@ -509,6 +530,22 @@ where
                                                         session_id,
                                                         error = %error,
                                                         "zram observe audit was unavailable"
+                                                    ),
+                                                }
+                                                match tiering::inspect_host(
+                                                    &config.tiering,
+                                                    decision.timestamp_ns,
+                                                ) {
+                                                    Ok(audit) => storage
+                                                        .store_tiering_audit(session_id, &audit)
+                                                        .context(
+                                                            "cannot persist tiering observe audit",
+                                                        )?,
+                                                    Err(error) => warn!(
+                                                        event = "tiering_inventory_unavailable",
+                                                        session_id,
+                                                        error = %error,
+                                                        "tiering observe audit was unavailable"
                                                     ),
                                                 }
                                                 info!(

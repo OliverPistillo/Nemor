@@ -1,4 +1,4 @@
-# Phase 5 safety model
+# Nemor safety model
 
 The only valid mode is exactly `observe`.
 `general.allow_automatic_actions`, `ksm.enabled`, and `damon.enabled` must all be
@@ -71,3 +71,9 @@ data is isolated under `/var/lib/nemor` and can be removed separately
 when retention is no longer desired. Retention affects only telemetry rows in
 the configured SQLite database. There is no kernel-parameter rollback
 because no kernel parameter is ever changed.
+
+Phase 6 preserves observe-mode zero mutation. Swapfile ownership, normalized
+paths, helper executable/argv allow-lists, no-swap-loss, write budgets and
+rollback are fail-closed. `/dev/zram0` remains external and protected. Zswap is
+kernel-global, so live desktop validation never enables it merely to satisfy a
+test. Persistent boot plans require separate explicit approval.

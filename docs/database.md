@@ -89,3 +89,11 @@ read-only.
 The existing `benchmark_runs`/`benchmark_metrics` schema is sufficient.
 Isolated results retain a real-versus-simulated marker; simulated fixture data
 cannot be reported as a kernel benchmark. The model registry remains unused.
+
+## Tiering audit
+
+Phase 6 reuses `configuration_snapshots` with reason
+`tiering_observe_audit`, plus existing safety, benchmark, policy and action
+tables. No migration 0005 is needed. Real action results remain reserved for
+explicit privileged transactions; observe-mode inventory stores only audit
+evidence.

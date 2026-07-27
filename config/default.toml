@@ -79,6 +79,24 @@ benchmark_max_bytes = 67108864
 max_cpu_overhead_percent = 2.0
 min_capacity_gain_percent = 10.0
 
+[tiering]
+enabled = true
+dry_run = true
+preferred_backend = "detect"
+allow_runtime_reconfigure = false
+allow_persistent_reconfigure = false
+allow_swapfile_create = false
+require_nvme = true
+max_swapfile_percent_disk = 10
+min_free_disk_gib = 32
+max_write_mib_per_second = 100
+daily_write_budget_gib = 64
+benchmark_enabled = false
+benchmark_max_bytes = 67108864
+zswap_pool_min_percent = 5
+zswap_pool_max_percent = 20
+allow_shrinker = false
+
 [ksm]
 enabled = false
 profiles = ["virtualization", "browser_heavy"]

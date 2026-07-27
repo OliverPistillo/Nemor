@@ -237,3 +237,20 @@ valid JSON. Fifteen samples at two-second intervals measured mean CPU
 0.212940%, maximum interval 0.496909%, maximum RSS 7,675,904 bytes (~7.32 MiB),
 and final PSS 5,244,928 bytes (~5.00 MiB), without a material Phase 4
 regression.
+
+## Phase 6 development validation
+
+On 2026-07-27 CachyOS kernel `7.1.4-1-cachyos` exposed zswap but booted with it
+disabled. The root Btrfs filesystem resolves to a non-rotational SATA SSD, not
+NVMe. Read-only inventory detected the kernel command-line and CachyOS provider
+conflict without changing either.
+
+The release privileged harness completed the bounded Btrfs swapfile lifecycle
+with exit code zero. `/dev/zram0` stayed active and structurally unchanged;
+rollback/recovery was idempotent and no resource remained. Full zswap+NVMe boot
+validation is pending separate approval and suitable NVMe evidence.
+
+A release observe daemon sampled over 15 two-second intervals exited cleanly
+after SIGTERM. Mean CPU was 0.232293%, maximum interval CPU 0.995682%, RSS
+8,040,448 bytes and PSS 5,599,232 bytes. These host-specific values are a
+modest increase over Phase 5, not a universal performance claim.

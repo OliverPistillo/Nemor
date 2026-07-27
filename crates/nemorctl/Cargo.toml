@@ -13,6 +13,7 @@ policy-engine = { package = "nemor-policy-engine", path = "../policy-engine" }
 serde.workspace = true
 serde_json.workspace = true
 storage = { package = "nemor-storage", path = "../storage" }
+tiering = { package = "nemor-tiering", path = "../tiering" }
 zram = { package = "nemor-zram", path = "../zram" }
 
 [dev-dependencies]

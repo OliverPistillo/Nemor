@@ -162,3 +162,17 @@ The validation proves the privileged primitives through a dedicated test
 harness; it does not enable general daemon mutation. The default service has
 no cgroup or zram mutation privileges. Live Steam/Proton/Wine/Gamescope
 coverage remains separate, and Phase 6 remains planned and unimplemented.
+
+## Phase 6 live-safe validation
+
+On 2026-07-27 the release harness `--tiering` completed with exit code zero.
+It inventoried supported-but-disabled zswap read-only, resolved Btrfs on a
+non-rotational SATA SSD, created and activated a 64 MiB Nemor-owned temporary
+swapfile while `/dev/zram0` remained active, recorded a host-wide 4096-byte
+physical block write delta, recovered with a fresh backend, rolled back twice
+idempotently and removed all resources. Baseline and final swap topology and
+protected zram structure were identical.
+
+This proves the live-safe swapfile lifecycle and accounting path, not the full
+zswap+NVMe backend. Dedicated boot validation remains pending and requires
+separate explicit approval.

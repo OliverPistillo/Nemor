@@ -6,6 +6,7 @@ members = [
     "crates/classifier",
     "crates/policy-engine",
     "crates/zram",
+    "crates/tiering",
     "crates/storage",
     "crates/nemord",
     "crates/nemorctl",

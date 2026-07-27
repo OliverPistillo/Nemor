@@ -308,6 +308,24 @@ pub fn zram_report_latest(config_path: &Path) -> Result<ZramAuditReport> {
     serde_json::from_str(&snapshot.system_values_json).context("invalid stored zram audit JSON")
 }
 
+pub fn tiering_status(config_path: &Path) -> Result<tiering::TieringAuditReport> {
+    let loaded = LoadedConfig::load(config_path).context("invalid tiering status configuration")?;
+    tiering::inspect_host(&loaded.config.tiering, 0).map_err(anyhow::Error::msg)
+}
+
+pub fn tiering_recommend(config_path: &Path) -> Result<tiering::BackendRecommendation> {
+    Ok(tiering_status(config_path)?.recommendation)
+}
+
+pub fn tiering_report_latest(config_path: &Path) -> Result<tiering::TieringAuditReport> {
+    let loaded = LoadedConfig::load(config_path).context("invalid tiering report configuration")?;
+    let snapshot = storage::latest_configuration_snapshot(
+        &loaded.config.general.database_path,
+        tiering::TIERING_AUDIT_REASON,
+    )?;
+    serde_json::from_str(&snapshot.system_values_json).context("invalid stored tiering audit JSON")
+}
+
 fn read_memory_capacity() -> Result<(u64, u64)> {
     let input = fs::read_to_string("/proc/meminfo").context("cannot read /proc/meminfo")?;
     let read = |name: &str| -> Result<u64> {

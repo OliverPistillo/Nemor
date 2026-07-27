@@ -1,5 +1,10 @@
 # Deterministic policy engine
 
+Phase 6 adds `SelectMemoryBackend { zram | zswap_nvme }` as a non-mutating
+intent. Policy never writes zswap sysfs or creates a swapfile. Missing benchmark
+evidence, gaming, severe pressure or a write-budget event resolves
+conservatively to zram; `nemor-tiering` performs the final validation.
+
 Phase 4 adds a pure rule-based decision layer. It consumes normalized
 telemetry and classifications; it never reads `/proc`, `/sys`, a clock, or the
 network. The caller supplies logical time, so equal state, input, history and

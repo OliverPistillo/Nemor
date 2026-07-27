@@ -14,6 +14,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tiering::{
+    apply_swapfile, inspect_storage, parse_block_stat, rollback_swapfile, FilesystemKind,
+    LinuxSwapfileBackend, MutationSnapshot as TieringMutationSnapshot, StorageClass,
+    SwapfileBackend, SwapfileOwnership, SwapfilePlan,
+};
 use zram::{DatasetKind, LinuxZramBackend, ZramBackend};
 
 const PREFIX: &str = "nemor-validation-";
@@ -26,12 +31,14 @@ const MEMORY_HIGH: u64 = 8 * 1024 * 1024 * 1024;
 const TEST_SWAP_PRIORITY_A: i32 = 10;
 const TEST_SWAP_PRIORITY_B: i32 = 11;
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(180);
+const TIERING_SWAP_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 enum Scope {
     Preflight,
     Cgroups,
     Zram,
+    Tiering,
     All,
 }
 
@@ -44,6 +51,8 @@ struct Cli {
     cgroups: bool,
     #[arg(long)]
     zram: bool,
+    #[arg(long)]
+    tiering: bool,
     #[arg(long)]
     all: bool,
     #[arg(long)]
@@ -61,6 +70,7 @@ impl Cli {
             (self.preflight, Scope::Preflight),
             (self.cgroups, Scope::Cgroups),
             (self.zram, Scope::Zram),
+            (self.tiering, Scope::Tiering),
             (self.all, Scope::All),
         ];
         let values: Vec<_> = selected
@@ -69,7 +79,7 @@ impl Cli {
             .collect();
         match values.as_slice() {
             [scope] => Ok(*scope),
-            _ => bail!("select exactly one of --preflight, --cgroups, --zram, or --all"),
+            _ => bail!("select exactly one of --preflight, --cgroups, --zram, --tiering, or --all"),
         }
     }
 }
@@ -163,6 +173,22 @@ struct ZramEvidence {
     recovery_idempotent: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TieringEvidence {
+    attempted: bool,
+    checks: Vec<Check>,
+    swapfile: Option<String>,
+    filesystem: Option<String>,
+    storage_class: Option<String>,
+    zswap_supported: bool,
+    zswap_enabled: Option<bool>,
+    block_write_bytes_delta: Option<u64>,
+    no_swap_loss: bool,
+    recovery_replayed: bool,
+    recovery_idempotent: bool,
+    boot_validation_required: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ValidationReport {
     schema: &'static str,
@@ -176,6 +202,7 @@ struct ValidationReport {
     final_snapshot: HostSnapshot,
     cgroups: CgroupEvidence,
     zram: ZramEvidence,
+    tiering: TieringEvidence,
     host_unchanged: bool,
     errors: Vec<String>,
 }
@@ -274,7 +301,7 @@ fn main() -> Result<()> {
         return run_internal_worker(worker);
     }
     if cli.cleanup_owned_residue {
-        if cli.preflight || cli.cgroups || cli.zram || cli.all {
+        if cli.preflight || cli.cgroups || cli.zram || cli.tiering || cli.all {
             bail!("--cleanup-owned-residue cannot be combined with validation modes");
         }
         return cleanup_owned_residue();
@@ -298,6 +325,7 @@ fn main() -> Result<()> {
         final_snapshot: baseline.clone(),
         cgroups: CgroupEvidence::default(),
         zram: ZramEvidence::default(),
+        tiering: TieringEvidence::default(),
         host_unchanged: false,
         errors: Vec::new(),
     };
@@ -312,6 +340,12 @@ fn main() -> Result<()> {
         deadline.check("zram validation")?;
         if let Err(error) = validate_zram(&baseline, &mut report.zram, &deadline) {
             report.errors.push(format!("zram: {error:#}"));
+        }
+    }
+    if matches!(scope, Scope::Tiering | Scope::All) {
+        deadline.check("tiering validation")?;
+        if let Err(error) = validate_tiering(&baseline, &mut report.tiering, &deadline) {
+            report.errors.push(format!("tiering: {error:#}"));
         }
     }
 
@@ -1065,6 +1099,178 @@ fn snapshot_host() -> Result<HostSnapshot> {
     })
 }
 
+fn validate_tiering(
+    baseline: &HostSnapshot,
+    evidence: &mut TieringEvidence,
+    deadline: &Deadline,
+) -> Result<()> {
+    evidence.attempted = true;
+    evidence.boot_validation_required = true;
+    let zswap = tiering::inspect_linux(Path::new("/"), true)?;
+    evidence.zswap_supported = zswap.supported;
+    evidence.zswap_enabled = zswap.parameters.enabled;
+    evidence.checks.push(check(
+        "zswap_read_only_inventory",
+        zswap.supported,
+        format!(
+            "supported={}, enabled={:?}; no global parameter was written",
+            zswap.supported, zswap.parameters.enabled
+        ),
+    ));
+
+    let (mount_source, filesystem) = mount_for(Path::new("/var/tmp"))?;
+    let filesystem_kind = match filesystem.as_str() {
+        "btrfs" => FilesystemKind::Btrfs,
+        "ext4" => FilesystemKind::Ext4,
+        _ => FilesystemKind::Unsupported,
+    };
+    if filesystem_kind == FilesystemKind::Unsupported {
+        bail!("validation mount filesystem {filesystem} is unsupported");
+    }
+    let topology = inspect_storage(Path::new("/"), &mount_source, &filesystem);
+    let storage_class = topology
+        .physical
+        .as_ref()
+        .map_or(StorageClass::Unknown, |device| device.class);
+    evidence.filesystem = Some(filesystem.clone());
+    evidence.storage_class = Some(format!("{storage_class:?}").to_lowercase());
+    evidence.checks.push(check(
+        "storage_topology",
+        !topology.ambiguous && topology.physical.is_some(),
+        format!("mount_source={mount_source}, filesystem={filesystem}, class={storage_class:?}"),
+    ));
+
+    let path = PathBuf::from(format!(
+        "/var/tmp/nemor-validation-tiering-{}.swap",
+        now_ns()?
+    ));
+    if path.exists() {
+        bail!("generated validation swapfile already exists");
+    }
+    evidence.swapfile = Some(path.display().to_string());
+    let plan = SwapfilePlan {
+        path: path.clone(),
+        mountpoint: PathBuf::from("/var/tmp"),
+        filesystem: filesystem_kind,
+        backing_device: mount_source,
+        physical_device_class: storage_class,
+        proposed_size: TIERING_SWAP_BYTES,
+        priority: 9,
+        free_bytes: 0,
+        required_headroom_bytes: 0,
+        ownership: SwapfileOwnership::NemorOwned,
+        create_required: true,
+        format_required: true,
+        activate_required: true,
+        persistence_requested: false,
+        allowed: true,
+        blocked_reasons: Vec::new(),
+        dry_run: false,
+    };
+    let before_stat = read_physical_block_stat(&topology)?;
+    let mut backend = LinuxSwapfileBackend::default();
+    let baseline_paths = baseline
+        .swaps
+        .iter()
+        .map(|entry| PathBuf::from(&entry.path))
+        .collect();
+    let mut snapshot = TieringMutationSnapshot {
+        path: path.clone(),
+        baseline_swaps: baseline_paths,
+        created: false,
+        activated: false,
+        rollback_pending: false,
+        rolled_back: false,
+        last_error: None,
+    };
+    deadline.check("tiering swapfile create and activate")?;
+    apply_swapfile(&mut backend, &plan, &mut snapshot)?;
+    let active = backend.active_swaps()?;
+    if !active.contains(&path) || !active.contains(Path::new("/dev/zram0")) {
+        let _ = rollback_swapfile(&mut backend, &mut snapshot);
+        bail!("tiering checkpoint violated active swap or protected zram0 invariant");
+    }
+    evidence.no_swap_loss = true;
+    evidence.checks.push(check(
+        "owned_swapfile_active",
+        true,
+        "temporary owned swapfile and protected zram0 were simultaneously active".to_owned(),
+    ));
+
+    deadline.check("tiering restart recovery")?;
+    drop(backend);
+    let mut recovered = LinuxSwapfileBackend::default();
+    recovered.resume_owned(&path)?;
+    rollback_swapfile(&mut recovered, &mut snapshot)?;
+    evidence.recovery_replayed = !path.exists() && !recovered.active_swaps()?.contains(&path);
+    rollback_swapfile(&mut recovered, &mut snapshot)?;
+    evidence.recovery_idempotent = true;
+    evidence.checks.push(check(
+        "rollback_recovery",
+        evidence.recovery_replayed && evidence.recovery_idempotent,
+        "fresh backend recovered exact root-owned path; second rollback was idempotent".to_owned(),
+    ));
+
+    let after_stat = read_physical_block_stat(&topology)?;
+    evidence.block_write_bytes_delta = match (before_stat, after_stat) {
+        (Some(before), Some(after)) => after
+            .delta(before, 1_000_000)
+            .map(|delta| delta.write_bytes),
+        _ => None,
+    };
+    evidence.checks.push(check(
+        "host_wide_block_accounting",
+        evidence.block_write_bytes_delta.is_some(),
+        format!(
+            "physical write delta={:?} bytes; host-wide and not claimed as NAND-attributable",
+            evidence.block_write_bytes_delta
+        ),
+    ));
+    Ok(())
+}
+
+fn mount_for(path: &Path) -> Result<(String, String)> {
+    let mut best: Option<(usize, String, String)> = None;
+    for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let left_fields: Vec<_> = left.split_whitespace().collect();
+        let right_fields: Vec<_> = right.split_whitespace().collect();
+        if left_fields.len() < 5 || right_fields.len() < 2 {
+            continue;
+        }
+        let mountpoint = Path::new(left_fields[4]);
+        if path.starts_with(mountpoint) {
+            let depth = mountpoint.components().count();
+            if best.as_ref().is_none_or(|current| depth > current.0) {
+                best = Some((
+                    depth,
+                    right_fields[1].to_owned(),
+                    right_fields[0].to_owned(),
+                ));
+            }
+        }
+    }
+    best.map(|(_, source, filesystem)| (source, filesystem))
+        .ok_or_else(|| anyhow!("no mount found for {}", path.display()))
+}
+
+fn read_physical_block_stat(
+    topology: &tiering::StorageTopology,
+) -> Result<Option<tiering::BlockStat>> {
+    let Some(device) = topology.physical.as_ref() else {
+        return Ok(None);
+    };
+    let path = Path::new("/sys/class/block")
+        .join(&device.name)
+        .join("stat");
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    Ok(Some(
+        parse_block_stat(&text).map_err(|error| anyhow!(error))?,
+    ))
+}
+
 fn validate_baseline(snapshot: &HostSnapshot) -> Result<()> {
     if !snapshot.validation_cgroups.is_empty() || !snapshot.validation_processes.is_empty() {
         bail!("pre-existing validation resource makes ownership ambiguous");
@@ -1502,6 +1708,7 @@ mod tests {
             final_snapshot: snapshot,
             cgroups: CgroupEvidence::default(),
             zram: ZramEvidence::default(),
+            tiering: TieringEvidence::default(),
             host_unchanged: true,
             errors: Vec::new(),
         };

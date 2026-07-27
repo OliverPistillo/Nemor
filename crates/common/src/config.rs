@@ -17,6 +17,7 @@ pub struct Config {
     pub pressure: PressureConfig,
     pub policy: PolicyConfig,
     pub compression: CompressionConfig,
+    pub tiering: TieringConfig,
     pub ksm: KsmConfig,
     pub damon: DamonConfig,
     pub gaming: GamingConfig,
@@ -125,6 +126,28 @@ pub struct CompressionConfig {
     pub benchmark_max_bytes: u64,
     pub max_cpu_overhead_percent: f64,
     pub min_capacity_gain_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TieringConfig {
+    pub enabled: bool,
+    pub dry_run: bool,
+    pub preferred_backend: String,
+    pub allow_runtime_reconfigure: bool,
+    pub allow_persistent_reconfigure: bool,
+    pub allow_swapfile_create: bool,
+    pub require_nvme: bool,
+    pub max_swapfile_percent_disk: u8,
+    pub min_free_disk_gib: u64,
+    pub max_write_mib_per_second: u64,
+    pub daily_write_budget_gib: u64,
+    pub benchmark_enabled: bool,
+    pub benchmark_max_bytes: u64,
+    pub zswap_pool_min_percent: u8,
+    pub zswap_pool_max_percent: u8,
+    pub allow_shrinker: bool,
+    pub rated_tbw: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,6 +542,75 @@ impl Config {
                 "must be between 1 and 268435456 bytes",
             ));
         }
+        if !matches!(
+            self.tiering.preferred_backend.as_str(),
+            "detect" | "zram" | "zswap_nvme"
+        ) {
+            return Err(validation(
+                "tiering.preferred_backend",
+                "must be detect, zram, or zswap_nvme",
+            ));
+        }
+        for (field, value) in [
+            (
+                "tiering.max_swapfile_percent_disk",
+                self.tiering.max_swapfile_percent_disk,
+            ),
+            (
+                "tiering.zswap_pool_min_percent",
+                self.tiering.zswap_pool_min_percent,
+            ),
+            (
+                "tiering.zswap_pool_max_percent",
+                self.tiering.zswap_pool_max_percent,
+            ),
+        ] {
+            validate_percentage(field, f64::from(value))?;
+        }
+        if self.tiering.max_swapfile_percent_disk == 0 {
+            return Err(validation(
+                "tiering.max_swapfile_percent_disk",
+                "must be greater than zero",
+            ));
+        }
+        if self.tiering.zswap_pool_min_percent == 0
+            || self.tiering.zswap_pool_min_percent > self.tiering.zswap_pool_max_percent
+        {
+            return Err(validation(
+                "tiering.zswap_pool_min_percent",
+                "must be non-zero and not exceed the maximum",
+            ));
+        }
+        if self.tiering.max_write_mib_per_second == 0
+            || self.tiering.max_write_mib_per_second > self.safety.max_io_write_mib_per_second
+        {
+            return Err(validation(
+                "tiering.max_write_mib_per_second",
+                "must be non-zero and not exceed the global safety limit",
+            ));
+        }
+        if self.tiering.daily_write_budget_gib == 0 {
+            return Err(validation(
+                "tiering.daily_write_budget_gib",
+                "must be greater than zero",
+            ));
+        }
+        if self.tiering.benchmark_max_bytes == 0 || self.tiering.benchmark_max_bytes > 268_435_456 {
+            return Err(validation(
+                "tiering.benchmark_max_bytes",
+                "must be between 1 and 268435456",
+            ));
+        }
+        if self
+            .tiering
+            .rated_tbw
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(validation(
+                "tiering.rated_tbw",
+                "must be finite and positive when provided",
+            ));
+        }
         if self.ksm.enabled {
             return Err(validation(
                 "ksm.enabled",
@@ -821,6 +913,31 @@ mod tests {
             ),
         ] {
             let error = Config::from_toml(&changed(from, to)).expect_err("must reject zram field");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn validates_phase_six_tiering_safety_bounds() {
+        for (from, to, field) in [
+            (
+                "preferred_backend = \"detect\"",
+                "preferred_backend = \"magic\"",
+                "tiering.preferred_backend",
+            ),
+            (
+                "max_write_mib_per_second = 100",
+                "max_write_mib_per_second = 201",
+                "tiering.max_write_mib_per_second",
+            ),
+            (
+                "zswap_pool_min_percent = 5",
+                "zswap_pool_min_percent = 21",
+                "tiering.zswap_pool_min_percent",
+            ),
+        ] {
+            let error = Config::from_toml(&changed(from, to))
+                .expect_err("unsafe tiering configuration must be rejected");
             assert!(error.to_string().contains(field), "{error}");
         }
     }
