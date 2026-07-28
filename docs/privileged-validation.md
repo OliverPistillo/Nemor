@@ -333,9 +333,13 @@ passed with `errors=[]`. The canonical and preserved report SHA-256 is
 `aaa4a44e80b55e84a302a1109b68208b6a55270b106f2f6eb4a68930794d580a`.
 
 This closes the privileged Checkpoint 3A-P observer pipeline. ATTEMPT 1 and
-ATTEMPT 2 remain permanent negative history; no ATTEMPT 4 is planned. Real
-Checkpoint 3A baseline-versus-observe A/B performance validation is the next
-checkpoint. Phase 10 remains in development, and Phase 6 zswap+NVMe boot
+ATTEMPT 2 remain permanent negative history; no ATTEMPT 4 is planned. The
+Checkpoint 3A execution bridge now reuses this DynamicUser systemd service;
+the raw child observer path is not reachable for performance evidence.
+Unprivileged preparation freezes an integrity-bound manifest and privileged
+execution consumes only that manifest. Real Checkpoint 3A baseline-versus-
+observe A/B performance validation is the next checkpoint. Phase 10 remains
+in development, and Phase 6 zswap+NVMe boot
 validation remains pending on dedicated hardware.
 
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required

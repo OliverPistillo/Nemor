@@ -2401,3 +2401,28 @@ fn fixture_report() -> BenchmarkReport {
         ended_monotonic_ns: 1,
     }
 }
+
+#[test]
+fn checkpoint3a_execution_requires_prepared_manifest_and_service_backend() {
+    let source = include_str!("performance.rs");
+    let cli = include_str!("main.rs");
+    let harness = include_str!("harness.rs");
+    assert!(cli.contains("PrepareExperiment"));
+    assert!(cli.contains("ExecuteExperiment"));
+    assert!(source.contains("PreparedExperimentManifest"));
+    assert!(source.contains("execute_prepared_experiment"));
+    assert!(source.contains("unsupported validated observer service contract version"));
+    assert!(!harness.contains("cannot spawn exact owned nemord observer"));
+    assert!(harness.contains("start_performance_observer"));
+}
+
+#[test]
+fn checkpoint3a_runtime_bound_exceeds_measurement_and_is_finite() {
+    let profile = crate::performance::PerformanceProfile::checkpoint3a(
+        crate::performance::CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES,
+    )
+    .unwrap();
+    let runtime = crate::performance::performance_runtime_max_usec(&profile);
+    assert!(runtime > profile.measurement_ms * 1_000);
+    assert!(runtime <= crate::observer_service::PERFORMANCE_SERVICE_RUNTIME_MAX_USEC);
+}

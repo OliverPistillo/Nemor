@@ -117,6 +117,28 @@ enum Command {
         #[arg(long)]
         execute: bool,
     },
+    PrepareExperiment {
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        #[arg(long, default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        observer_binary: PathBuf,
+        #[arg(long)]
+        prepared_dir: PathBuf,
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        report_dir: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value_t = 128 * 1024 * 1024)]
+        payload_bytes: u64,
+    },
+    ExecuteExperiment {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     #[command(hide = true)]
     WorkerHold {
         #[arg(long)]
@@ -421,8 +443,8 @@ fn run() -> Result<i32> {
             seed,
             payload_bytes,
             config,
-            database,
-            report_dir,
+            database: _,
+            report_dir: _,
             observer_binary,
             execute,
         } => {
@@ -451,47 +473,40 @@ fn run() -> Result<i32> {
             if !execute {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
-                nemor_benchmark::performance::require_live_eligibility(&plan)?;
-                nemor_benchmark::performance::require_validated_observer_service_boundary()?;
-                let mut backend = nemor_benchmark::performance::LiveCheckpoint3aBackend {
-                    config,
-                    report_dir: report_dir.clone(),
-                    observer_binary,
-                };
-                let mut outcome =
-                    nemor_benchmark::performance::execute_planned_experiment(plan, &mut backend)?;
-                let metrics = nemor_benchmark::performance::comparison_metric_inputs(&outcome.runs);
-                outcome.comparison = nemor_benchmark::performance::compare_observer_overhead(
-                    &outcome.runs,
-                    &metrics,
-                )
-                .ok();
-                nemor_benchmark::performance::persist_experiment(
-                    &database,
-                    include_str!("../../../migrations/0008_benchmark.sql"),
-                    include_str!("../../../migrations/0009_benchmark_performance.sql"),
-                    &outcome,
-                )?;
-                std::fs::create_dir_all(&report_dir)?;
-                let report = report_dir.join(format!("{}.json", outcome.plan.experiment_id));
-                std::fs::write(&report, serde_json::to_vec_pretty(&outcome)?)?;
-                let inspection_config =
-                    report_dir.join(format!("{}-inspection.toml", outcome.plan.experiment_id));
-                nemor_benchmark::performance::write_inspection_config(
-                    &backend.config,
-                    &database,
-                    &inspection_config,
-                )?;
-                println!(
-                    "experiment_id={} runs={} comparison={} capacity_gain_percent=not_evaluated report={} inspection_config={}",
-                    outcome.plan.experiment_id,
-                    outcome.runs.len(),
-                    outcome.comparison.is_some(),
-                    report.display(),
-                    inspection_config.display()
-                );
-                return Ok(if outcome.comparison.is_some() { 0 } else { 1 });
+                bail!("experiment --execute is retired; use prepare-experiment followed by execute-experiment --manifest")
             }
+        }
+        Command::PrepareExperiment {
+            repository,
+            config,
+            observer_binary,
+            prepared_dir,
+            database,
+            report_dir,
+            seed,
+            payload_bytes,
+        } => {
+            let path = nemor_benchmark::performance::prepare_experiment_manifest(
+                &repository,
+                &config,
+                &observer_binary,
+                &prepared_dir,
+                &database,
+                &report_dir,
+                seed,
+                payload_bytes,
+            )?;
+            println!("manifest={}", path.display());
+        }
+        Command::ExecuteExperiment { manifest } => {
+            let outcome = nemor_benchmark::performance::execute_prepared_experiment(&manifest)?;
+            println!(
+                "experiment_id={} runs={} comparison={} capacity_gain_percent=not_evaluated",
+                outcome.plan.experiment_id,
+                outcome.runs.len(),
+                outcome.comparison.is_some()
+            );
+            return Ok(if outcome.comparison.is_some() { 0 } else { 1 });
         }
         Command::WorkerHold {
             bytes,

@@ -608,10 +608,12 @@ pub struct ObserverLaunch {
     pub binary_sha256: String,
     pub config_hash: String,
     pub warmup_ms: u64,
+    pub run_id: String,
+    pub runtime_max_usec: u64,
 }
 
 struct ObserverRuntime {
-    child: Child,
+    service: crate::observer_service::PerformanceObserverHandle,
     identity: crate::performance::ProcessIdentity,
     binary_sha256: String,
     config_hash: String,
@@ -641,11 +643,21 @@ impl Default for HarnessOptions {
 }
 
 pub fn run_live(options: &HarnessOptions) -> Result<(HarnessValidationReport, PathBuf)> {
+    run_live_with_provenance(options, None)
+}
+
+pub fn run_live_with_provenance(
+    options: &HarnessOptions,
+    frozen_provenance: Option<&BuildProvenance>,
+) -> Result<(HarnessValidationReport, PathBuf)> {
     let wall_start = Instant::now();
     let runner_ticks_start = process_cpu_ticks(std::process::id());
     let clk_tck = detect_clk_tck();
     let loaded = LoadedConfig::load(&options.config)?;
-    let provenance = BuildProvenance::capture()?;
+    let provenance = match frozen_provenance {
+        Some(provenance) => provenance.clone(),
+        None => BuildProvenance::capture()?,
+    };
     let run_id = format!("checkpoint2-{}", now_ns());
     let cgroup_mount = PathBuf::from("/sys/fs/cgroup");
     let mut backend = SystemdDbusBackend::system()?;
@@ -1614,30 +1626,27 @@ fn start_observer(
     if plan.measurement_ms < crate::performance::CHECKPOINT3A_MIN_MEASUREMENT_MS {
         bail!("owned observer is available only for Checkpoint 3A performance runs");
     }
-    let mut child = Command::new(&launch.binary)
-        .arg("--config")
-        .arg(&launch.config)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("cannot spawn exact owned nemord observer")?;
-    let pid = child.id();
     let started_monotonic_ns = now_ns();
-    let start_ticks = wait_process_identity(pid, Duration::from_secs(2))?;
+    let service = crate::observer_service::start_performance_observer(
+        &launch.run_id,
+        &launch.binary,
+        &launch.config,
+        &launch.binary_sha256,
+        &launch.config_hash,
+        launch.runtime_max_usec,
+    )?;
+    let pid = service.state.main_pid;
+    let start_ticks = service.state.start_ticks;
     let setup_cpu_start_ticks = process_cpu_ticks(pid).unwrap_or(0);
-    if let Some(status) = child.try_wait()? {
-        bail!("owned nemord exited during setup with {status}");
-    }
-    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
-    let outside_worker_scope = !cgroup.contains(worker_control_group);
+    let outside_worker_scope = service.state.control_group != worker_control_group;
     if !outside_worker_scope {
+        let _ = service.stop_and_cleanup();
         bail!("owned observer entered worker cgroup");
     }
     let measurement_cpu_start_ticks = process_cpu_ticks(pid).context("observer CPU unavailable")?;
     let (rss_samples, pss_samples) = process_memory(pid);
     Ok(ObserverRuntime {
-        child,
+        service,
         identity: crate::performance::ProcessIdentity { pid, start_ticks },
         binary_sha256: launch.binary_sha256.clone(),
         config_hash: launch.config_hash.clone(),
@@ -1658,31 +1667,14 @@ fn stop_observer(
     clk_tck: Option<u64>,
     profile: Option<&crate::performance::PerformanceProfile>,
 ) -> Result<Option<crate::performance::ObserverEvidence>> {
-    let Some(mut runtime) = runtime.take() else {
+    let Some(runtime) = runtime.take() else {
         return Ok(None);
     };
     if read_start_ticks(runtime.identity.pid) != Some(runtime.identity.start_ticks) {
         bail!("owned observer identity changed before cleanup");
     }
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(i32::try_from(runtime.identity.pid)?),
-        nix::sys::signal::Signal::SIGTERM,
-    )?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut status = None;
-    while Instant::now() < deadline {
-        if let Some(found) = runtime.child.try_wait()? {
-            status = Some(found);
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    if status.is_none()
-        && read_start_ticks(runtime.identity.pid) == Some(runtime.identity.start_ticks)
-    {
-        runtime.child.kill()?;
-        status = Some(runtime.child.wait()?);
-    }
+    runtime.service.verify_active()?;
+    runtime.service.stop_and_cleanup()?;
     let stopped_monotonic_ns = now_ns();
     let ticks_per_second = clk_tck.context("CLK_TCK unavailable for observer accounting")? as f64;
     let setup_cpu_seconds = runtime
@@ -1708,7 +1700,7 @@ fn stop_observer(
         measurement_started_monotonic_ns: runtime.measurement_started_monotonic_ns,
         measurement_ended_monotonic_ns: runtime.measurement_ended_monotonic_ns,
         stopped_monotonic_ns,
-        exit_status: status.and_then(|status| status.code()),
+        exit_status: Some(0),
         setup_wall_seconds: runtime
             .measurement_started_monotonic_ns
             .saturating_sub(runtime.started_monotonic_ns) as f64
@@ -1723,17 +1715,6 @@ fn stop_observer(
         outside_worker_scope: runtime.outside_worker_scope,
         isolated_storage_closed: true,
     }))
-}
-
-fn wait_process_identity(pid: u32, timeout: Duration) -> Result<u64> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(start_ticks) = read_start_ticks(pid) {
-            return Ok(start_ticks);
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    bail!("process identity did not become readable")
 }
 
 fn process_memory(pid: u32) -> (Vec<u64>, Vec<u64>) {
@@ -1913,6 +1894,10 @@ fn monitor(
         }
         samples.push(sample);
         if let Some(runtime) = observer.as_deref_mut() {
+            if runtime.service.verify_active().is_err() {
+                watchdog.reason = Some("owned_observer_service_identity_changed".into());
+                break;
+            }
             if read_start_ticks(runtime.identity.pid) != Some(runtime.identity.start_ticks) {
                 watchdog.reason = Some("owned_observer_identity_stale".into());
                 break;

@@ -282,10 +282,19 @@ and the comparison. Percent changes use the baseline arithmetic mean as
 denominator and positive means observe is higher; no significance is claimed
 from three repetitions.
 
-Checkpoint 3A-P is validated. Checkpoint 3A remains pending its real baseline
-versus observe A/B performance experiment. Capacity, maximum sustainable
+Checkpoint 3A-P is validated and the 3A execution bridge reuses its transient
+observer-service lifecycle. Checkpoint 3A remains pending its real baseline
+versus observe A/B performance experiment. Preparation is unprivileged and
+freezes an integrity-bound manifest; privileged execution consumes only that
+manifest. Capacity, maximum sustainable
 load, `capacity_gain_percent`, gaming, OOM avoidance, incompressible
 regression and overall Phase 10 acceptance remain `not_evaluated`.
+
+The execution bridge is explicit: an unprivileged `prepare-experiment` command
+freezes the release identities, environment, six-run seeded order, profile,
+property contract and output destinations. Privileged execution uses only
+`execute-experiment --manifest`; the legacy `experiment --execute` path is
+retired. No Git or shell inspection is performed during privileged execution.
 
 ### Checkpoint 3A-P DynamicUser observer boundary
 

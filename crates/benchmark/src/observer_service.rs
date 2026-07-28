@@ -25,6 +25,7 @@ const OBSERVER_PREFIX: &str = "nemor-benchmark-observer-";
 const RUNTIME_BASE: &str = "/run";
 const PRODUCTION_DATABASE: &str = "/var/lib/nemor/nemor.db";
 const SERVICE_RUNTIME_MAX_USEC: u64 = 20_000_000;
+pub const PERFORMANCE_SERVICE_RUNTIME_MAX_USEC: u64 = 60_000_000;
 const SERVICE_TIMEOUT_USEC: u64 = 5_000_000;
 const VALIDATION_WINDOW: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -365,6 +366,15 @@ fn readback_contract(property: &str) -> Result<(&'static str, &'static str)> {
 
 impl ObserverServicePlan {
     pub fn new(run_id: &str, binary: PathBuf, config: PathBuf) -> Result<Self> {
+        Self::new_with_runtime(run_id, binary, config, SERVICE_RUNTIME_MAX_USEC)
+    }
+
+    pub fn new_with_runtime(
+        run_id: &str,
+        binary: PathBuf,
+        config: PathBuf,
+        runtime_max_usec: u64,
+    ) -> Result<Self> {
         let suffix: String = run_id
             .chars()
             .filter(char::is_ascii_alphanumeric)
@@ -389,7 +399,7 @@ impl ObserverServicePlan {
                 .join(&runtime_directory)
                 .join("nemor-observer.sqlite"),
             runtime_directory,
-            runtime_max_usec: SERVICE_RUNTIME_MAX_USEC,
+            runtime_max_usec,
             timeout_start_usec: SERVICE_TIMEOUT_USEC,
             timeout_stop_usec: SERVICE_TIMEOUT_USEC,
         };
@@ -434,7 +444,8 @@ impl ObserverServicePlan {
         if self.runtime_directory.contains('/') || self.runtime_directory.contains("..") {
             bail!("invalid observer RuntimeDirectory basename");
         }
-        if self.runtime_max_usec > SERVICE_RUNTIME_MAX_USEC
+        if self.runtime_max_usec == 0
+            || self.runtime_max_usec > PERFORMANCE_SERVICE_RUNTIME_MAX_USEC
             || self.timeout_start_usec > SERVICE_TIMEOUT_USEC
             || self.timeout_stop_usec > SERVICE_TIMEOUT_USEC
         {
@@ -1418,6 +1429,128 @@ pub struct ObserverServiceStart {
     pub settling: ExecIdentitySettlingEvidence,
 }
 
+/// Runtime handle used by Checkpoint 3A. This deliberately shares the same
+/// systemd backend, identity settling, declared-contract verification, and
+/// readiness boundary as the privileged 3A-P validator.
+pub struct PerformanceObserverHandle {
+    pub backend: SystemdObserverServiceBackend,
+    pub plan: ObserverServicePlan,
+    pub state: ObserverServiceState,
+    pub settling: ExecIdentitySettlingEvidence,
+    pub staged: StagedObserverInputs,
+    pub source_sha256: String,
+    pub config_sha256: String,
+    pub setup_wall_seconds: f64,
+}
+
+pub fn start_performance_observer(
+    run_id: &str,
+    source_observer: &Path,
+    config: &Path,
+    expected_source_sha256: &str,
+    expected_config_sha256: &str,
+    runtime_max_usec: u64,
+) -> Result<PerformanceObserverHandle> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("performance observer service requires privileged execution");
+    }
+    let source_uid = fs::symlink_metadata(source_observer)?.uid();
+    let source =
+        read_verified_source_observer(source_observer, source_uid, Some(expected_source_sha256))?;
+    let config_bytes = read_verified_prepared_bytes(
+        config,
+        fs::symlink_metadata(config)?.uid(),
+        MAX_PREPARED_CONFIG_BYTES,
+        expected_config_sha256,
+    )?;
+    let staged_binary_path = staged_observer_path(run_id)?;
+    let staged_config_path = staged_config_path(run_id)?;
+    let staged = {
+        stage_verified_bytes(
+            &staged_binary_path,
+            &source.bytes,
+            0o755,
+            0,
+            expected_source_sha256,
+        )?;
+        if let Err(error) = stage_verified_bytes(
+            &staged_config_path,
+            &config_bytes,
+            0o644,
+            0,
+            expected_config_sha256,
+        ) {
+            let _ = remove_staged_input(
+                &staged_binary_path,
+                STAGED_BINARY_PREFIX,
+                0,
+                0o755,
+                expected_source_sha256,
+            );
+            return Err(error);
+        }
+        StagedObserverInputs {
+            binary: staged_binary_path,
+            config: staged_config_path,
+        }
+    };
+    let plan = ObserverServicePlan::new_with_runtime(
+        run_id,
+        staged.binary.clone(),
+        staged.config.clone(),
+        runtime_max_usec,
+    )?;
+    let mut backend = SystemdObserverServiceBackend::system()?;
+    backend.preflight()?;
+    let setup = Instant::now();
+    let started = match backend.start(&plan, expected_source_sha256) {
+        Ok(started) => started,
+        Err(error) => {
+            let _ = staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
+            return Err(error);
+        }
+    };
+    if let Err(error) = started.state.verify_declared(&plan, expected_source_sha256) {
+        let _ = backend.stop(&plan);
+        let _ = backend.wait_absent(&plan);
+        let _ = staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
+        return Err(error);
+    }
+    if let Err(error) = wait_ready(&plan.database, &backend, &plan, &started.state) {
+        let _ = backend.stop(&plan);
+        let _ = backend.wait_absent(&plan);
+        let _ = staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
+        return Err(error);
+    }
+    Ok(PerformanceObserverHandle {
+        backend,
+        plan,
+        state: started.state,
+        settling: started.settling,
+        staged,
+        source_sha256: expected_source_sha256.into(),
+        config_sha256: expected_config_sha256.into(),
+        setup_wall_seconds: setup.elapsed().as_secs_f64(),
+    })
+}
+
+impl PerformanceObserverHandle {
+    pub fn verify_active(&self) -> Result<()> {
+        self.backend.verify_active(&self.plan, &self.state)
+    }
+
+    pub fn stop_and_cleanup(mut self) -> Result<()> {
+        self.backend.stop(&self.plan)?;
+        self.backend.wait_absent(&self.plan)?;
+        let (binary, config) = self
+            .staged
+            .cleanup_paths(&self.source_sha256, &self.config_sha256);
+        binary?;
+        config?;
+        Ok(())
+    }
+}
+
 pub trait ObserverServiceBackend {
     fn preflight(&self) -> Result<()>;
     fn unit_exists(&self, unit_name: &str) -> Result<bool>;
@@ -2146,7 +2279,7 @@ fn replace_durable_audit_report(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-struct StagedObserverInputs {
+pub struct StagedObserverInputs {
     binary: PathBuf,
     config: PathBuf,
 }
@@ -2171,7 +2304,21 @@ impl StagedObserverInputs {
     }
 }
 
-fn stage_root_owned_inputs(manifest: &IntegrityBoundManifest) -> Result<StagedObserverInputs> {
+impl StagedObserverInputs {
+    pub fn cleanup_paths(
+        self,
+        binary_sha256: &str,
+        config_sha256: &str,
+    ) -> (Result<()>, Result<()>) {
+        let config =
+            remove_staged_input(&self.config, STAGED_CONFIG_PREFIX, 0, 0o644, config_sha256);
+        let binary =
+            remove_staged_input(&self.binary, STAGED_BINARY_PREFIX, 0, 0o755, binary_sha256);
+        (config, binary)
+    }
+}
+
+pub fn stage_root_owned_inputs(manifest: &IntegrityBoundManifest) -> Result<StagedObserverInputs> {
     let source = read_verified_source_observer(
         &manifest.payload.source_observer_path,
         manifest.payload.created_uid,

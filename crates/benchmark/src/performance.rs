@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -182,6 +183,244 @@ pub struct ExperimentInputs<'a> {
     pub observer_binary_path: &'a Path,
 }
 
+pub const PREPARED_EXPERIMENT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedExperimentPayload {
+    pub schema_version: u32,
+    pub experiment_id: String,
+    pub evidence_kind: EvidenceKind,
+    pub comparison_purpose: ComparisonPurpose,
+    pub performance_claim_eligible: bool,
+    pub preparing_uid: u32,
+    pub preparing_gid: u32,
+    pub repository: PathBuf,
+    pub config_path: PathBuf,
+    pub runner_path: PathBuf,
+    pub observer_path: PathBuf,
+    pub database_path: PathBuf,
+    pub report_dir: PathBuf,
+    pub observer_property_contract_version: u32,
+    pub observer_service_plans: Vec<crate::observer_service::ObserverServicePlan>,
+    pub plan: ExperimentPlan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedExperimentManifest {
+    pub payload: PreparedExperimentPayload,
+    pub payload_sha256: String,
+}
+
+impl PreparedExperimentManifest {
+    pub fn verify(&self, path: &Path) -> Result<()> {
+        if self.payload.schema_version != PREPARED_EXPERIMENT_SCHEMA_VERSION
+            || self.payload.observer_property_contract_version
+                != crate::observer_service::OBSERVER_PROPERTY_CONTRACT_VERSION
+        {
+            bail!("unsupported Checkpoint 3A prepared experiment manifest")
+        }
+        let bytes = serde_json::to_vec(&self.payload)?;
+        let hash = hex::encode(Sha256::digest(bytes));
+        if hash != self.payload_sha256 {
+            bail!("prepared experiment manifest integrity mismatch")
+        }
+        if !path.is_absolute() || !path.is_file() || path.is_symlink() {
+            bail!("prepared experiment manifest must be a regular absolute file")
+        }
+        self.payload.plan.profile.validate()?;
+        if !self.payload.config_path.is_absolute()
+            || !self.payload.runner_path.is_absolute()
+            || !self.payload.observer_path.is_absolute()
+            || !self.payload.database_path.is_absolute()
+            || !self.payload.report_dir.is_absolute()
+        {
+            bail!("prepared experiment paths must be absolute")
+        }
+        for path in [
+            &self.payload.config_path,
+            &self.payload.runner_path,
+            &self.payload.observer_path,
+        ] {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.nlink() == 0 {
+                bail!("prepared experiment input is not a regular file")
+            }
+        }
+        if hex::encode(Sha256::digest(fs::read(&self.payload.config_path)?))
+            != self.payload.plan.config_hash
+            || hex::encode(Sha256::digest(fs::read(&self.payload.runner_path)?))
+                != self.payload.plan.benchmark_binary.sha256
+            || hex::encode(Sha256::digest(fs::read(&self.payload.observer_path)?))
+                != self.payload.plan.observer_binary.sha256
+        {
+            bail!("prepared experiment input hash differs from frozen identity")
+        }
+        if self.payload.plan.benchmark_binary.embedded_git_head
+            != self.payload.plan.provenance.git_head
+            || self.payload.plan.observer_binary.embedded_git_head
+                != self.payload.plan.provenance.git_head
+        {
+            bail!("prepared experiment embedded commit identity mismatch")
+        }
+        if self.payload.observer_service_plans.len()
+            != self
+                .payload
+                .plan
+                .randomized_order
+                .iter()
+                .filter(|run| run.variant == BenchmarkVariant::NemorObserve)
+                .count()
+        {
+            bail!("prepared observer service plan count does not match observe repetitions")
+        }
+        for service_plan in &self.payload.observer_service_plans {
+            service_plan.validate()?;
+            if service_plan.runtime_max_usec <= 20_000_000 {
+                bail!("performance observer service plan retained validation-only RuntimeMax")
+            }
+        }
+        if self.payload.plan.evidence_kind != EvidenceKind::PerformanceBenchmark
+            || self.payload.plan.comparison_purpose != ComparisonPurpose::ObserverOverhead
+            || self.payload.plan.variants
+                != [
+                    BenchmarkVariant::CachyosBaseline,
+                    BenchmarkVariant::NemorObserve,
+                ]
+        {
+            bail!("prepared experiment does not match Checkpoint 3A observer-overhead contract")
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_experiment_manifest(
+    repository: &Path,
+    config: &Path,
+    observer_binary: &Path,
+    destination: &Path,
+    database: &Path,
+    report_dir: &Path,
+    seed: u64,
+    payload_bytes: u64,
+) -> Result<PathBuf> {
+    if nix::unistd::geteuid().is_root() {
+        bail!("Checkpoint 3A preparation must run unprivileged")
+    }
+    let repository = repository.canonicalize()?;
+    if std::env::current_dir()?.canonicalize()? != repository || !repository.join(".git").exists() {
+        bail!("preparation repository root is not the explicit current repository")
+    }
+    let config = config.canonicalize()?;
+    let observer_binary = observer_binary.canonicalize()?;
+    if destination.exists() {
+        bail!("prepared experiment directory already exists; refusing reuse")
+    }
+    let loaded = common::LoadedConfig::load(&config)?;
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let variants = [
+        BenchmarkVariant::CachyosBaseline,
+        BenchmarkVariant::NemorObserve,
+    ];
+    let inputs = ExperimentInputs {
+        scenario: CHECKPOINT3A_SCENARIO,
+        variants: &variants,
+        repetitions: 3,
+        seed,
+        payload_bytes,
+        config_hash: &loaded.sha256,
+        benchmark_binary_path: &executable,
+        observer_binary_path: &observer_binary,
+    };
+    let plan = plan_experiment(&inputs)?;
+    let observer_service_plans = plan
+        .randomized_order
+        .iter()
+        .filter(|run| run.variant == BenchmarkVariant::NemorObserve)
+        .map(|run| {
+            let run_id = format!("{}-run-{}", plan.experiment_id, run.order_index);
+            let suffix: String = run_id
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .take(32)
+                .collect();
+            crate::observer_service::ObserverServicePlan::new_with_runtime(
+                &run_id,
+                PathBuf::from(format!("/run/nemor-benchmark-observer-bin-{suffix}")),
+                PathBuf::from(format!(
+                    "/run/nemor-benchmark-observer-config-{suffix}.toml"
+                )),
+                performance_runtime_max_usec(&plan.profile),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    fs::create_dir(destination)?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o755))?;
+    let payload = PreparedExperimentPayload {
+        schema_version: PREPARED_EXPERIMENT_SCHEMA_VERSION,
+        experiment_id: plan.experiment_id.clone(),
+        evidence_kind: EvidenceKind::PerformanceBenchmark,
+        comparison_purpose: ComparisonPurpose::ObserverOverhead,
+        performance_claim_eligible: plan.performance_claim_eligible,
+        preparing_uid: nix::unistd::getuid().as_raw(),
+        preparing_gid: nix::unistd::getgid().as_raw(),
+        repository,
+        config_path: config,
+        runner_path: executable,
+        observer_path: observer_binary,
+        database_path: database.to_path_buf(),
+        report_dir: report_dir.to_path_buf(),
+        observer_property_contract_version:
+            crate::observer_service::OBSERVER_PROPERTY_CONTRACT_VERSION,
+        observer_service_plans,
+        plan,
+    };
+    let payload_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&payload)?));
+    let manifest = PreparedExperimentManifest {
+        payload,
+        payload_sha256,
+    };
+    let path = destination.join("experiment.manifest.json");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    drop(file);
+    fs::write(&path, serde_json::to_vec_pretty(&manifest)?)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+    Ok(path)
+}
+
+pub fn execute_prepared_experiment(manifest_path: &Path) -> Result<ExperimentOutcome> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("Checkpoint 3A execution requires privileged execution")
+    }
+    let manifest: PreparedExperimentManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
+    manifest.verify(manifest_path)?;
+    let payload = &manifest.payload;
+    if payload.database_path.exists() {
+        bail!("prepared experiment database already exists; refusing evidence overwrite")
+    }
+    if hex::encode(Sha256::digest(fs::read(&payload.config_path)?)) != payload.plan.config_hash {
+        bail!("prepared experiment config changed")
+    }
+    let mut backend = LiveCheckpoint3aBackend {
+        config: payload.config_path.clone(),
+        report_dir: payload.report_dir.clone(),
+        observer_binary: payload.observer_path.clone(),
+    };
+    let mut outcome = execute_planned_experiment(payload.plan.clone(), &mut backend)?;
+    outcome.comparison =
+        compare_observer_overhead(&outcome.runs, &comparison_metric_inputs(&outcome.runs)).ok();
+    persist_experiment(
+        &payload.database_path,
+        include_str!("../../../migrations/0008_benchmark.sql"),
+        include_str!("../../../migrations/0009_benchmark_performance.sql"),
+        &outcome,
+    )?;
+    Ok(outcome)
+}
+
 pub fn plan_experiment(inputs: &ExperimentInputs<'_>) -> Result<ExperimentPlan> {
     if inputs.scenario != CHECKPOINT3A_SCENARIO {
         bail!("Checkpoint 3A supports only synthetic_compressible");
@@ -272,8 +511,22 @@ pub fn require_live_eligibility(plan: &ExperimentPlan) -> Result<()> {
 }
 
 pub fn require_validated_observer_service_boundary() -> Result<()> {
-    bail!(
-        "Checkpoint 3A execution remains blocked until the transient DynamicUser observer service boundary is live validated"
+    if crate::observer_service::OBSERVER_PROPERTY_CONTRACT_VERSION != 2 {
+        bail!("unsupported validated observer service contract version")
+    }
+    Ok(())
+}
+
+pub fn performance_runtime_max_usec(profile: &PerformanceProfile) -> u64 {
+    let lifecycle_ms = profile
+        .pre_measurement_hold_ms
+        .saturating_add(profile.stabilization_ms)
+        .saturating_add(profile.measurement_ms)
+        .saturating_add(profile.cooldown_ms)
+        .saturating_add(10_000);
+    lifecycle_ms.saturating_mul(1_000).clamp(
+        crate::observer_service::PERFORMANCE_SERVICE_RUNTIME_MAX_USEC / 2,
+        crate::observer_service::PERFORMANCE_SERVICE_RUNTIME_MAX_USEC,
     )
 }
 
@@ -661,6 +914,8 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
                 binary_sha256: plan.observer_binary.sha256.clone(),
                 config_hash,
                 warmup_ms: plan.profile.observer_warmup_ms,
+                run_id: format!("{}-run-{}", plan.experiment_id, planned.order_index),
+                runtime_max_usec: performance_runtime_max_usec(&plan.profile),
             })
         } else {
             None
@@ -675,7 +930,8 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
             observer,
             worker_seed: planned.run_seed,
         };
-        let (report, _) = crate::harness::run_live(&options)?;
+        let (report, _) =
+            crate::harness::run_live_with_provenance(&options, Some(&plan.provenance))?;
         let deltas = report
             .samples
             .first()
