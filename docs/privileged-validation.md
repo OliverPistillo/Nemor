@@ -344,6 +344,12 @@ preflight before authorization, exact transaction/output roles, and execution
 via `sudo` by the preparing user identity. Phase 6 zswap+NVMe boot
 validation remains pending on dedicated hardware.
 
+Checkpoint 3A Experiment 1 execution attempt 1 was rejected before run 0 due
+to privilege-sensitive environment fingerprinting. The performance path now
+freezes and compares a versioned material environment contract without reading
+repository `.git` state under privilege; the full observational snapshot is
+retained separately.
+
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
 worker/unit/cgroup final absence, structural restore and full host restore.

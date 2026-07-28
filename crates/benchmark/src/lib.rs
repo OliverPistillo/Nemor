@@ -16,6 +16,7 @@ pub mod performance;
 pub mod systemd;
 
 pub const BENCHMARK_SCHEMA_VERSION: u32 = 1;
+pub const MATERIAL_ENVIRONMENT_SCHEMA_VERSION: u32 = 1;
 pub const MIN_REPETITIONS: usize = 3;
 pub const DEFAULT_MAX_SAMPLES: usize = 4_096;
 pub const SMOKE_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -1152,8 +1153,41 @@ pub struct EnvironmentFingerprint {
     pub thermal_state_unverified: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaterialEnvironmentFingerprint {
+    pub schema_version: u32,
+    pub config_hash: String,
+    pub kernel_release: String,
+    pub distro_id: String,
+    pub distro_version: String,
+    pub cpu_model: String,
+    pub logical_cpus: usize,
+    pub total_ram_bytes: u64,
+    pub swap_topology: Vec<String>,
+    pub zram_inventory: Vec<String>,
+    pub zswap_state: String,
+    pub root_filesystem: String,
+    pub storage_class: String,
+    pub gpu_identity: Option<String>,
+    pub cgroup_v2: bool,
+    pub psi: bool,
+    pub damon: bool,
+    pub ksm: bool,
+    pub ksm_run: Option<u64>,
+    pub cpu_governor: Option<String>,
+    pub power_profile: Option<String>,
+}
+
 impl EnvironmentFingerprint {
     pub fn capture(config_hash: &str) -> Result<Self> {
+        Self::capture_with_commit(config_hash, None)
+    }
+
+    pub fn capture_for_performance(config_hash: &str, frozen_commit: &str) -> Result<Self> {
+        Self::capture_with_commit(config_hash, Some(frozen_commit))
+    }
+
+    fn capture_with_commit(config_hash: &str, frozen_commit: Option<&str>) -> Result<Self> {
         let os = parse_os_release(&fs::read_to_string("/etc/os-release").unwrap_or_default());
         let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
         let cpu_model = cpuinfo
@@ -1191,7 +1225,10 @@ impl EnvironmentFingerprint {
             }
         }
         zram_inventory.sort();
-        let commit = read_git_head(Path::new(".")).unwrap_or_else(|| "unknown".into());
+        let commit = frozen_commit
+            .map(str::to_owned)
+            .or_else(|| read_git_head(Path::new(".")))
+            .unwrap_or_else(|| "unknown".into());
         let ksm_run = fs::read_to_string("/sys/kernel/mm/ksm/run")
             .ok()
             .and_then(|v| v.trim().parse().ok());
@@ -1247,15 +1284,80 @@ impl EnvironmentFingerprint {
         Ok(hex::encode(Sha256::digest(bytes)))
     }
 
+    pub fn material(&self) -> MaterialEnvironmentFingerprint {
+        MaterialEnvironmentFingerprint {
+            schema_version: MATERIAL_ENVIRONMENT_SCHEMA_VERSION,
+            config_hash: self.config_hash.clone(),
+            kernel_release: self.kernel_release.clone(),
+            distro_id: self.distro_id.clone(),
+            distro_version: self.distro_version.clone(),
+            cpu_model: self.cpu_model.clone(),
+            logical_cpus: self.logical_cpus,
+            total_ram_bytes: self.total_ram_bytes,
+            swap_topology: self.swap_topology.clone(),
+            zram_inventory: self.zram_inventory.clone(),
+            zswap_state: self.zswap_state.clone(),
+            root_filesystem: self.root_filesystem.clone(),
+            storage_class: self.storage_class.clone(),
+            gpu_identity: self.gpu_identity.clone(),
+            cgroup_v2: self.cgroup_v2,
+            psi: self.psi,
+            damon: self.damon,
+            ksm: self.ksm,
+            ksm_run: self.ksm_run,
+            cpu_governor: self.cpu_governor.clone(),
+            power_profile: self.power_profile.clone(),
+        }
+    }
+
+    pub fn material_hash(&self) -> Result<String> {
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+            &self.material(),
+        )?)))
+    }
+
+    pub fn material_diff(&self, other: &Self) -> Result<Vec<String>> {
+        let left = self.material();
+        let right = other.material();
+        let mut differences = Vec::new();
+        macro_rules! compare {
+            ($field:ident) => {
+                if left.$field != right.$field {
+                    differences.push(stringify!($field).to_owned());
+                }
+            };
+        }
+        compare!(schema_version);
+        compare!(config_hash);
+        compare!(kernel_release);
+        compare!(distro_id);
+        compare!(distro_version);
+        compare!(cpu_model);
+        compare!(logical_cpus);
+        compare!(total_ram_bytes);
+        compare!(swap_topology);
+        compare!(zram_inventory);
+        compare!(zswap_state);
+        compare!(root_filesystem);
+        compare!(storage_class);
+        compare!(gpu_identity);
+        compare!(cgroup_v2);
+        compare!(psi);
+        compare!(damon);
+        compare!(ksm);
+        compare!(ksm_run);
+        compare!(cpu_governor);
+        compare!(power_profile);
+        Ok(differences)
+    }
+
     pub fn comparable_with(&self, other: &Self) -> Result<()> {
-        if self.kernel_release != other.kernel_release {
-            bail!("kernel mismatch");
-        }
-        if self.config_hash != other.config_hash {
-            bail!("configuration hash mismatch");
-        }
-        if self.cpu_model != other.cpu_model || self.total_ram_bytes != other.total_ram_bytes {
-            bail!("material host fingerprint mismatch");
+        let differences = self.material_diff(other)?;
+        if !differences.is_empty() {
+            bail!(
+                "material host fingerprint mismatch: {}",
+                differences.join(", ")
+            );
         }
         Ok(())
     }
@@ -1325,12 +1427,12 @@ fn has_energy_counter(root: &str) -> bool {
         .flatten()
         .any(|entry| {
             let path = entry.path();
-            fs::read_to_string(path.join("energy_uj")).is_ok()
+            path.join("energy_uj").exists()
                 || fs::read_dir(path)
                     .into_iter()
                     .flatten()
                     .flatten()
-                    .any(|child| fs::read_to_string(child.path().join("energy_uj")).is_ok())
+                    .any(|child| child.path().join("energy_uj").exists())
         })
 }
 

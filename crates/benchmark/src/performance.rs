@@ -3,7 +3,7 @@ use crate::observer_service::ObserverServiceBackend;
 use crate::{
     deterministic_order, run_relative_counter_deltas, summarize, BenchmarkVariant, BuildProvenance,
     EnvironmentFingerprint, EvaluationState, EvidenceKind, StructuralSnapshot, SummaryStatistics,
-    BENCHMARK_SCHEMA_VERSION, MIN_REPETITIONS,
+    BENCHMARK_SCHEMA_VERSION, MATERIAL_ENVIRONMENT_SCHEMA_VERSION, MIN_REPETITIONS,
 };
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
@@ -149,6 +149,8 @@ pub struct ExperimentPlan {
     pub config_hash: String,
     pub environment: EnvironmentFingerprint,
     pub environment_hash: String,
+    pub material_environment_schema_version: u32,
+    pub material_environment_hash: String,
     pub thermal_state_unverified: bool,
     pub performance_claim_eligible: bool,
     pub capacity_gain_percent: EvaluationState,
@@ -185,7 +187,7 @@ pub struct ExperimentInputs<'a> {
     pub observer_binary_path: &'a Path,
 }
 
-pub const PREPARED_EXPERIMENT_SCHEMA_VERSION: u32 = 1;
+pub const PREPARED_EXPERIMENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedExperimentPayload {
@@ -516,6 +518,11 @@ impl PreparedExperimentManifest {
             bail!("prepared experiment does not match Checkpoint 3A observer-overhead contract")
         }
         require_live_eligibility(&self.payload.plan)?;
+        if self.payload.plan.material_environment_schema_version
+            != MATERIAL_ENVIRONMENT_SCHEMA_VERSION
+        {
+            bail!("unsupported material environment contract version")
+        }
         Ok(())
     }
 }
@@ -645,7 +652,9 @@ pub fn execute_prepared_experiment(manifest_path: &Path) -> Result<ExperimentOut
     if !nix::unistd::geteuid().is_root() {
         bail!("Checkpoint 3A execution requires privileged execution")
     }
-    let manifest: PreparedExperimentManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
+    let manifest_bytes = fs::read(manifest_path)?;
+    let manifest_file_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+    let manifest: PreparedExperimentManifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.verify(manifest_path)?;
     let payload = &manifest.payload;
     let sudo_uid = std::env::var("SUDO_UID")
@@ -694,16 +703,12 @@ pub fn execute_prepared_experiment(manifest_path: &Path) -> Result<ExperimentOut
         include_str!("../../../migrations/0009_benchmark_performance.sql"),
         &outcome,
     )?;
-    let report_bytes = serde_json::to_vec_pretty(&serde_json::json!({
-        "manifest_sha256": manifest.payload_sha256,
-        "plan": &outcome.plan,
-        "runs": &outcome.runs,
-        "aborted_after_order": outcome.aborted_after_order,
-        "comparison": &outcome.comparison,
-        "capacity_gain_percent": "not_evaluated",
-        "performance_claim_eligible": payload.performance_claim_eligible,
-        "execution_error": outcome.execution_error
-    }))?;
+    let report_bytes = canonical_experiment_report(
+        &manifest_file_sha256,
+        &manifest.payload_sha256,
+        &outcome,
+        payload.performance_claim_eligible,
+    )?;
     let mut report_file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -715,13 +720,35 @@ pub fn execute_prepared_experiment(manifest_path: &Path) -> Result<ExperimentOut
     Ok(outcome)
 }
 
+pub(crate) fn canonical_experiment_report(
+    manifest_file_sha256: &str,
+    manifest_payload_sha256: &str,
+    outcome: &ExperimentOutcome,
+    performance_claim_eligible: bool,
+) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(&serde_json::json!({
+        "manifest_file_sha256": manifest_file_sha256,
+        "manifest_payload_sha256": manifest_payload_sha256,
+        "plan": &outcome.plan,
+        "runs": &outcome.runs,
+        "aborted_after_order": outcome.aborted_after_order,
+        "comparison": &outcome.comparison,
+        "capacity_gain_percent": "not_evaluated",
+        "performance_claim_eligible": performance_claim_eligible,
+        "execution_error": outcome.execution_error
+    }))?)
+}
+
 pub fn preflight_prepared_experiment(manifest_path: &Path) -> Result<serde_json::Value> {
     let bytes = fs::read(manifest_path)?;
     let manifest: PreparedExperimentManifest = serde_json::from_slice(&bytes)?;
     manifest.verify(manifest_path)?;
     let payload = &manifest.payload;
-    let environment = EnvironmentFingerprint::capture(&payload.plan.config_hash)?;
-    let environment_match = environment.hash()? == payload.plan.environment_hash;
+    let environment = EnvironmentFingerprint::capture_for_performance(
+        &payload.plan.config_hash,
+        &payload.plan.provenance.git_head,
+    )?;
+    let environment_match = environment.material_hash()? == payload.plan.material_environment_hash;
     let foreign = detect_nemord_processes(&payload.observer_path, None);
     let foreign_nemord_clear = reject_foreign_nemord(&foreign, None).is_ok();
     let observer_contract_supported =
@@ -820,8 +847,10 @@ pub fn plan_experiment(inputs: &ExperimentInputs<'_>) -> Result<ExperimentPlan> 
         &provenance.source_state_id,
         &provenance.git_head,
     )?;
-    let environment = EnvironmentFingerprint::capture(inputs.config_hash)?;
+    let environment =
+        EnvironmentFingerprint::capture_for_performance(inputs.config_hash, &provenance.git_head)?;
     let environment_hash = environment.hash()?;
+    let material_environment_hash = environment.material_hash()?;
     let randomized_order = deterministic_order(inputs.variants, inputs.repetitions, inputs.seed)
         .into_iter()
         .enumerate()
@@ -857,6 +886,8 @@ pub fn plan_experiment(inputs: &ExperimentInputs<'_>) -> Result<ExperimentPlan> 
         thermal_state_unverified: environment.thermal_state_unverified,
         environment,
         environment_hash,
+        material_environment_schema_version: MATERIAL_ENVIRONMENT_SCHEMA_VERSION,
+        material_environment_hash,
         performance_claim_eligible,
         capacity_gain_percent: EvaluationState::NotEvaluated,
     })
@@ -1298,9 +1329,16 @@ impl LiveCheckpoint3aBackend {
 
 impl ExperimentRunBackend for LiveCheckpoint3aBackend {
     fn preflight_run(&mut self, plan: &ExperimentPlan, _planned: &PlannedRun) -> Result<()> {
-        let environment = EnvironmentFingerprint::capture(&plan.config_hash)?;
-        if environment.hash()? != plan.environment_hash {
-            bail!("material environment changed before repetition");
+        let environment = EnvironmentFingerprint::capture_for_performance(
+            &plan.config_hash,
+            &plan.provenance.git_head,
+        )?;
+        if environment.material_hash()? != plan.material_environment_hash {
+            let differences = plan
+                .environment
+                .material_diff(&environment)
+                .unwrap_or_default();
+            bail!("material_environment_mismatch: {}", differences.join(", "));
         }
         let detected = detect_nemord_processes(&self.observer_binary, None);
         reject_foreign_nemord(&detected, None)
@@ -1394,7 +1432,7 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
                     .failure_class
                     .as_deref()
                     .is_some_and(|class| class == "safety_failure" || class == "cleanup_failure"),
-            environment_hash: plan.environment_hash.clone(),
+            environment_hash: plan.material_environment_hash.clone(),
             benchmark_binary_sha256: plan.benchmark_binary.sha256.clone(),
             observer_binary_sha256: observer
                 .as_ref()
@@ -1750,7 +1788,7 @@ pub fn persist_experiment(
             outcome.plan.scenario_version,
             outcome.plan.experiment_seed as i64,
             outcome.plan.repetitions as i64,
-            outcome.plan.environment_hash,
+            outcome.plan.material_environment_hash,
             outcome.plan.provenance.git_head,
             outcome.plan.config_hash,
             outcome.plan.provenance.source_state_id,
@@ -1792,7 +1830,7 @@ pub fn persist_experiment(
                 actual.is_some_and(|run| run.valid),
                 actual.and_then(|run| run.invalid_reason.clone()),
                 outcome.plan.profile.logical_payload_bytes as i64,
-                outcome.plan.environment_hash,
+                outcome.plan.material_environment_hash,
                 if planned.variant == BenchmarkVariant::NemorObserve {
                     "owned observe telemetry process only"
                 } else {

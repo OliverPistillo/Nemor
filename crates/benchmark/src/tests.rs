@@ -497,6 +497,76 @@ fn environment_hash_is_stable_for_fixture() {
 }
 
 #[test]
+fn material_environment_ignores_energy_provider_observability() {
+    let mut user = fixture_environment();
+    let mut root = user.clone();
+    root.energy_provider = Some("powercap".into());
+    assert_ne!(user.hash().unwrap(), root.hash().unwrap());
+    assert_eq!(user.material_hash().unwrap(), root.material_hash().unwrap());
+    assert!(user.material_diff(&root).unwrap().is_empty());
+    user.kernel_release = "changed".into();
+    assert!(user.material_hash().unwrap() != root.material_hash().unwrap());
+    assert!(user
+        .material_diff(&root)
+        .unwrap()
+        .contains(&"kernel_release".into()));
+}
+
+#[test]
+fn material_environment_detects_core_host_changes() {
+    let base = fixture_environment();
+    type Mutation = Box<dyn Fn(&mut EnvironmentFingerprint)>;
+    let mutations: Vec<Mutation> = vec![
+        Box::new(|env| env.cpu_governor = Some("performance".into())),
+        Box::new(|env| env.ksm_run = Some(1)),
+        Box::new(|env| env.zswap_state = "Y".into()),
+        Box::new(|env| env.swap_topology = vec!["zram".into()]),
+        Box::new(|env| env.config_hash = "changed".into()),
+    ];
+    for mutate in mutations {
+        let mut changed = base.clone();
+        mutate(&mut changed);
+        assert!(!base.material_diff(&changed).unwrap().is_empty());
+        assert_ne!(
+            base.material_hash().unwrap(),
+            changed.material_hash().unwrap()
+        );
+    }
+}
+
+#[test]
+fn performance_environment_capture_uses_frozen_identity_without_git() {
+    let captured = EnvironmentFingerprint::capture_for_performance("cfg", "frozen-commit").unwrap();
+    assert_eq!(captured.nemor_commit, "frozen-commit");
+}
+
+#[test]
+fn canonical_report_distinguishes_manifest_file_and_payload_hashes() {
+    let outcome = ExperimentOutcome {
+        plan: checkpoint3a_fixture_plan(),
+        runs: Vec::new(),
+        aborted_after_order: Some(0),
+        comparison: None,
+        capacity_gain_percent: EvaluationState::NotEvaluated,
+        execution_error: Some("material_environment_mismatch".into()),
+    };
+    let bytes = crate::performance::canonical_experiment_report(
+        "file-hash",
+        "payload-hash",
+        &outcome,
+        true,
+    )
+    .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report["manifest_file_sha256"], "file-hash");
+    assert_eq!(report["manifest_payload_sha256"], "payload-hash");
+    assert_ne!(
+        report["manifest_file_sha256"],
+        report["manifest_payload_sha256"]
+    );
+}
+
+#[test]
 fn fingerprint_has_no_sensitive_identifier_fields() {
     let json = serde_json::to_string(&fixture_environment()).unwrap();
     for forbidden in ["machine_id", "username", "home_path", "serial_number"] {
@@ -1930,6 +2000,8 @@ fn checkpoint3a_fixture_plan() -> ExperimentPlan {
         },
         config_hash: "config".into(),
         environment_hash: environment.hash().unwrap(),
+        material_environment_schema_version: crate::MATERIAL_ENVIRONMENT_SCHEMA_VERSION,
+        material_environment_hash: environment.material_hash().unwrap(),
         thermal_state_unverified: environment.thermal_state_unverified,
         environment,
         performance_claim_eligible: true,

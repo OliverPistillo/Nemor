@@ -312,6 +312,15 @@ three observe transactions. No host preflight, sudo, A/B execution, or
 performance evidence occurred. Preparation V2 will use fresh paths after the
 transaction-ID fix.
 
+Preparation V2 passed preparation and the real-host read-only preflight. Its
+first privileged execution attempt was rejected before run 0 because the
+full observational environment hash differed by privilege-sensitive energy
+provider visibility (`null` as the preparing user versus `powercap` as root).
+No performance run occurred. The performance gate now uses an explicit,
+versioned material environment projection while retaining the full snapshot
+for evidence; energy counter accessibility is observational and does not
+change A/B environment identity.
+
 ### Checkpoint 3A-P DynamicUser observer boundary
 
 Checkpoint 3A-P now proves the observer boundary through one bounded
