@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 Checkpoint 3A CLOSED / PASS; Checkpoint 3B framework ready |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 Checkpoints 3A and 3B CLOSED / PASS; controlled progressive memory pressure is next |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -36,10 +36,10 @@ development; ⚪ planned.
 | Workspace crates | 15 |
 | Tests defined / executed | 511 / 511 |
 | Passed / failed / ignored | 511 / 0 / 0 |
-| Phase 10 validation | Checkpoint 3A CLOSED / PASS; incompressible Checkpoint 3B framework ready |
+| Phase 10 validation | Checkpoints 3A and 3B CLOSED / PASS; Phase 10 remains in development |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
-| Checkpoint 3B | `synthetic_incompressible` baseline/observe framework ready; live preparation not started |
+| Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -154,7 +154,9 @@ production performance claims.
 - a versioned A/B benchmark framework with eight scenarios, capability-aware
   variants, anonymized host comparability, scoped metrics, deterministic
   statistics, bounded SQLite/JSON evidence, restore proof and an explicit
-  non-privileged owned-synthetic smoke runner. Real A/B validation is pending.
+  non-privileged owned-synthetic smoke runner. Fixed-load compressible and
+  incompressible baseline/observe validation is complete; controlled
+  progressive pressure remains future work.
 - an explicit Checkpoint 2 owned-cgroup harness with dirty-source provenance,
   evidence-kind isolation, effective-state variant resolution, audited
   PID/start-ticks ownership, a 64 MiB steady worker, watchdog and restore
@@ -177,9 +179,18 @@ production performance claims.
   comparison architecture. Its deterministic SplitMix64 generator is bound by
   scenario, generator identity/version, seed, payload, and worker-manifest
   evidence; generation and prefault finish before measurement, with bounded
-  integrity reads and no sustained rewrite. The initial 128 MiB/256 MiB,
-  non-pressure three-plus-three observer-overhead profile is framework-only;
-  no live 3B preparation or execution has occurred.
+  integrity reads and no sustained rewrite. Experiment
+  `checkpoint3b-1785272587990631899` completed three baseline and three observe
+  repetitions with exact paired workload/payload identities. All runs passed
+  integrity, watchdog, OOM/OOM-kill and restore gates; the observer-overhead
+  comparison is comparable. Worker CPU changed by +4.486%; mean and peak
+  worker memory were approximately unchanged (-0.112%/-0.110%). Observe used
+  0.11 CPU-seconds per 20-second window with mean RSS/PSS of
+  8,959,317/6,538,923 bytes. Runner CPU changed from 0.03 to 0.72 seconds
+  (about +0.69 CPU-seconds); the 2300% relative figure has a tiny baseline and
+  is not a system CPU regression claim. Three repetitions support no
+  significance claim, and capacity remains `not_evaluated`. Checkpoint 3B is
+  CLOSED / PASS.
 - a Checkpoint 3A-P boundary for one benchmark-owned transient
   `nemor-benchmark-observer-*.service`. PID 1 creates the real release
   `nemord` with `DynamicUser=true`, an ephemeral `RuntimeDirectory`, fixed
@@ -190,7 +201,7 @@ production performance claims.
   privileged pipeline validation passed on CachyOS in Checkpoint 3A-P ATTEMPT
   3. The three-attempt history is retained, and this harness evidence makes
   no performance claim; its boundary is reused by the closed Checkpoint 3A and
-  the ready Checkpoint 3B framework.
+  the closed Checkpoint 3B experiment.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process

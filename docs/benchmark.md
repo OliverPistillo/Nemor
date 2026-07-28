@@ -359,9 +359,32 @@ Only `cachyos_baseline,nemor_observe` and `observer_overhead` are in scope.
 Comparison requires all three valid runs per variant with paired seeds and
 workload identities, the same generator/manifest, payload, envelope and
 material environment. No significance claim is made from three repetitions.
-`capacity_gain_percent`, capacity, gaming, OOM avoidance, progressive pressure
-and optimization effectiveness remain `not_evaluated`. Framework and tests are
-ready; no live 3B preparation, preflight or execution has occurred.
+Experiment `checkpoint3b-1785272587990631899` completed all six planned runs:
+three valid `cachyos_baseline` and three valid `nemor_observe` repetitions.
+Each paired repetition has the exact same persisted workload identity and
+actual payload SHA-256 fingerprint. All runs recorded twenty samples over
+twenty seconds with zero watchdog triggers, OOMs and OOM kills, valid worker
+integrity and structural restore. Baseline runs had no observer; observe runs
+had the expected exact-owned observer. The observer-overhead comparison is
+`comparable=true`.
+
+Worker CPU means were 0.008017 seconds baseline and 0.008377 seconds observe,
+a +4.486% change. Worker mean memory changed by -0.112% and peak memory by
+-0.110%, approximately unchanged. The observer used 0.11 CPU-seconds per
+twenty-second measurement window; its mean RSS was 8,959,317 bytes and mean
+PSS was 6,538,923 bytes.
+
+The benchmark runner CPU diagnostic is retained explicitly: baseline mean
+0.03 seconds and observe mean 0.72 seconds, or about +0.69 absolute
+CPU-seconds during a twenty-second window. The computed +2300% relative change
+uses an extremely small baseline and must not be described as a 2300% system
+CPU regression. It does not invalidate the six valid comparable runs.
+
+Only three repetitions were collected, so no statistical significance is
+claimed. `capacity_gain_percent`, capacity, gaming, OOM avoidance and
+optimization effectiveness remain `not_evaluated`. Checkpoint 3B is CLOSED /
+PASS. Phase 10 remains in development; controlled progressive memory pressure
+is the next framework/design target and is not implemented here.
 
 ### Checkpoint 3A-P DynamicUser observer boundary
 

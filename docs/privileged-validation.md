@@ -363,10 +363,24 @@ offline revalidator may derive a corrected result. That bounded revalidation
 has now returned `REVALIDATED_PASS`, closing Checkpoint 3A without a V4.
 Capacity, gaming, OOM avoidance and effectiveness remain `not_evaluated`.
 
-Checkpoint 3B is the next validation step and reuses this exact privileged
-boundary for a bounded `synthetic_incompressible` baseline/observe pilot.
-Only framework and tests are present: no live 3B manifest has been prepared,
-no host preflight has run and no privileged A/B execution has started.
+Checkpoint 3B Experiment `checkpoint3b-1785272587990631899` reused this exact
+boundary for a bounded `synthetic_incompressible` baseline/observe pilot with
+SplitMix64 generator version 1. Three baseline and three observe runs completed
+validly with exact paired workload/payload identities, zero watchdog/OOM/
+OOM-kill events, worker integrity PASS and restore PASS. The observer-overhead
+comparison is `comparable=true`. Worker CPU changed by +4.486%; mean/peak
+memory were approximately unchanged. Observer means were 0.11 CPU-seconds,
+8,959,317 bytes RSS and 6,538,923 bytes PSS per twenty-second window.
+
+The runner diagnostic is retained separately: 0.03 seconds baseline versus
+0.72 seconds observe, about +0.69 absolute CPU-seconds. Its +2300% relative
+change uses a tiny denominator and is not a 2300% system CPU regression.
+Three repetitions support no significance claim, and capacity remains
+`not_evaluated`. Final read-only inspection found no benchmark unit, observer
+service, transaction runtime directory or benchmark-owned process residue;
+production Nemor state was not adopted. Checkpoint 3B is CLOSED / PASS.
+Phase 10 remains in development, with controlled progressive memory pressure
+as the next framework/design target.
 
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
