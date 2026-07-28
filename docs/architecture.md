@@ -195,3 +195,11 @@ TOCTOU window. Checkpoint 3A-P remains pending one bounded live validation.
 The application-level provenance command is authoritative for cleanliness;
 shell emptiness of `git status` is intentionally not used because bounded
 validation reports remain preserved as untracked non-source evidence.
+
+Build identity is supplied by one shared build-time Git resolver used by both
+`nemor-benchmark` and `nemord`. It registers Cargo dependencies on Git's
+resolved worktree HEAD plus the active loose ref, or packed refs and the
+bounded ref directory needed to observe loose-ref creation. It supports
+detached HEAD and linked worktrees without assuming `.git` is a directory.
+This compile-time read-only Git step is separate from privileged execution,
+which remains entirely manifest/hash driven and invokes no Git.

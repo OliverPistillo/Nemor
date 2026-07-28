@@ -362,6 +362,22 @@ because Cargo produced the normal two-link observer artifact. This was a
 pre-live preparation blocker, not Checkpoint 3A-P ATTEMPT 1; no privileged
 validation occurred.
 
+A second pre-live build at
+`6030547debe4ea3877b9f1804622e79c7425cb36` exposed an independent incremental
+build-stamp defect: both build scripts watched only `.git/HEAD`. On symbolic
+`main`, that file continues to name `refs/heads/main` while the branch ref
+advances, so Cargo could reuse an older `NEMOR_BUILD_GIT_HEAD`. The shared
+build-time resolver now asks Git for the actual worktree HEAD path, active
+symbolic-ref path, packed-ref state and a bounded ref-parent directory that
+covers packed-to-loose creation. Detached HEAD and linked-worktree metadata
+therefore use their real Git paths. `git rev-parse --verify HEAD^{commit}`
+remains the stamp source, while runtime provenance independently rejects any
+embedded-commit mismatch or dirty relevant source.
+
+Neither preparation blocker counts as live ATTEMPT 1. The historical V1
+directory remains untouched, V2 was never created, and the next preparation
+lineage uses V3.
+
 The later matched 3A timeline is fixed: after worker-scope verification,
 observe performs separately-accounted service setup; both variants then
 receive the same five-second hold—idle for baseline and observer-alive warmup
