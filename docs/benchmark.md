@@ -324,6 +324,19 @@ system telemetry sample persisted by the normal daemon loop. Stop uses the
 same asynchronous contract. Final validity requires process, unit, cgroup and
 runtime-directory absence plus structural restore.
 
+`JobRemoved(result=done)` is only `START_JOB_COMPLETE`. With the deliberately
+representative `Type=simple` contract, systemd completes that job after fork
+and may do so before the executor has applied credentials and called `execve`.
+It is not `EXEC_IDENTITY_SETTLED`. After obtaining the authoritative
+`Service.MainPID`, validation therefore polls the same PID and start ticks at
+20 ms intervals for at most two seconds. The exact unit, D-Bus object,
+`GetUnitByPID`, cgroup membership, running service state and `DynamicUser`
+contract must remain valid throughout. A root-owned `systemd-executor`
+identity is diagnostic intermediate state only. Readiness starts only after
+the same process is non-root and its final `/proc/PID/exe` path and SHA-256
+match the root-staged observer. Settling time is observer setup time and is
+outside the matched five-second hold and sustained measurement.
+
 Preparation runs unprivileged and records clean Git/source identity, release
 binary hashes, embedded commit and config hash in an integrity-bound manifest.
 Privileged execution invokes no Git and re-hashes every input before mutation.
@@ -392,6 +405,26 @@ preparation schema and observer property-contract version were advanced, so
 the historical V3 manifest is deterministically rejected by corrected
 binaries. V3 remains untouched; the next preparation lineage uses V4. This
 was pre-live capability discovery, not live ATTEMPT 1.
+
+Checkpoint 3A-P ATTEMPT 1 was the first real privileged live validation. The
+transient service was created successfully and reached
+`loaded/active/running`; staging and every intended property/hardening
+readback passed. The first identity sample for `MainPID=75843`,
+`start_ticks=1718566` observed effective UID/GID `0/0` and executable SHA-256
+`b5199b96a1bfc9e6d843e6b075521f1909492327893f592a9abfc045ae451fae`.
+That hash exactly identifies this systemd 261 host's
+`/usr/lib/systemd/systemd-executor`. The harness correctly failed closed
+before readiness. Cleanup and structural restore passed, including process,
+unit, cgroup, runtime state, staged binary and staged config absence.
+
+ATTEMPT 1 is classified
+`FAILED_CLOSED_STARTUP_IDENTITY_TRANSITION`: `Type=simple` start-job
+completion was sampled before final exec/credential identity settled. It is
+not a DynamicUser failure and not a cleanup failure. The preserved canonical
+report SHA-256 is
+`069c2c05018ea3b090749ad53688e9892a50de24efedbffa5a4f48dd4ae7eff0`.
+It counts as ATTEMPT 1; the next live validation is ATTEMPT 2. No live
+ATTEMPT 2 is part of this fix.
 
 The later matched 3A timeline is fixed: after worker-scope verification,
 observe performs separately-accounted service setup; both variants then

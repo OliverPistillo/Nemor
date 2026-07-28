@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -28,6 +28,8 @@ const SERVICE_RUNTIME_MAX_USEC: u64 = 20_000_000;
 const SERVICE_TIMEOUT_USEC: u64 = 5_000_000;
 const VALIDATION_WINDOW: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
+const EXEC_IDENTITY_SETTLING_TIMEOUT: Duration = Duration::from_secs(2);
+const EXEC_IDENTITY_SETTLING_POLL: Duration = Duration::from_millis(20);
 const MAX_PREPARED_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PREPARED_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SOURCE_OBSERVER_BYTES: u64 = 128 * 1024 * 1024;
@@ -1052,10 +1054,42 @@ pub struct ObserverServiceState {
     pub start_ticks: u64,
     pub effective_uid: u32,
     pub effective_gid: u32,
+    #[serde(default)]
+    pub executable_path: PathBuf,
     pub executable_sha256: String,
 }
 
 impl ObserverServiceState {
+    fn verify_startup_contract(
+        &self,
+        plan: &ObserverServicePlan,
+        initial_pid: u32,
+        initial_start_ticks: u64,
+        initial_object_path: &str,
+        initial_control_group: &str,
+    ) -> Result<()> {
+        if self.unit_name != plan.unit_name
+            || self.load_state != "loaded"
+            || self.active_state != "active"
+            || self.sub_state != "running"
+            || self.main_pid == 0
+            || self.main_pid != initial_pid
+            || self.start_ticks != initial_start_ticks
+            || self.object_path != initial_object_path
+            || self.control_group != initial_control_group
+            || self.exec_main_pid != self.main_pid
+            || self.exec_main_status != 0
+            || self.result != "success"
+            || !self.dynamic_user
+            || self.control_group.is_empty()
+            || !self.control_group.starts_with('/')
+            || self.control_group.contains("..")
+        {
+            bail!("observer service changed or failed during identity settling");
+        }
+        Ok(())
+    }
+
     pub fn verify_declared(&self, plan: &ObserverServicePlan, expected_sha256: &str) -> Result<()> {
         if self.unit_name != plan.unit_name
             || self.load_state != "loaded"
@@ -1088,6 +1122,7 @@ impl ObserverServiceState {
             || self.system_call_architectures != ["native"]
             || self.ip_address_deny != [(2, vec![0; 4], 0), (10, vec![0; 16], 0)]
             || self.effective_uid == 0
+            || self.effective_gid == 0
             || self.control_group.is_empty()
             || !self.control_group.starts_with('/')
             || self.control_group.contains("..")
@@ -1122,10 +1157,43 @@ impl ObserverServiceState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecIdentitySettlingEvidence {
+    pub status: String,
+    pub initial_uid: u32,
+    pub initial_gid: u32,
+    pub final_uid: u32,
+    pub final_gid: u32,
+    pub polls: u32,
+    pub duration_seconds: f64,
+    pub pre_exec_root_observed: bool,
+    pub initial_executable_path: PathBuf,
+    pub initial_executable_sha256: String,
+    pub final_executable_sha256: String,
+    pub expected_executable_sha256: String,
+    pub transition_observed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObserverServiceStart {
+    pub state: ObserverServiceState,
+    pub settling: ExecIdentitySettlingEvidence,
+}
+
 pub trait ObserverServiceBackend {
     fn preflight(&self) -> Result<()>;
     fn unit_exists(&self, unit_name: &str) -> Result<bool>;
-    fn start(&mut self, plan: &ObserverServicePlan) -> Result<ObserverServiceState>;
+    fn start(
+        &mut self,
+        plan: &ObserverServicePlan,
+        expected_sha256: &str,
+    ) -> Result<ObserverServiceStart>;
+    fn last_start_state(&self) -> Option<ObserverServiceState> {
+        None
+    }
+    fn last_settling_evidence(&self) -> Option<ExecIdentitySettlingEvidence> {
+        None
+    }
     fn verify_active(
         &self,
         plan: &ObserverServicePlan,
@@ -1137,12 +1205,16 @@ pub trait ObserverServiceBackend {
 
 pub struct SystemdObserverServiceBackend {
     connection: Connection,
+    last_start_state: Option<ObserverServiceState>,
+    last_settling_evidence: Option<ExecIdentitySettlingEvidence>,
 }
 
 impl SystemdObserverServiceBackend {
     pub fn system() -> Result<Self> {
         Ok(Self {
             connection: Connection::system()?,
+            last_start_state: None,
+            last_settling_evidence: None,
         })
     }
 
@@ -1218,7 +1290,11 @@ impl SystemdObserverServiceBackend {
         })
     }
 
-    fn read_state(&self, plan: &ObserverServicePlan) -> Result<ObserverServiceState> {
+    fn read_state(
+        &self,
+        plan: &ObserverServicePlan,
+        hash_unexpected_executable: bool,
+    ) -> Result<ObserverServiceState> {
         let object: OwnedObjectPath = self.manager()?.call("GetUnit", &plan.unit_name)?;
         let unit = Proxy::new(
             &self.connection,
@@ -1233,12 +1309,16 @@ impl SystemdObserverServiceBackend {
             SERVICE_INTERFACE,
         )?;
         let main_pid: u32 = service.get_property("MainPID")?;
+        if main_pid == 0 {
+            bail!("observer MainPID unavailable");
+        }
         let pid_object: OwnedObjectPath = self.manager()?.call("GetUnitByPID", &main_pid)?;
         if pid_object != object {
             bail!("GetUnit and GetUnitByPID disagree for observer MainPID");
         }
         let (uid, gid) = read_effective_ids(main_pid)?;
         let proc_exe = PathBuf::from(format!("/proc/{main_pid}/exe"));
+        let executable_path = fs::read_link(&proc_exe)?;
         let control_group: String = service.get_property("ControlGroup")?;
         let members = fs::read_to_string(
             Path::new("/sys/fs/cgroup")
@@ -1287,8 +1367,96 @@ impl SystemdObserverServiceBackend {
             start_ticks: read_start_ticks(main_pid).context("observer start_ticks unavailable")?,
             effective_uid: uid,
             effective_gid: gid,
-            executable_sha256: sha256_file(&proc_exe)?,
+            executable_sha256: if hash_unexpected_executable
+                || executable_path == plan.service_binary
+            {
+                sha256_file(&proc_exe)?
+            } else {
+                String::new()
+            },
+            executable_path,
         })
+    }
+}
+
+fn settle_observer_identity<F>(
+    plan: &ObserverServicePlan,
+    expected_sha256: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut read_state: F,
+) -> Result<ObserverServiceStart>
+where
+    F: FnMut(bool) -> Result<ObserverServiceState>,
+{
+    let started = Instant::now();
+    let initial = read_state(true)?;
+    let initial_pid = initial.main_pid;
+    let initial_start_ticks = initial.start_ticks;
+    let initial_object_path = initial.object_path.clone();
+    let initial_control_group = initial.control_group.clone();
+    let initial_uid = initial.effective_uid;
+    let initial_gid = initial.effective_gid;
+    initial.verify_startup_contract(
+        plan,
+        initial_pid,
+        initial_start_ticks,
+        &initial_object_path,
+        &initial_control_group,
+    )?;
+    let mut polls = 1_u32;
+    let mut pre_exec_root_observed = initial.effective_uid == 0 && initial.effective_gid == 0;
+    let initial_executable_path = initial.executable_path.clone();
+    let initial_executable_sha256 = initial.executable_sha256.clone();
+    let mut current = initial;
+
+    loop {
+        current.verify_startup_contract(
+            plan,
+            initial_pid,
+            initial_start_ticks,
+            &initial_object_path,
+            &initial_control_group,
+        )?;
+        let expected_executable = current.executable_path == plan.service_binary
+            && current.executable_sha256 == expected_sha256;
+        let non_root = current.effective_uid != 0 && current.effective_gid != 0;
+
+        if expected_executable && non_root {
+            return Ok(ObserverServiceStart {
+                settling: ExecIdentitySettlingEvidence {
+                    status: "EXEC_IDENTITY_SETTLED".into(),
+                    initial_uid,
+                    initial_gid,
+                    final_uid: current.effective_uid,
+                    final_gid: current.effective_gid,
+                    polls,
+                    duration_seconds: started.elapsed().as_secs_f64(),
+                    pre_exec_root_observed,
+                    initial_executable_path,
+                    initial_executable_sha256,
+                    final_executable_sha256: current.executable_sha256.clone(),
+                    expected_executable_sha256: expected_sha256.into(),
+                    transition_observed: polls > 1,
+                },
+                state: current,
+            });
+        }
+        if expected_executable && !non_root {
+            bail!("observer expected executable appeared with root identity");
+        }
+        if started.elapsed() >= timeout {
+            bail!("observer EXEC_IDENTITY_SETTLING timed out");
+        }
+
+        if !poll_interval.is_zero() {
+            std::thread::sleep(poll_interval);
+        }
+        current = read_state(false)?;
+        polls = polls
+            .checked_add(1)
+            .context("observer settling poll count overflow")?;
+        pre_exec_root_observed |= current.effective_uid == 0 && current.effective_gid == 0;
     }
 }
 
@@ -1323,12 +1491,90 @@ impl ObserverServiceBackend for SystemdObserverServiceBackend {
             .is_ok())
     }
 
-    fn start(&mut self, plan: &ObserverServicePlan) -> Result<ObserverServiceState> {
+    fn start(
+        &mut self,
+        plan: &ObserverServicePlan,
+        expected_sha256: &str,
+    ) -> Result<ObserverServiceStart> {
+        self.last_start_state = None;
+        self.last_settling_evidence = None;
         if self.unit_exists(&plan.unit_name)? {
             bail!("exact observer service name already exists");
         }
         self.run_job("StartTransientUnit", plan)?;
-        self.read_state(plan)
+        let settling_started = Instant::now();
+        let mut observations = Vec::new();
+        let mut transitioned_hashes: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let result = settle_observer_identity(
+            plan,
+            expected_sha256,
+            EXEC_IDENTITY_SETTLING_TIMEOUT,
+            EXEC_IDENTITY_SETTLING_POLL,
+            |hash_unexpected| {
+                let mut state = self.read_state(plan, hash_unexpected)?;
+                let transitioned =
+                    observations
+                        .first()
+                        .is_some_and(|initial: &ObserverServiceState| {
+                            state.executable_path != initial.executable_path
+                        });
+                if transitioned && state.executable_sha256.is_empty() {
+                    state.executable_sha256 = if let Some(cached) =
+                        transitioned_hashes.get(&state.executable_path)
+                    {
+                        cached.clone()
+                    } else {
+                        let hash =
+                            sha256_file(&PathBuf::from(format!("/proc/{}/exe", state.main_pid)))?;
+                        transitioned_hashes.insert(state.executable_path.clone(), hash.clone());
+                        hash
+                    };
+                }
+                observations.push(state.clone());
+                Ok(state)
+            },
+        );
+        if let Some(final_state) = observations.last() {
+            self.last_start_state = Some(final_state.clone());
+        }
+        match result {
+            Ok(started) => {
+                self.last_settling_evidence = Some(started.settling.clone());
+                Ok(started)
+            }
+            Err(error) => {
+                if let (Some(initial), Some(final_state)) =
+                    (observations.first(), observations.last())
+                {
+                    self.last_settling_evidence = Some(ExecIdentitySettlingEvidence {
+                        status: "EXEC_IDENTITY_SETTLING_FAILED".into(),
+                        initial_uid: initial.effective_uid,
+                        initial_gid: initial.effective_gid,
+                        final_uid: final_state.effective_uid,
+                        final_gid: final_state.effective_gid,
+                        polls: u32::try_from(observations.len()).unwrap_or(u32::MAX),
+                        duration_seconds: settling_started.elapsed().as_secs_f64(),
+                        pre_exec_root_observed: observations
+                            .iter()
+                            .any(|state| state.effective_uid == 0 && state.effective_gid == 0),
+                        initial_executable_path: initial.executable_path.clone(),
+                        initial_executable_sha256: initial.executable_sha256.clone(),
+                        final_executable_sha256: final_state.executable_sha256.clone(),
+                        expected_executable_sha256: expected_sha256.into(),
+                        transition_observed: observations.len() > 1,
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn last_start_state(&self) -> Option<ObserverServiceState> {
+        self.last_start_state.clone()
+    }
+
+    fn last_settling_evidence(&self) -> Option<ExecIdentitySettlingEvidence> {
+        self.last_settling_evidence.clone()
     }
 
     fn stop(&mut self, plan: &ObserverServicePlan) -> Result<()> {
@@ -1343,7 +1589,7 @@ impl ObserverServiceBackend for SystemdObserverServiceBackend {
         plan: &ObserverServicePlan,
         expected: &ObserverServiceState,
     ) -> Result<()> {
-        let current = self.read_state(plan)?;
+        let current = self.read_state(plan, false)?;
         if current.main_pid != expected.main_pid
             || current.start_ticks != expected.start_ticks
             || current.control_group != expected.control_group
@@ -1378,6 +1624,7 @@ pub struct ObserverValidationReport {
     pub plan: ObserverServicePlan,
     pub transient_property_audit: Vec<ObserverTransientPropertyAudit>,
     pub state: Option<ObserverServiceState>,
+    pub exec_identity_settling: Option<ExecIdentitySettlingEvidence>,
     pub observer_setup_wall_seconds: Option<f64>,
     pub observer_setup_cpu_seconds: Option<f64>,
     pub readiness: String,
@@ -1493,6 +1740,7 @@ pub fn validate_observer_service_with_backend<B: ObserverServiceBackend>(
         plan: plan.clone(),
         transient_property_audit: plan.property_audit()?,
         state: None,
+        exec_identity_settling: None,
         observer_setup_wall_seconds: None,
         observer_setup_cpu_seconds: None,
         readiness: "not_started".into(),
@@ -1512,9 +1760,11 @@ pub fn validate_observer_service_with_backend<B: ObserverServiceBackend>(
         staged_config_cleanup: false,
         errors: Vec::new(),
     };
-    let start_result = backend.start(plan);
+    let start_result = backend.start(plan, &manifest.payload.expected_staged_observer_sha256);
     match start_result {
-        Ok(state) => {
+        Ok(started) => {
+            let state = started.state;
+            report.exec_identity_settling = Some(started.settling);
             let identity_result =
                 state.verify(plan, &manifest.payload.expected_staged_observer_sha256);
             report.state = Some(state);
@@ -1542,7 +1792,11 @@ pub fn validate_observer_service_with_backend<B: ObserverServiceBackend>(
                 }
             }
         }
-        Err(error) => report.errors.push(error.to_string()),
+        Err(error) => {
+            report.state = backend.last_start_state();
+            report.exec_identity_settling = backend.last_settling_evidence();
+            report.errors.push(error.to_string());
+        }
     }
     if let Err(error) = backend.stop(plan) {
         report.errors.push(error.to_string());
@@ -2011,6 +2265,7 @@ mod tests {
             start_ticks: 10,
             effective_uid: 61_234,
             effective_gid: 61_234,
+            executable_path: plan.service_binary.clone(),
             executable_sha256: "binary".into(),
         }
     }
@@ -2200,6 +2455,112 @@ mod tests {
         let mut root = first;
         root.effective_uid = 0;
         assert!(root.verify_declared(&plan, "binary").is_err());
+    }
+
+    #[test]
+    fn type_simple_pre_exec_identity_settles_before_readiness() {
+        let plan = plan();
+        let mut pre_exec = state(&plan);
+        pre_exec.effective_uid = 0;
+        pre_exec.effective_gid = 0;
+        pre_exec.executable_path = PathBuf::from("/usr/lib/systemd/systemd-executor");
+        pre_exec.executable_sha256 = "executor".into();
+        let settled = state(&plan);
+        let mut samples = vec![pre_exec, settled].into_iter();
+
+        let started = settle_observer_identity(
+            &plan,
+            "binary",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| samples.next().context("missing scripted settling sample"),
+        )
+        .unwrap();
+
+        assert_eq!(started.state.effective_uid, 61_234);
+        assert_eq!(started.settling.status, "EXEC_IDENTITY_SETTLED");
+        assert_eq!(started.settling.polls, 2);
+        assert!(started.settling.pre_exec_root_observed);
+        assert!(started.settling.transition_observed);
+        assert_eq!(
+            started.settling.initial_executable_path,
+            Path::new("/usr/lib/systemd/systemd-executor")
+        );
+        assert_eq!(started.settling.final_executable_sha256, "binary");
+    }
+
+    #[test]
+    fn identity_settling_times_out_on_persistent_root_executor() {
+        let plan = plan();
+        let mut pre_exec = state(&plan);
+        pre_exec.effective_uid = 0;
+        pre_exec.effective_gid = 0;
+        pre_exec.executable_path = PathBuf::from("/usr/lib/systemd/systemd-executor");
+        pre_exec.executable_sha256 = "executor".into();
+        let error =
+            settle_observer_identity(&plan, "binary", Duration::ZERO, Duration::ZERO, |_| {
+                Ok(pre_exec.clone())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn identity_settling_rejects_bad_transitions_and_never_accepts_executor_hash() {
+        let plan = plan();
+        let mut initial = state(&plan);
+        initial.effective_uid = 0;
+        initial.effective_gid = 0;
+        initial.executable_path = PathBuf::from("/usr/lib/systemd/systemd-executor");
+        initial.executable_sha256 = "executor".into();
+
+        for mutation in 0..6 {
+            let mut bad = initial.clone();
+            match mutation {
+                0 => bad.main_pid += 1,
+                1 => bad.start_ticks += 1,
+                2 => bad.unit_name = "foreign.service".into(),
+                3 => bad.control_group = "/system.slice/foreign.service".into(),
+                4 => bad.active_state = "failed".into(),
+                5 => bad.main_pid = 0,
+                _ => unreachable!(),
+            }
+            let mut samples = vec![initial.clone(), bad].into_iter();
+            assert!(settle_observer_identity(
+                &plan,
+                "binary",
+                Duration::from_secs(1),
+                Duration::ZERO,
+                |_| samples.next().context("missing scripted settling sample"),
+            )
+            .is_err());
+        }
+
+        let mut executor_as_non_root = initial.clone();
+        executor_as_non_root.effective_uid = 61_234;
+        executor_as_non_root.effective_gid = 61_234;
+        assert!(settle_observer_identity(
+            &plan,
+            "executor",
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| Ok(executor_as_non_root.clone()),
+        )
+        .is_err());
+
+        let mut expected_as_root = initial;
+        expected_as_root.executable_path = plan.service_binary.clone();
+        expected_as_root.executable_sha256 = "binary".into();
+        assert!(settle_observer_identity(
+            &plan,
+            "binary",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| Ok(expected_as_root.clone()),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("root identity"));
     }
 
     #[test]
@@ -2551,9 +2912,34 @@ mod tests {
             Ok(self.exists)
         }
 
-        fn start(&mut self, _plan: &ObserverServicePlan) -> Result<ObserverServiceState> {
-            self.start_error
-                .map_or_else(|| Ok(self.state.clone()), |message| bail!("{message}"))
+        fn start(
+            &mut self,
+            _plan: &ObserverServicePlan,
+            expected_sha256: &str,
+        ) -> Result<ObserverServiceStart> {
+            self.start_error.map_or_else(
+                || {
+                    Ok(ObserverServiceStart {
+                        state: self.state.clone(),
+                        settling: ExecIdentitySettlingEvidence {
+                            status: "EXEC_IDENTITY_SETTLED".into(),
+                            initial_uid: self.state.effective_uid,
+                            initial_gid: self.state.effective_gid,
+                            final_uid: self.state.effective_uid,
+                            final_gid: self.state.effective_gid,
+                            polls: 1,
+                            duration_seconds: 0.0,
+                            pre_exec_root_observed: false,
+                            initial_executable_path: self.state.executable_path.clone(),
+                            initial_executable_sha256: self.state.executable_sha256.clone(),
+                            final_executable_sha256: self.state.executable_sha256.clone(),
+                            expected_executable_sha256: expected_sha256.into(),
+                            transition_observed: false,
+                        },
+                    })
+                },
+                |message| bail!("{message}"),
+            )
         }
 
         fn verify_active(

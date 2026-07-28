@@ -279,6 +279,29 @@ The D-Bus object is read through two fixed interfaces: `Unit` for
 `memory.max` and exact PID/start-ticks membership remain independent mandatory
 cross-checks before the worker receives `ALLOCATE`.
 
+For the Checkpoint 3A-P transient observer service, the asynchronous
+`Type=simple` start job has a second, distinct bounded gate. Systemd 261 may
+report the start job complete after fork while the same MainPID is still its
+root-owned executor and before credential setup and `execve`. Nemor records
+that state as `EXEC_IDENTITY_SETTLING`, never as readiness. It holds the
+authoritative MainPID/start-ticks, exact unit/object/cgroup ownership and
+running state fixed while polling for no more than two seconds. Only a
+simultaneous non-root DynamicUser identity and final staged-binary SHA-256
+produces `EXEC_IDENTITY_SETTLED=PASS`; timeout, disappearance, replacement,
+ownership change, service failure, expected binary under root, or any wrong
+final binary fails closed and enters common cleanup.
+
+Checkpoint 3A-P ATTEMPT 1 is retained as a real live failed-closed validation.
+Service creation, staging and all hardening readbacks passed. Its first
+identity sample was PID 75843/start ticks 1718566, effective UID/GID 0/0,
+with SHA-256
+`b5199b96a1bfc9e6d843e6b075521f1909492327893f592a9abfc045ae451fae`,
+which exactly matches the host's `/usr/lib/systemd/systemd-executor`.
+Readiness never started. Process/unit/cgroup/runtime cleanup and structural
+restore all passed. The classification is
+`FAILED_CLOSED_STARTUP_IDENTITY_TRANSITION`; the next live run is ATTEMPT 2,
+after a clean release, fresh V5 preparation and preflight.
+
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
 worker/unit/cgroup final absence, structural restore and full host restore.
