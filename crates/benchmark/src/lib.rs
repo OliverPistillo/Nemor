@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub mod harness;
 pub mod observer_service;
 pub mod performance;
+pub mod pressure;
 pub mod systemd;
 
 pub const BENCHMARK_SCHEMA_VERSION: u32 = 1;

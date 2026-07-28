@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 Checkpoints 3A and 3B CLOSED / PASS; controlled progressive memory pressure is next |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C controlled-pressure framework ready, live validation pending |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -34,12 +34,13 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 511 / 511 |
-| Passed / failed / ignored | 511 / 0 / 0 |
-| Phase 10 validation | Checkpoints 3A and 3B CLOSED / PASS; Phase 10 remains in development |
+| Tests defined / executed | 529 / 529 |
+| Passed / failed / ignored | 529 / 0 / 0 |
+| Phase 10 validation | 3A/3B CLOSED / PASS; 3C framework ready / live validation pending |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
+| Checkpoint 3C | controlled progressive-pressure framework ready; external review required before live pilot preparation |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -202,6 +203,17 @@ production performance claims.
   3. The three-attempt history is retained, and this harness evidence makes
   no performance claim; its boundary is reused by the closed Checkpoint 3A and
   the closed Checkpoint 3B experiment.
+- a Checkpoint 3C model-only controlled progressive-pressure framework. Its
+  versioned manifest contract freezes exact increasing byte levels, the
+  SplitMix64 incompressible generator, a shared baseline/observe `MemoryMax`,
+  timing/watchdog bounds, material environment, conservative headroom
+  reserves, scoped health gates, emergency stop policy and deterministic
+  bracket-only refinement. Sustainable capacity is always the highest
+  actually tested healthy level; safety aborts are retained but never become
+  capacity bounds. Host OOM is forbidden. A zero-allocation, zero-privilege
+  simulator covers negative levels, aborts, restore failure and refinement.
+  The framework is ready, but no 3C preparation, preflight or live validation
+  has occurred.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process

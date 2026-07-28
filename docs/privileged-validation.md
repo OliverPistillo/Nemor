@@ -382,6 +382,25 @@ production Nemor state was not adopted. Checkpoint 3B is CLOSED / PASS.
 Phase 10 remains in development, with controlled progressive memory pressure
 as the next framework/design target.
 
+Checkpoint 3C now provides the model, manifest-ready plan, versioned level/run
+evidence, scoped health gates, conservative headroom calculation, emergency
+taxonomy and deterministic simulated scheduler for controlled progressive
+pressure. It does not add a live command. Future baseline and observe runs must
+share the exact systemd-owned `MemoryMax`, schedule and worker implementation;
+no raw cgroup writer or arbitrary PID/unit target is introduced.
+
+The framework forbids host-OOM search and intentional OOM requests. Host PSI
+emergency, host OOM, ownership/identity loss, heartbeat/watchdog timeout,
+memory/observer contract failure and restore failure stop level growth
+immediately, preserve evidence and leave later levels unexecuted. Safety abort
+is never a capacity boundary. Refinement is permitted only within an actually
+tested healthy/unhealthy bracket and never publishes an untested value.
+
+Checkpoint 3C is **FRAMEWORK READY / LIVE VALIDATION PENDING**. External review
+is required before any conservative live pilot preparation. No 3C preparation,
+preflight, transient unit, observer, pressure allocation or privileged action
+was performed while implementing the framework.
+
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
 worker/unit/cgroup final absence, structural restore and full host restore.

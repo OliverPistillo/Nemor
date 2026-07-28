@@ -70,13 +70,14 @@ privileged cgroup mutation. External adapters require an absolute executable
 from an explicit allow-list plus an argv vector; configuration cannot provide
 shell text.
 
-The progressive-pressure performance runner remains future work. Checkpoint 2
-validated the explicit privileged owned-cgroup transaction without applying
-performance pressure. `MemoryMax` must remain below measured host headroom, a
-watchdog and timeout are mandatory, and host OOM is always a safety failure.
-Controlled cgroup OOM is a distinct outcome. Structural
-snapshots compare swap, zswap, KSM and DAMON state; restore mismatch invalidates
-the result.
+The Checkpoint 3C progressive-pressure scheduler and evidence contracts are
+implemented as a model-only framework; live preparation/execution remains
+pending. Checkpoint 2 validated the explicit privileged owned-cgroup
+transaction without applying performance pressure. `MemoryMax` must remain
+below measured host headroom, a watchdog and timeout are mandatory, and host
+OOM is always a safety failure. Controlled cgroup OOM is a distinct outcome.
+Structural snapshots compare swap, zswap, KSM and DAMON state; restore
+mismatch invalidates the result.
 
 The runner does not bypass component ownership, audit, headroom, rollback or
 recovery guards. Normal `nemord` semantics remain unchanged. `nemorctl`
@@ -384,7 +385,67 @@ Only three repetitions were collected, so no statistical significance is
 claimed. `capacity_gain_percent`, capacity, gaming, OOM avoidance and
 optimization effectiveness remain `not_evaluated`. Checkpoint 3B is CLOSED /
 PASS. Phase 10 remains in development; controlled progressive memory pressure
-is the next framework/design target and is not implemented here.
+is the next live validation target.
+
+### Checkpoint 3C controlled progressive pressure
+
+Checkpoint 3C adds an explicit version-1 `progressive_memory_pressure`
+contract with comparison purpose `pressure_framework_validation`. It remains
+limited to `cachyos_baseline,nemor_observe` and reuses the 3A/3B provenance,
+material-environment, owned systemd scope, DynamicUser observer, watchdog,
+restore, counter, persistence and immutable-failure architecture. The live
+prepare/execute path does not accept 3C yet.
+
+`ProgressivePressurePlan` freezes the SplitMix64 incompressible generator v1,
+experiment seed, exact ordered byte levels, hold/stabilization/sample timing,
+one identical `MemoryMax` for both variants, watchdog and total-duration
+bounds, health/emergency policies, stop policy, refinement granularity/count,
+maximum levels and explicit headroom reserve/effective maximum. Development
+policy may express a small conservative sequence as fractions of a future
+effective maximum, but preparation must derive, align and freeze exact byte
+values from then-current headroom. No development-host free-memory value is
+embedded as a live schedule.
+
+Each level moves through planned, sustainable, unsustainable, safety-abort or
+not-executed-after-abort states. Versioned `LevelEvidence` retains planned and
+actual touched bytes plus the worker's exact delta acknowledgement and PID
+identity. The evidence also retains generator/workload/integrity identities,
+monotonic timing, samples, memory/CPU, separately scoped host and cgroup PSI,
+relative fault/swap/I/O activity, watchdog/OOM observations, every health
+gate, classification and failure reason. These versioned serializable records
+are the JSON/SQLite persistence contract for a future live backend; no failed
+level may be overwritten. Missing optional measurements remain unavailable,
+not zero. Swap topology is configuration evidence and is distinct from runtime
+swap or block-write deltas.
+
+Sustainable means every mandatory health and integrity contract passed; worker
+liveness alone is insufficient. Unsustainable health is a measured non-safety
+boundary. Emergency classes include host PSI/OOM, ownership or identity loss,
+heartbeat/watchdog timeout, broken memory/observer contracts and restore
+failure. An emergency retains current evidence, marks later levels unexecuted,
+enters only the existing exact-owned cleanup design and can never be an
+unsustainable capacity endpoint. Host OOM is prohibited and `request_oom`
+remains false.
+
+Refinement is a deterministic aligned midpoint and is eligible only inside a
+tested sustainable-lower/unsustainable-upper bracket. It cannot repeat a
+tested point, exceed its persisted count or extrapolate. Reported maximum
+sustainable capacity is the highest level actually tested successfully; no
+interpolation is capacity. Capacity gain remains `not_evaluated` until both
+variants have comparable completed non-aborted searches under identical
+scenario, generator, schedule, timing, envelope, material environment and
+worker implementation contracts.
+
+The unprivileged simulator allocates no workload memory and performs no
+privileged operation. It deterministically covers all-sustainable,
+unsustainable, PSI/OOM/worker/observer/watchdog/restore abort, touched-byte
+mismatch, refinement and comparison-mismatch paths. Checkpoint 3C status is
+**FRAMEWORK READY / LIVE VALIDATION PENDING**, not PASS.
+
+Future flow is: external review, separately authorized preparation that
+derives and freezes exact conservative levels, manifest review, separately
+authorized read-only host preflight, and only then a separately approved live
+pilot. None of those live steps occurred here.
 
 ### Checkpoint 3A-P DynamicUser observer boundary
 
