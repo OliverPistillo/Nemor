@@ -2453,5 +2453,13 @@ fn checkpoint3a_runtime_bound_exceeds_measurement_and_is_finite() {
     .unwrap();
     let runtime = crate::performance::performance_runtime_max_usec(&profile);
     assert!(runtime > profile.measurement_ms * 1_000);
+    let bounded_lifecycle_ms = 2_000
+        + 8_000
+        + profile.pre_measurement_hold_ms
+        + profile.stabilization_ms
+        + profile.measurement_ms
+        + 8_000
+        + 5_000;
+    assert!(runtime > bounded_lifecycle_ms * 1_000);
     assert!(runtime <= crate::observer_service::PERFORMANCE_SERVICE_RUNTIME_MAX_USEC);
 }

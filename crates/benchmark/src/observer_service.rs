@@ -428,21 +428,36 @@ impl ObserverServicePlan {
         {
             bail!("observer bind source must be the fixed staged executable role");
         }
-        if self.database == Path::new(PRODUCTION_DATABASE)
-            || !self
-                .database
-                .starts_with(Path::new(RUNTIME_BASE).join(&self.runtime_directory))
-            || !self
-                .service_config
-                .starts_with(Path::new(RUNTIME_BASE).join(&self.runtime_directory))
-            || !self
-                .service_binary
-                .starts_with(Path::new(RUNTIME_BASE).join(&self.runtime_directory))
-        {
-            bail!("observer database is not transaction-isolated");
-        }
         if self.runtime_directory.contains('/') || self.runtime_directory.contains("..") {
             bail!("invalid observer RuntimeDirectory basename");
+        }
+        let suffix = self
+            .runtime_directory
+            .strip_prefix(OBSERVER_PREFIX)
+            .filter(|suffix| is_safe_transaction_suffix(suffix))
+            .context("invalid observer transaction suffix")?;
+        let expected_runtime = format!("{OBSERVER_PREFIX}{suffix}");
+        let expected_unit = format!("{expected_runtime}.service");
+        let expected_binary =
+            Path::new(RUNTIME_BASE).join(format!("{STAGED_BINARY_PREFIX}{suffix}"));
+        let expected_config =
+            Path::new(RUNTIME_BASE).join(format!("{STAGED_CONFIG_PREFIX}{suffix}.toml"));
+        let expected_service_dir = Path::new(RUNTIME_BASE).join(&expected_runtime);
+        let expected_service_binary = expected_service_dir.join("nemord");
+        let expected_service_config = expected_service_dir.join("observer.toml");
+        let expected_database = expected_service_dir.join("nemor-observer.sqlite");
+        if self.runtime_directory != expected_runtime
+            || self.unit_name != expected_unit
+            || self.binary != expected_binary
+            || self.config != expected_config
+            || self.service_binary != expected_service_binary
+            || self.service_config != expected_service_config
+            || self.database != expected_database
+        {
+            bail!("observer transaction paths do not match exact generated roles");
+        }
+        if self.database == Path::new(PRODUCTION_DATABASE) {
+            bail!("observer database is not transaction-isolated");
         }
         if self.runtime_max_usec == 0
             || self.runtime_max_usec > PERFORMANCE_SERVICE_RUNTIME_MAX_USEC
@@ -1505,28 +1520,37 @@ pub fn start_performance_observer(
     let started = match backend.start(plan, expected_source_sha256) {
         Ok(started) => started,
         Err(error) => {
-            let _ = backend.stop(plan);
-            if backend.wait_absent(plan).is_ok() {
-                let (binary, config) =
-                    staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
-                binary.context("performance observer binary cleanup after start failure")?;
-                config.context("performance observer config cleanup after start failure")?;
-            } else {
-                bail!("observer start failed and owned service absence could not be proven: {error:#}");
-            }
+            cleanup_started_observer(
+                &mut backend,
+                plan,
+                &staged,
+                expected_source_sha256,
+                expected_config_sha256,
+            )
+            .map_err(|cleanup| anyhow::anyhow!("{error:#}; cleanup failure: {cleanup:#}"))?;
             return Err(error);
         }
     };
     if let Err(error) = started.state.verify_declared(plan, expected_source_sha256) {
-        let _ = backend.stop(plan);
-        let _ = backend.wait_absent(plan);
-        let _ = staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
+        cleanup_started_observer(
+            &mut backend,
+            plan,
+            &staged,
+            expected_source_sha256,
+            expected_config_sha256,
+        )
+        .map_err(|cleanup| anyhow::anyhow!("{error:#}; cleanup failure: {cleanup:#}"))?;
         return Err(error);
     }
     if let Err(error) = wait_ready(&plan.database, &backend, plan, &started.state) {
-        let _ = backend.stop(plan);
-        let _ = backend.wait_absent(plan);
-        let _ = staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
+        cleanup_started_observer(
+            &mut backend,
+            plan,
+            &staged,
+            expected_source_sha256,
+            expected_config_sha256,
+        )
+        .map_err(|cleanup| anyhow::anyhow!("{error:#}; cleanup failure: {cleanup:#}"))?;
         return Err(error);
     }
     Ok(PerformanceObserverHandle {
@@ -1541,22 +1565,36 @@ pub fn start_performance_observer(
     })
 }
 
+fn cleanup_started_observer<B: ObserverServiceBackend>(
+    backend: &mut B,
+    plan: &ObserverServicePlan,
+    staged: &StagedObserverInputs,
+    source_sha256: &str,
+    config_sha256: &str,
+) -> Result<()> {
+    let stop = backend.stop(plan);
+    let absence = backend.wait_absent(plan);
+    stop.context("observer StopUnit cleanup")?;
+    absence.context("observer service absence cleanup")?;
+    let (binary, config) = staged.cleanup_paths(source_sha256, config_sha256);
+    binary.context("performance observer binary cleanup")?;
+    config.context("performance observer config cleanup")?;
+    Ok(())
+}
+
 impl PerformanceObserverHandle {
     pub fn verify_active(&self) -> Result<()> {
         self.backend.verify_active(&self.plan, &self.state)
     }
 
     pub fn stop_and_cleanup(mut self) -> Result<()> {
-        let stop_result = self.backend.stop(&self.plan);
-        let absence_result = self.backend.wait_absent(&self.plan);
-        stop_result.context("observer StopUnit cleanup")?;
-        absence_result.context("observer service absence cleanup")?;
-        let (binary, config) = self
-            .staged
-            .cleanup_paths(&self.source_sha256, &self.config_sha256);
-        binary?;
-        config?;
-        Ok(())
+        cleanup_started_observer(
+            &mut self.backend,
+            &self.plan,
+            &self.staged,
+            &self.source_sha256,
+            &self.config_sha256,
+        )
     }
 }
 
@@ -2320,7 +2358,7 @@ impl StagedObserverInputs {
 
 impl StagedObserverInputs {
     pub fn cleanup_paths(
-        self,
+        &self,
         binary_sha256: &str,
         config_sha256: &str,
     ) -> (Result<()>, Result<()>) {
@@ -2625,6 +2663,23 @@ mod tests {
             PathBuf::from("/run/nemor-benchmark-observer-config-attempt1.toml"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn observer_plan_rejects_tampered_transaction_roles() {
+        let mut tampered = plan();
+        tampered.config = PathBuf::from("/etc/arbitrary-file");
+        assert!(tampered.validate().is_err());
+        let mut tampered = plan();
+        tampered.service_config =
+            PathBuf::from("/run/nemor-benchmark-observer-attempt1/../other.toml");
+        assert!(tampered.validate().is_err());
+        let mut tampered = plan();
+        tampered.database = PathBuf::from("/run/nemor-benchmark-observer-attempt1/../other.sqlite");
+        assert!(tampered.validate().is_err());
+        let mut tampered = plan();
+        tampered.unit_name = "nemor-benchmark-observer-other.service".into();
+        assert!(tampered.validate().is_err());
     }
 
     fn state(plan: &ObserverServicePlan) -> ObserverServiceState {

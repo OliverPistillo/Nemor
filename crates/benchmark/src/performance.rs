@@ -1,4 +1,4 @@
-use crate::harness::{HarnessOptions, ObserverLaunch};
+use crate::harness::{CgroupHarnessPlan, HarnessOptions, ObserverLaunch};
 use crate::observer_service::ObserverServiceBackend;
 use crate::{
     deterministic_order, run_relative_counter_deltas, summarize, BenchmarkVariant, BuildProvenance,
@@ -261,6 +261,47 @@ impl PreparedExperimentManifest {
             bail!("prepared experiment directory ownership or mode is unsafe")
         }
         self.payload.plan.profile.validate()?;
+        if self.payload.plan.scenario != CHECKPOINT3A_SCENARIO
+            || self.payload.plan.scenario_version != 1
+            || self.payload.plan.repetitions != 3
+            || self.payload.plan.variants
+                != [
+                    BenchmarkVariant::CachyosBaseline,
+                    BenchmarkVariant::NemorObserve,
+                ]
+            || self.payload.plan.randomized_order.len() != 6
+        {
+            bail!("prepared plan is not the exact Checkpoint 3A experiment contract")
+        }
+        let expected_profile =
+            PerformanceProfile::checkpoint3a(self.payload.plan.profile.logical_payload_bytes)?;
+        if self.payload.plan.profile != expected_profile {
+            bail!("prepared performance profile differs from Checkpoint 3A defaults")
+        }
+        let expected_order = deterministic_order(
+            &self.payload.plan.variants,
+            self.payload.plan.repetitions,
+            self.payload.plan.experiment_seed,
+        );
+        if self
+            .payload
+            .plan
+            .randomized_order
+            .iter()
+            .enumerate()
+            .any(|(index, run)| {
+                run.order_index != index
+                    || expected_order.get(index) != Some(&(run.variant, run.repetition_index))
+                    || run.run_seed
+                        != derive_run_seed(
+                            self.payload.plan.experiment_seed,
+                            run.variant,
+                            run.repetition_index,
+                        )
+            })
+        {
+            bail!("prepared randomized order or run seeds differ from deterministic Checkpoint 3A plan")
+        }
         if !self.payload.config_path.is_absolute()
             || !self.payload.runner_path.is_absolute()
             || !self.payload.observer_path.is_absolute()
@@ -271,11 +312,8 @@ impl PreparedExperimentManifest {
         {
             bail!("prepared experiment paths must be absolute")
         }
-        for path in [
-            &self.payload.config_path,
-            &self.payload.runner_path,
-            &self.payload.observer_path,
-        ] {
+        {
+            let path = &self.payload.config_path;
             let metadata = fs::symlink_metadata(path)?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
@@ -287,6 +325,41 @@ impl PreparedExperimentManifest {
             {
                 bail!("prepared experiment input is not a regular file")
             }
+        }
+        for path in [&self.payload.runner_path, &self.payload.observer_path] {
+            let metadata = fs::symlink_metadata(path)?;
+            let filename = path.file_name().and_then(|value| value.to_str());
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != self.payload.preparing_uid
+                || metadata.permissions().mode() & 0o022 != 0
+                || metadata.len() == 0
+                || metadata.len() > 128 * 1024 * 1024
+                || path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|value| value.to_str())
+                    != Some("release")
+                || !matches!(filename, Some("nemor-benchmark") | Some("nemord"))
+            {
+                bail!("prepared release binary role or metadata is unsafe")
+            }
+        }
+        if self
+            .payload
+            .runner_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some("nemor-benchmark")
+            || self
+                .payload
+                .observer_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                != Some("nemord")
+            || self.payload.runner_path.parent() != self.payload.observer_path.parent()
+        {
+            bail!("prepared release binary sibling roles are invalid")
         }
         if hex::encode(Sha256::digest(fs::read(&self.payload.config_path)?))
             != self.payload.plan.config_hash
@@ -363,17 +436,31 @@ impl PreparedExperimentManifest {
                 bail!("prepared observer config database differs from frozen service plan")
             }
         }
-        if !self
+        if self
             .payload
-            .database_path
-            .starts_with(&self.payload.output_root)
-            || !self
+            .output_root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+            || self
+                .payload
+                .database_path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || self
                 .payload
                 .report_path
-                .starts_with(&self.payload.output_root)
-            || !self.payload.runs_dir.starts_with(&self.payload.output_root)
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || self
+                .payload
+                .runs_dir
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || self.payload.database_path != self.payload.output_root.join("experiment.sqlite")
+            || self.payload.report_path != self.payload.output_root.join("experiment.json")
+            || self.payload.runs_dir != self.payload.output_root.join("runs")
         {
-            bail!("experiment outputs escape the prepared output root")
+            bail!("experiment output roles do not match the prepared output root")
         }
         let output_meta = fs::symlink_metadata(&self.payload.output_root)?;
         if output_meta.file_type().is_symlink()
@@ -393,6 +480,7 @@ impl PreparedExperimentManifest {
         {
             bail!("prepared experiment does not match Checkpoint 3A observer-overhead contract")
         }
+        require_live_eligibility(&self.payload.plan)?;
         Ok(())
     }
 }
@@ -526,6 +614,18 @@ pub fn execute_prepared_experiment(manifest_path: &Path) -> Result<ExperimentOut
     let manifest: PreparedExperimentManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
     manifest.verify(manifest_path)?;
     let payload = &manifest.payload;
+    let sudo_uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .context("Checkpoint 3A execution requires sudo by the preparing user")?;
+    if sudo_uid != payload.preparing_uid
+        || std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            != Some(payload.preparing_gid)
+    {
+        bail!("sudo invoking identity differs from manifest preparing identity")
+    }
     if fs::read_dir(&payload.output_root)?.next().is_some() {
         bail!("prepared output root contains unexpected pre-existing evidence")
     }
@@ -597,22 +697,48 @@ pub fn preflight_prepared_experiment(manifest_path: &Path) -> Result<serde_json:
     let cgroup_capable = fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")
         .map(|controllers| controllers.split_whitespace().any(|v| v == "memory"))
         .unwrap_or(false);
-    let output_fresh = !payload.database_path.exists()
+    let output_fresh = fs::read_dir(&payload.output_root)
+        .map(|entries| entries.count() == 0)
+        .unwrap_or(false)
+        && !payload.database_path.exists()
         && !payload.report_path.exists()
         && !payload.runs_dir.exists();
-    let headroom_sufficient = fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .find(|line| line.starts_with("MemAvailable:"))
-                .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let meminfo_value = |key: &str| {
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
         })
-        .is_some_and(|available_kib| {
-            available_kib.saturating_mul(1024) > payload.plan.profile.worker_memory_max_bytes
-        });
+    };
+    let available = meminfo_value("MemAvailable:")
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let total = meminfo_value("MemTotal:").unwrap_or(0).saturating_mul(1024);
+    let headroom_sufficient = CgroupHarnessPlan::checkpoint3a(
+        payload.plan.profile.logical_payload_bytes,
+        payload.plan.profile.worker_memory_max_bytes,
+        available,
+        total,
+        PathBuf::from("/sys/fs/cgroup"),
+        "preflight",
+        payload.plan.profile.measurement_ms,
+        payload.plan.profile.stabilization_ms,
+    )
+    .is_ok();
+    let benchmark_transient_units_clear = crate::systemd::SystemdDbusBackend::system()
+        .and_then(|backend| backend.list_owned_benchmark_units())
+        .map(|units| units.is_empty())
+        .unwrap_or(false);
+    let performance_claim_eligible = payload.performance_claim_eligible;
+    let release_binary_provenance_verified = true;
+    let manifest_verified = true;
     let current_identity_authorized = nix::unistd::geteuid().is_root();
     Ok(serde_json::json!({
-        "manifest_verified": true,
+        "manifest_verified": manifest_verified,
+        "release_binary_provenance_verified": true,
         "preflight_mutated": false,
         "performance_claim_eligible": payload.performance_claim_eligible,
         "foreign_nemord_clear": foreign_nemord_clear,
@@ -621,10 +747,11 @@ pub fn preflight_prepared_experiment(manifest_path: &Path) -> Result<serde_json:
         "observer_property_contract_version": payload.observer_property_contract_version,
         "cgroup_capable": cgroup_capable,
         "headroom_sufficient": headroom_sufficient,
+        "benchmark_transient_units_clear": benchmark_transient_units_clear,
         "output_fresh": output_fresh,
         "requires_privileged_execution": true,
         "current_identity_authorized": current_identity_authorized,
-        "execution_ready_except_authorization": environment_match && foreign_nemord_clear && observer_contract_supported && cgroup_capable && headroom_sufficient && output_fresh
+        "execution_ready_except_authorization": manifest_verified && release_binary_provenance_verified && performance_claim_eligible && environment_match && foreign_nemord_clear && observer_contract_supported && cgroup_capable && headroom_sufficient && benchmark_transient_units_clear && output_fresh
     }))
 }
 
@@ -731,7 +858,8 @@ pub fn performance_runtime_max_usec(profile: &PerformanceProfile) -> u64 {
         .saturating_add(profile.stabilization_ms)
         .saturating_add(profile.measurement_ms)
         .saturating_add(8_000)
-        .saturating_add(5_000);
+        .saturating_add(5_000)
+        .saturating_add(5_000); // explicit scheduler margin; cooldown is post-stop
     lifecycle_ms.saturating_mul(1_000).clamp(
         crate::observer_service::PERFORMANCE_SERVICE_RUNTIME_MAX_USEC / 2,
         crate::observer_service::PERFORMANCE_SERVICE_RUNTIME_MAX_USEC,

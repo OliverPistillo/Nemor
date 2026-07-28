@@ -481,6 +481,27 @@ impl SystemdDbusBackend {
         )?)
     }
 
+    pub fn list_owned_benchmark_units(&self) -> Result<Vec<String>> {
+        type UnitRow = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            OwnedObjectPath,
+            u32,
+            String,
+            OwnedObjectPath,
+        );
+        let rows: Vec<UnitRow> = self.manager()?.call("ListUnits", &())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.0)
+            .filter(|name| name.starts_with(UNIT_PREFIX))
+            .collect())
+    }
+
     fn unit_path(&self, unit_name: &str) -> Result<OwnedObjectPath> {
         validate_unit_name(unit_name)?;
         Ok(self.manager()?.call("GetUnit", &(unit_name))?)

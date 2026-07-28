@@ -38,7 +38,7 @@ development; ⚪ planned.
 | Passed / failed / ignored | 491 / 0 / 0 |
 | Phase 10 validation | framework + privileged worker harness + 3A-P observer pipeline validated; real A/B pending |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
-| Checkpoint 3A | hardened execution bridge ready; manifest host preflight and real baseline-versus-observe A/B pending |
+| Checkpoint 3A | final pre-live contract gates closed; manifest host preflight and real baseline-versus-observe A/B pending |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |

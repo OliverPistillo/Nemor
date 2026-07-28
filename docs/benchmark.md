@@ -291,6 +291,10 @@ per observe repetition; each config points at that plan's isolated
 RuntimeDirectory database. A read-only `experiment-preflight --manifest`
 command verifies manifest ownership, hashes, environment, systemd/cgroup
 capability, foreign-process absence and output freshness before authorization.
+Final pre-live gates also require exact Checkpoint 3A plan/profile reconstruction,
+safe output roles, conservative headroom parity with the live cgroup plan, and
+an empty set of pre-existing benchmark transient units. Live execution must be
+invoked through `sudo` by the same UID/GID that prepared the manifest.
 Capacity, maximum sustainable
 load, `capacity_gain_percent`, gaming, OOM avoidance, incompressible
 regression and overall Phase 10 acceptance remain `not_evaluated`.
