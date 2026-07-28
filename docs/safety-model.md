@@ -94,3 +94,15 @@ gaming, critical, and protected targets always reject. Pageout rollback stops
 future actions; it cannot undo reclaimed pages byte-for-byte. The controlled
 path is validated on CachyOS with COLD-only trace candidates and exact-range
 pagemap proof that HOT/WARM remained resident.
+
+## Selective KSM boundary
+
+Phase 9 normal runtime remains observation and planning only. KSM is a global
+cross-process deduplication facility, so unknown identity, foreign security
+domain, foreground, gaming and critical candidates are rejected. Nemor cannot
+remotely apply `MADV_MERGEABLE`; only an owned cooperative validation child may
+opt in its exact mappings. The global unmerge value `run=2` is prohibited in
+all paths. Owned rollback uses `run=0`, headroom-guarded child unmerge or child
+termination, scanner snapshot restoration and idempotent owned recovery.
+Real profitable and inefficient-controller paths are validated only for owned
+synthetic targets; normal runtime remains non-mutating.

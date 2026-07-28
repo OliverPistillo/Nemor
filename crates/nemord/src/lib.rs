@@ -85,6 +85,9 @@ pub trait TelemetryStorage {
     fn store_damos_audit(&mut self, _session_id: i64, _audit: &damos::DamosReport) -> Result<()> {
         Ok(())
     }
+    fn store_ksm_audit(&mut self, _session_id: i64, _audit: &ksm::KsmReport) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl TelemetryStorage for Storage {
@@ -156,6 +159,15 @@ impl TelemetryStorage for Storage {
     }
     fn store_damos_audit(&mut self, session_id: i64, audit: &damos::DamosReport) -> Result<()> {
         self.insert_configuration_snapshot(session_id, damos::AUDIT_REASON, &audit.plan, audit)?;
+        Ok(())
+    }
+    fn store_ksm_audit(&mut self, session_id: i64, audit: &ksm::KsmReport) -> Result<()> {
+        self.insert_configuration_snapshot(
+            session_id,
+            ksm::AUDIT_REASON,
+            &audit.capability,
+            audit,
+        )?;
         Ok(())
     }
 }
@@ -604,6 +616,18 @@ where
                                                 storage
                                                     .store_damos_audit(session_id, &damos_audit)
                                                     .context("cannot persist DAMOS plan-only audit")?;
+                                                let ksm_audit = ksm::inspect_linux(
+                                                    std::path::Path::new(
+                                                        "/sys/kernel/mm/ksm",
+                                                    ),
+                                                    std::path::Path::new("/proc"),
+                                                    decision.timestamp_ns as u128,
+                                                );
+                                                storage
+                                                    .store_ksm_audit(session_id, &ksm_audit)
+                                                    .context(
+                                                        "cannot persist KSM observe-only audit",
+                                                    )?;
                                                 info!(
                                                     event = "policy_decision_persisted",
                                                     session_id,

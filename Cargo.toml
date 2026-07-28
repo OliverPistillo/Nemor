@@ -9,6 +9,7 @@ members = [
     "crates/tiering",
     "crates/damon",
     "crates/damos",
+    "crates/ksm",
     "crates/storage",
     "crates/nemord",
     "crates/nemorctl",

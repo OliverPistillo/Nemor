@@ -417,6 +417,39 @@ pub fn damos_blacklist(config_path: &Path) -> Result<Vec<damos::BlacklistRecord>
     storage::damos_blacklist(&loaded.config.general.database_path, now).or_else(|_| Ok(Vec::new()))
 }
 
+pub fn ksm_status(config_path: &Path) -> Result<ksm::KsmReport> {
+    let _ = LoadedConfig::load(config_path).context("invalid KSM status configuration")?;
+    Ok(ksm::inspect_linux(
+        Path::new("/sys/kernel/mm/ksm"),
+        Path::new("/proc"),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default(),
+    ))
+}
+
+pub fn ksm_processes(config_path: &Path) -> Result<Vec<ksm::KsmProcessMetrics>> {
+    let _ = LoadedConfig::load(config_path).context("invalid KSM process configuration")?;
+    Ok(ksm::external_mergeable_processes(
+        Path::new("/proc"),
+        &std::collections::BTreeSet::new(),
+    ))
+}
+
+pub fn ksm_plan_latest(config_path: &Path) -> Result<Option<ksm::EligibilityDecision>> {
+    Ok(ksm_status(config_path)?.plan)
+}
+
+pub fn ksm_report_latest(config_path: &Path) -> Result<ksm::KsmReport> {
+    ksm_status(config_path)
+}
+
+pub fn ksm_history(config_path: &Path) -> Result<Vec<ksm::ProfitEvaluation>> {
+    let _ = LoadedConfig::load(config_path).context("invalid KSM history configuration")?;
+    Ok(Vec::new())
+}
+
 fn read_memory_capacity() -> Result<(u64, u64)> {
     let input = fs::read_to_string("/proc/meminfo").context("cannot read /proc/meminfo")?;
     let read = |name: &str| -> Result<u64> {

@@ -19,6 +19,7 @@ not AI.
 | Phase 6 | zswap + NVMe tiering backend | 🟡 Dev complete / boot validation pending |
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
+| Phase 9 | selective KSM | ✅ Validated on CachyOS |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
 development; ⚪ planned.
@@ -30,9 +31,9 @@ development; ⚪ planned.
 | Platform | CachyOS Linux, x86_64 |
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
-| Workspace crates | 13 |
-| Tests defined / executed | 268 / 268 |
-| Passed / failed / ignored | 268 / 0 / 0 |
+| Workspace crates | 14 |
+| Tests defined / executed | 316 / 316 |
+| Passed / failed / ignored | 316 / 0 / 0 |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -40,6 +41,7 @@ development; ⚪ planned.
 | Phase 6 validation | read-only + live-safe swapfile; dedicated boot pending |
 | Phase 7 validation | real `vaddr` monitor-only session; 30/30 gates; host unchanged |
 | Phase 8 validation | owned-target DAMOS pageout; 8 MiB COLD reclaimed; host unchanged |
+| Phase 9 validation | profitable and inefficient auto-disable paths validated on owned synthetic targets; host unchanged |
 
 Linux tests include real `/proc`/`/sys` reads and real SIGINT/SIGTERM delivery.
 The dedicated bounded harness additionally validates isolated privileged
@@ -57,18 +59,21 @@ pageout.
 Release `nemord` was sampled on the validation host 15 times at two-second
 intervals using `/proc/<pid>/stat`, `status`, and `smaps_rollup`.
 
-| Metric | Phase 3 | Phase 4 | Phase 5 | Phase 6 | Phase 8 observe |
-|---|---:|---:|---:|---:|---:|
-| Mean CPU (one logical CPU) | 0.1990% | 0.199249% | 0.212940% | 0.232293% | 0.200000% |
-| Maximum interval CPU | 0.4976% | 0.996093% | 0.496909% | 0.995682% | 0.500000% |
-| Maximum RSS | ~7.03 MiB | ~7.34 MiB | ~7.32 MiB | ~7.67 MiB | ~7.86 MiB |
-| PSS | ~4.70 MiB | ~4.99 MiB | ~5.00 MiB | ~5.34 MiB | ~5.54 MiB |
+| Metric | Phase 3 | Phase 4 | Phase 5 | Phase 6 | Phase 8 observe | Phase 9 observe |
+|---|---:|---:|---:|---:|---:|---:|
+| Mean CPU (one logical CPU) | 0.1990% | 0.199249% | 0.212940% | 0.232293% | 0.200000% | 0.200000% |
+| Maximum interval CPU | 0.4976% | 0.996093% | 0.496909% | 0.995682% | 0.500000% | 0.500000% |
+| Maximum RSS | ~7.03 MiB | ~7.34 MiB | ~7.32 MiB | ~7.67 MiB | ~7.86 MiB | ~8.00 MiB |
+| PSS | ~4.70 MiB | ~4.99 MiB | ~5.00 MiB | ~5.34 MiB | ~5.54 MiB | ~5.67 MiB |
 
 These are host-specific validation measurements, not universal benchmarks.
 Phase 6 used the same 15 two-second interval method. Mean CPU and memory
 increased modestly; storage inventory is bounded by the normal sampling loop.
 The Phase 8 observe measurement also used 15 two-second intervals with no
 owned DAMON/DAMOS session; it measures only the unchanged observe runtime.
+The Phase 9 measurement used the same method with KSM `run=0` and no owned KSM
+session. Its exact maximum RSS was 8,392,704 bytes and final PSS 5,943,296
+bytes.
 
 Phase 7 measured the owned monitor session separately from normal daemon
 observe performance:
@@ -135,6 +140,21 @@ production performance claims.
   truthful stop-only rollback and owned recovery. The real kernel path is
   validated only for the owned synthetic harness target; production remains
   plan-only.
+- selective KSM capability/system/process metrics, conservative
+  VM/browser/Electron profiles, fixed/advisor-aware scanner planning,
+  profit/CPU-per-GiB evaluation, an ineffective-plan cooldown controller and
+  owned rollback/recovery. Normal runtime is read-only; live KSM is confined
+  to the validated explicit cooperative synthetic harness scopes.
+
+Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
+profitable path measured 39,931,904 saved bytes, positive system/process
+profit, two full scans and about 0.538% sustained `ksmd` CPU. The UNIQUE path
+measured two new full scans, zero attributable savings, 8,192 rmap items,
+zero merging pages and `-524288` bytes process profit per child; the controller
+transitioned EVALUATING→INEFFICIENT, stopped its owned scanner, entered
+COOLDOWN and rejected the same plan. Sustained CPU was about 0.480%. Both
+paths preserved content, configuration and host structure. These figures are
+not production application benchmarks.
 
 ## Safety model
 
@@ -155,6 +175,11 @@ production performance claims.
   action.
 - normal daemon and CLI cannot apply DAMOS; only the explicit manual
   `--damos` validation scope can page out its owned synthetic COLD mapping.
+- normal daemon and CLI cannot start, tune or stop KSM or mark memory
+  mergeable; `run=2` is forbidden. Only explicit manual `--ksm` and
+  `--ksm-inefficient` validation scopes may operate on cooperative children
+  after a persisted audit. They preserve baseline scanner settings and mutate
+  only `run=0→1→0`.
 
 See [the safety model](docs/safety-model.md).
 
@@ -183,6 +208,11 @@ nemorctl damos status
 nemorctl damos plan latest
 nemorctl damos history
 nemorctl damos blacklist
+nemorctl ksm status
+nemorctl ksm processes
+nemorctl ksm plan latest
+nemorctl ksm report latest
+nemorctl ksm history
 ```
 
 Read commands accept `--json` at their terminal command position. DAMON export
@@ -233,15 +263,22 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
   remains unavailable to normal `nemord` and `nemorctl`; rollback stops further
   reclaim but cannot undo pages already paged out byte-for-byte;
 - no LRU, migration, arbitrary-process, foreground, or gaming reclaim exists.
+- KSM profiles are conservative planning templates, not permission or
+  profitability proof; Nemor cannot remotely opt arbitrary processes into KSM.
+- Phase 9 live validation preserved the host scanner settings
+  (`pages_to_scan=100`, `sleep_millisecs=20`); dynamic scanner tuning is not
+  separately validated.
 
 ## Roadmap
 
-- Completed and validated on CachyOS: Phases 0–5, Phase 7 and Phase 8.
+- Completed and validated on CachyOS: Phases 0–5 and Phases 7–9.
 - Phase 6 implementation and live-safe swapfile validation are complete;
   dedicated zswap+NVMe boot validation remains pending.
 - The runtime default remains observe-only despite isolated privileged
   validation of Phases 3, 5, 6, 7 and 8.
-- Phase 9 is planned and not started.
+- Phase 9 validated both profitable selective KSM and real ineffective-workload
+  auto-disable/cooldown on cooperative owned targets.
+- Phase 10 is not started.
 
 ## Documentation
 
@@ -254,6 +291,7 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - [Zswap and storage tiering](docs/tiering.md)
 - [DAMON monitor-only telemetry](docs/damon.md)
 - [DAMOS controlled reclaim](docs/damos.md)
+- [Selective KSM](docs/ksm.md)
 - [Safety model](docs/safety-model.md)
 - [Database](docs/database.md)
 - [CachyOS validation](docs/cachyos-validation.md)
@@ -271,3 +309,4 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 | 6 development | 173 | CachyOS read-only + live-safe swapfile; boot pending | current development |
 | 7 | 213 | CachyOS real `vaddr`, 9 windows, zero DAMOS, host unchanged | current Phase 7 commit |
 | 8 | 268 | CachyOS controlled synthetic DAMOS pageout; 8 MiB COLD-only reclaim, refault/recovery, host unchanged | current Phase 8 commit |
+| 9 | 316 | CachyOS selective KSM: profitable path plus ineffective auto-disable/cooldown; host unchanged | current Phase 9 commit |

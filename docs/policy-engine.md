@@ -43,8 +43,8 @@ There is no zswap tuning, sysctl, reclaim, freezer, process signal,
 
 Phase 7 may supply read-only DAMON availability and hot/cold observational
 evidence to reports. It adds no policy action and cannot cause DAMON sysfs,
-tracefs or DAMOS mutation. Controlled DAMOS intent belongs to the unstarted
-Phase 8.
+tracefs or DAMOS mutation. Phase 8 controlled DAMOS remains plan-only in the
+normal runtime; its live validation path is separate.
 
 Policy expresses intent; concrete targets still pass the Phase 3 actuator’s
 stable identity allow-list, PID/start-tick, classification, ownership, and
@@ -73,3 +73,15 @@ identity. `nemor-damos` revalidates identity, history, fence, quota, conflicts,
 and blacklist. The daemon never applies the plan. Real pageout validation is
 confined to the separately audited manual harness and does not broaden this
 production policy boundary.
+
+## Phase 9 selective KSM plans
+
+KSM remains a background, plan-only optimization. NORMAL may plan a stable,
+cooperative candidate; WATCH continues only known-profitable candidates.
+PRESSURE starts no unknown work, while CRITICAL, EMERGENCY, STABILIZING and
+gaming modes start none. Foreground, critical, stale/unknown identity and
+foreign security-domain protections always win. Scanner CPU, profit, COW rate
+and cooldown decisions are deterministic and explainable.
+Owned synthetic validation proved both PROFITABLE and
+EVALUATING→INEFFICIENT→COOLDOWN behavior. This does not grant production
+mutation permission to VM, browser or Electron classifications.

@@ -1,0 +1,16 @@
+[package]
+name = "nemor-ksm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+policy-engine = { package = "nemor-policy-engine", path = "../policy-engine" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

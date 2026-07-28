@@ -290,3 +290,24 @@ structure was unchanged.
 control slowdown 0%. This validates only the controlled synthetic owned-target
 path. The normal daemon remains observe-only, and Phase 6 dedicated
 zswap+NVMe boot validation remains pending.
+
+## Phase 9 selective KSM validation
+
+On CachyOS kernel `7.1.4-1-cachyos`, read-only inspection found KSM sysfs with
+`run=0`, `pages_to_scan=100`, `sleep_millisecs=20`, `smart_scan=1`, fixed
+advisor selection (`[none] scan-time`) and the optional advisor controls.
+System KSM counters, `cow_ksm` and `ksm_swpin_copy` were zero; process
+`ksm_stat` was readable and no external mergeable activity was observed.
+The inventory was followed by a successful owned cooperative `--ksm`
+positive-path validation in ATTEMPT 3 and a successful real
+`--ksm-inefficient` behavioral validation in ATTEMPT 5.
+
+ATTEMPT 3 measured 39,931,904 saved bytes, a 39,651,328-byte positive
+system-profit delta, two full scans and about 0.538% sustained `ksmd` CPU.
+ATTEMPT 5 measured two new full scans, zero attributable current-session
+savings, 8,192 rmap items, zero merging pages and `-524288` bytes process
+profit for each owned child. The controller transitioned to INEFFICIENT,
+stopped its owned scanner, entered COOLDOWN and rejected the same plan.
+Sustained CPU was about 0.480%. Both runs preserved content, configuration and
+host structure. These are host-specific synthetic results, not application
+benchmarks.

@@ -559,6 +559,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nemor-ksm"
+version = "0.1.0"
+dependencies = [
+ "nemor-policy-engine",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "nemor-policy-engine"
 version = "0.1.0"
 dependencies = [
@@ -582,6 +592,7 @@ dependencies = [
  "nemor-collector",
  "nemor-common",
  "nemor-damos",
+ "nemor-ksm",
  "nemor-policy-engine",
  "rusqlite",
  "serde",
@@ -603,6 +614,7 @@ dependencies = [
  "nemor-common",
  "nemor-damon",
  "nemor-damos",
+ "nemor-ksm",
  "nemor-policy-engine",
  "nemor-storage",
  "nemor-tiering",
@@ -647,6 +659,7 @@ dependencies = [
  "nemor-common",
  "nemor-damon",
  "nemor-damos",
+ "nemor-ksm",
  "nemor-policy-engine",
  "nemor-storage",
  "nemor-test-support",
@@ -668,6 +681,7 @@ dependencies = [
  "nemor-common",
  "nemor-damon",
  "nemor-damos",
+ "nemor-ksm",
  "nemor-policy-engine",
  "nemor-storage",
  "nemor-test-support",

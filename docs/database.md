@@ -113,3 +113,11 @@ early-refault blacklist evidence. It preserves decision/plan/session/scheme
 links and tried/applied distinction without storing memory contents. Phase 8
 validation proved the audit chain on an owned synthetic action; normal daemon
 operation remains plan-only and does not create live pageout results.
+
+## KSM migration
+
+`0007_ksm.sql` records bounded KSM system/process samples and profitability
+evaluations linked to policy decisions, plans and controller transitions. It
+stores no memory contents, PFNs, environment variables or secrets. Validation
+hash evidence is bounded to counts, aggregate digests and at most sixteen
+sample hashes per child.

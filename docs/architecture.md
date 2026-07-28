@@ -126,3 +126,14 @@ owned recovery. `nemor-damon` remains observational. Production is plan-only;
 kernel mutation exists only in the manual privileged validation binary. That
 controlled owned-target path is validated on CachyOS with exact pagemap
 evidence; it is not an automatic production reclaim path.
+
+## Phase 9 KSM boundary
+
+`nemor-ksm` is the fourteenth workspace crate. It owns KSM capability and
+metrics, conservative VM/browser/Electron profiles, scanner planning,
+profit/CPU-cost evaluation, the auto-disable controller and owned validation
+transactions. Normal daemon integration is read-only and plan-only. The
+validated mutating paths are manual `--ksm` and `--ksm-inefficient` scopes with
+cooperative synthetic children; they
+cannot opt arbitrary external processes into KSM and hard-rejects global
+`run=2`. See [Selective KSM](ksm.md).

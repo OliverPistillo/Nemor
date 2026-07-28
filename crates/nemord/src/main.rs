@@ -89,6 +89,24 @@ async fn run(loaded: LoadedConfig) -> Result<()> {
             "cgroup actuator remains fail-closed"
         ),
     }
+    let ksm_report = ksm::inspect_linux(
+        std::path::Path::new("/sys/kernel/mm/ksm"),
+        std::path::Path::new("/proc"),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    info!(
+        event = "ksm_observe_inventory",
+        supported = ksm_report.capability.supported,
+        run = ?ksm_report.system.run,
+        external_mergeable_processes = ksm_report.processes.len(),
+        dry_run = ksm_report.dry_run,
+        configured_enabled = loaded.config.ksm.enabled,
+        configured_live_apply = loaded.config.ksm.live_apply,
+        "KSM capability and metrics inspected without mutation"
+    );
 
     let mut storage = Storage::open(&loaded.config.general.database_path).with_context(|| {
         format!(

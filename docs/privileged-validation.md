@@ -213,3 +213,36 @@ zero OOM and structural host equality passed. `kdamond` CPU was 0.25%,
 validation-control CPU approximately 0.25876444%, and control slowdown 0%.
 These results apply only to the bounded owned synthetic target. Normal
 `nemord` and `nemorctl` cannot execute pageout.
+
+## Phase 9 KSM gates (validated)
+
+`--ksm` is a separate explicit scope. It requires an isolated baseline
+(`run=0`, no external mergeable processes or ambiguous shared pages), fixed
+scanner control, sufficient allocation/unmerge headroom and audited owned
+children. Only the children mark their duplicate ranges mergeable. The harness
+persists the audit before opt-in, verifies exact `smaps` `mg` scope, and for
+ATTEMPT 1 writes only `run=0→1→0`. Baseline `pages_to_scan` and
+`sleep_millisecs` are validated but never changed. It continuously detects
+external mergeable processes and global setting changes, never uses `run=2`,
+and leaves DAMON/DAMOS, swap, zram, zswap, THP globals,
+NUMA KSM policy and boot state untouched. CI performs no live KSM mutation.
+
+The non-root `--ksm-bootstrap-preflight` diagnostic exercises the same worker
+allocation path without `MADV_MERGEABLE` or KSM sysfs writes. It verifies
+runtime page alignment and exact range-based `smaps` coverage, including
+`KernelPageSize`, `MMUPageSize`, `AnonHugePages`, `nh` and absence of `mg`.
+This diagnostic is not a privileged KSM validation.
+
+KSM CPU samples use the measured `CLK_TCK`. Short 500 ms samples and their
+quantization resolution are diagnostic only. The 1% one-logical-CPU gate is
+evaluated only after a sustained window reaches 0.25% or finer resolution.
+Every post-`run=1` exit follows a common stop/evidence/content/cleanup path.
+
+`--ksm-inefficient` is the separately validated manual scope for real
+controller auto-disable. It uses deterministic unique page payloads, evaluates
+signed baseline-relative counters and exact owned-process evidence, requires
+two new full scans, and accepts success only when insufficient owned profit—not
+CPU, residual global accounting or safety failure—causes the owned controller
+stop and cooldown rejection. Non-zero historical KSM counters are recorded but
+do not imply a live external consumer; current process `smaps` `KSM:` bytes and
+mergeability flags provide that evidence. It is never included in `--all`.

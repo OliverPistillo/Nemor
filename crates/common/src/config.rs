@@ -155,7 +155,21 @@ pub struct TieringConfig {
 #[serde(deny_unknown_fields)]
 pub struct KsmConfig {
     pub enabled: bool,
+    pub live_apply: bool,
     pub profiles: Vec<String>,
+    pub min_observation_seconds: u64,
+    pub min_mergeable_bytes: u64,
+    pub max_cpu_overhead_percent: f64,
+    pub min_process_profit_bytes: i64,
+    pub min_system_profit_bytes: i64,
+    pub max_cow_events_per_second: u64,
+    pub inefficiency_windows: u32,
+    pub cooldown_seconds: u64,
+    pub scanner_pages_to_scan_min: u64,
+    pub scanner_pages_to_scan_max: u64,
+    pub scanner_sleep_millisecs_min: u64,
+    pub validation_max_seconds: u64,
+    pub validation_max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,6 +656,49 @@ impl Config {
                 "must remain false in the current implementation",
             ));
         }
+        if self.ksm.live_apply {
+            return Err(validation(
+                "ksm.live_apply",
+                "normal runtime must remain plan-only",
+            ));
+        }
+        let allowed_profiles = ["vm", "browser", "electron"];
+        if self.ksm.profiles.is_empty()
+            || self
+                .ksm
+                .profiles
+                .iter()
+                .any(|profile| !allowed_profiles.contains(&profile.as_str()))
+        {
+            return Err(validation(
+                "ksm.profiles",
+                "must contain only vm, browser, and electron",
+            ));
+        }
+        if self.ksm.min_observation_seconds == 0
+            || self.ksm.min_mergeable_bytes == 0
+            || self.ksm.inefficiency_windows == 0
+            || self.ksm.cooldown_seconds == 0
+            || self.ksm.validation_max_seconds == 0
+            || self.ksm.validation_max_bytes == 0
+        {
+            return Err(validation("ksm", "bounded values must be non-zero"));
+        }
+        if !self.ksm.max_cpu_overhead_percent.is_finite()
+            || self.ksm.max_cpu_overhead_percent <= 0.0
+            || self.ksm.max_cpu_overhead_percent > self.safety.max_cpu_overhead_percent
+        {
+            return Err(validation(
+                "ksm.max_cpu_overhead_percent",
+                "must be positive and at most the global safety ceiling",
+            ));
+        }
+        if self.ksm.scanner_pages_to_scan_min == 0
+            || self.ksm.scanner_pages_to_scan_min > self.ksm.scanner_pages_to_scan_max
+            || self.ksm.scanner_sleep_millisecs_min == 0
+        {
+            return Err(validation("ksm.scanner", "invalid scanner bounds"));
+        }
         if self.damon.enabled {
             return Err(validation(
                 "damon.enabled",
@@ -1056,6 +1113,27 @@ mod tests {
         let error = Config::from_toml(&changed("[ksm]\nenabled = false", "[ksm]\nenabled = true"))
             .expect_err("KSM must remain disabled");
         assert!(error.to_string().contains("ksm.enabled"));
+    }
+
+    #[test]
+    fn phase_nine_ksm_is_always_plan_only_and_bounded() {
+        let live = changed("live_apply=false", "live_apply=true");
+        let error = Config::from_toml(&live).expect_err("KSM live apply must remain forbidden");
+        assert!(error.to_string().contains("ksm.live_apply"));
+
+        let cpu = changed(
+            "max_cpu_overhead_percent = 0.8",
+            "max_cpu_overhead_percent = 6.0",
+        );
+        let error = Config::from_toml(&cpu).expect_err("KSM CPU ceiling must be bounded");
+        assert!(error.to_string().contains("ksm.max_cpu_overhead_percent"));
+
+        let scanner = changed(
+            "scanner_pages_to_scan_min = 50",
+            "scanner_pages_to_scan_min = 1001",
+        );
+        let error = Config::from_toml(&scanner).expect_err("KSM scanner bounds must be ordered");
+        assert!(error.to_string().contains("ksm.scanner"));
     }
 
     #[test]

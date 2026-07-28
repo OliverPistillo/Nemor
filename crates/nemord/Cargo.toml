@@ -13,6 +13,7 @@ classifier = { package = "nemor-classifier", path = "../classifier" }
 common = { package = "nemor-common", path = "../common" }
 damon = { package = "nemor-damon", path = "../damon" }
 damos = { package = "nemor-damos", path = "../damos" }
+ksm = { package = "nemor-ksm", path = "../ksm" }
 policy-engine = { package = "nemor-policy-engine", path = "../policy-engine" }
 storage = { package = "nemor-storage", path = "../storage" }
 tiering = { package = "nemor-tiering", path = "../tiering" }

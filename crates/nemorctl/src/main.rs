@@ -3,11 +3,12 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use nemorctl::{
     cgroups_status, damon_export, damon_report_latest, damon_sessions, damon_status,
-    damos_blacklist, damos_history, damos_plan_latest, damos_status, doctor, policy_latest,
-    policy_status, render_cgroups_status, render_doctor, render_policy_latest,
-    render_policy_status, render_report, render_status, render_workload, render_zram,
-    report_latest, status, tiering_recommend, tiering_report_latest, tiering_status,
-    workload_latest, zram_profiles, zram_report_latest, zram_status, DoctorEnvironment,
+    damos_blacklist, damos_history, damos_plan_latest, damos_status, doctor, ksm_history,
+    ksm_plan_latest, ksm_processes, ksm_report_latest, ksm_status, policy_latest, policy_status,
+    render_cgroups_status, render_doctor, render_policy_latest, render_policy_status,
+    render_report, render_status, render_workload, render_zram, report_latest, status,
+    tiering_recommend, tiering_report_latest, tiering_status, workload_latest, zram_profiles,
+    zram_report_latest, zram_status, DoctorEnvironment,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -64,6 +65,10 @@ enum Command {
     Damos {
         #[command(subcommand)]
         command: DamosCommand,
+    },
+    Ksm {
+        #[command(subcommand)]
+        command: KsmCommand,
     },
 }
 
@@ -209,6 +214,46 @@ enum DamosCommand {
 
 #[derive(Debug, Subcommand)]
 enum DamosPlanCommand {
+    Latest {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KsmCommand {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Processes {
+        #[arg(long)]
+        json: bool,
+    },
+    Plan {
+        #[command(subcommand)]
+        command: KsmPlanCommand,
+    },
+    Report {
+        #[command(subcommand)]
+        command: KsmReportCommand,
+    },
+    History {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KsmPlanCommand {
+    Latest {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KsmReportCommand {
     Latest {
         #[arg(long)]
         json: bool,
@@ -377,6 +422,42 @@ fn run() -> anyhow::Result<i32> {
             command: DamosCommand::Blacklist { json },
         } => {
             print!("{}", render_zram(&damos_blacklist(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Ksm {
+            command: KsmCommand::Status { json },
+        } => {
+            print!("{}", render_zram(&ksm_status(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Ksm {
+            command: KsmCommand::Processes { json },
+        } => {
+            print!("{}", render_zram(&ksm_processes(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Ksm {
+            command:
+                KsmCommand::Plan {
+                    command: KsmPlanCommand::Latest { json },
+                },
+        } => {
+            print!("{}", render_zram(&ksm_plan_latest(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Ksm {
+            command:
+                KsmCommand::Report {
+                    command: KsmReportCommand::Latest { json },
+                },
+        } => {
+            print!("{}", render_zram(&ksm_report_latest(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Ksm {
+            command: KsmCommand::History { json },
+        } => {
+            print!("{}", render_zram(&ksm_history(&cli.config)?, json)?);
             Ok(0)
         }
     }

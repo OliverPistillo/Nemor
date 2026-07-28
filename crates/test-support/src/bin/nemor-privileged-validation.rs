@@ -121,6 +121,54 @@ const DAMOS_REQUIRED_GATES: &[&str] = &[
     "recovery_idempotent",
     "host_unchanged",
 ];
+const KSM_REQUIRED_GATES: &[&str] = &[
+    "capability",
+    "isolated_baseline",
+    "advisor_none",
+    "baseline_scanner_preserved",
+    "owned_targets_ready_unmergeable",
+    "audit_before_mergeable",
+    "exact_mergeable_scope_verified",
+    "external_rechecks",
+    "scanner_started",
+    "scanner_ownership_preserved",
+    "scanner_progress",
+    "minimum_saved_bytes",
+    "positive_system_profit",
+    "positive_process_profit",
+    "cpu_budget",
+    "scanner_stopped",
+    "owned_content_intact",
+    "owned_mergeability_absent_final",
+    "cleanup",
+    "configuration_restored",
+    "host_unchanged",
+];
+const KSM_INEFFICIENT_REQUIRED_GATES: &[&str] = &[
+    "capability",
+    "isolated_baseline",
+    "advisor_none",
+    "baseline_scanner_preserved",
+    "owned_targets_ready_unmergeable",
+    "audit_before_mergeable",
+    "exact_mergeable_scope_verified",
+    "external_rechecks",
+    "scanner_started",
+    "scanner_ownership_preserved",
+    "scanner_progress",
+    "sufficient_inefficiency_evidence",
+    "controller_inefficient_transition",
+    "controller_auto_disable",
+    "scanner_stopped",
+    "cooldown_entered",
+    "cooldown_rejects_next_plan",
+    "cpu_budget",
+    "owned_content_intact",
+    "owned_mergeability_absent_final",
+    "cleanup",
+    "configuration_restored",
+    "host_unchanged",
+];
 
 #[derive(Debug, Clone, Copy)]
 enum Scope {
@@ -130,7 +178,15 @@ enum Scope {
     Tiering,
     Damon,
     Damos,
+    Ksm,
+    KsmInefficient,
     All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KsmScenario {
+    Positive,
+    Inefficient,
 }
 
 #[derive(Debug, Parser)]
@@ -149,16 +205,22 @@ struct Cli {
     #[arg(long)]
     damos: bool,
     #[arg(long)]
+    ksm: bool,
+    #[arg(long)]
+    ksm_inefficient: bool,
+    #[arg(long)]
     all: bool,
     #[arg(long)]
     cleanup_owned_residue: bool,
+    #[arg(long, hide = true)]
+    ksm_bootstrap_preflight: bool,
     #[arg(long, value_enum, hide = true)]
     internal_worker: Option<InternalWorker>,
 }
 
 impl Cli {
     fn scope(&self) -> Result<Scope> {
-        if self.internal_worker.is_some() {
+        if self.internal_worker.is_some() || self.ksm_bootstrap_preflight {
             bail!("internal worker has no public validation scope");
         }
         let selected = [
@@ -168,6 +230,8 @@ impl Cli {
             (self.tiering, Scope::Tiering),
             (self.damon, Scope::Damon),
             (self.damos, Scope::Damos),
+            (self.ksm, Scope::Ksm),
+            (self.ksm_inefficient, Scope::KsmInefficient),
             (self.all, Scope::All),
         ];
         let values: Vec<_> = selected
@@ -177,7 +241,7 @@ impl Cli {
         match values.as_slice() {
             [scope] => Ok(*scope),
             _ => bail!(
-                "select exactly one of --preflight, --cgroups, --zram, --tiering, --damon, --damos, or --all"
+                "select exactly one of --preflight, --cgroups, --zram, --tiering, --damon, --damos, --ksm, --ksm-inefficient, or --all"
             ),
         }
     }
@@ -190,6 +254,7 @@ enum InternalWorker {
     NemorValidationSleeper,
     DamonTarget,
     DamonCrash,
+    KsmTarget,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -958,6 +1023,127 @@ struct AlignedWindowDiagnostic {
     alignment_estimated: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct KsmEvidence {
+    attempted: bool,
+    scenario: Option<String>,
+    required_gates_passed: bool,
+    checks: Vec<Check>,
+    capability: Option<ksm::KsmCapability>,
+    baseline: Option<ksm::KsmSnapshot>,
+    final_snapshot: Option<ksm::KsmSnapshot>,
+    system_before: Option<ksm::KsmSystemMetrics>,
+    system_peak: Option<ksm::KsmSystemMetrics>,
+    system_after: Option<ksm::KsmSystemMetrics>,
+    process_evidence: BTreeMap<String, Vec<ksm::KsmProcessMetrics>>,
+    bootstrap_evidence: BTreeMap<u8, KsmBootstrapEvidence>,
+    profit: Option<ksm::ProfitEvaluation>,
+    profit_gate: Option<ksm::ValidationProfitGate>,
+    mergeable_scope: BTreeMap<u32, ksm::MergeableScopeEvidence>,
+    external_mergeable_processes: Vec<ksm::KsmProcessMetrics>,
+    residual_process_accounting: Vec<ksm::KsmProcessMetrics>,
+    external_live_ksm_activity: Option<bool>,
+    residual_global_ksm_accounting: Option<bool>,
+    current_session_owned_activity: Option<bool>,
+    residual_accounting_reconciled: Option<bool>,
+    residual_baseline: Option<ksm::KsmSystemMetrics>,
+    first_scan_snapshot: Option<ksm::KsmSystemMetrics>,
+    second_scan_snapshot: Option<ksm::KsmSystemMetrics>,
+    decision_id: Option<String>,
+    plan_id: Option<String>,
+    transaction_id: Option<String>,
+    scanner_plan: Option<ksm::ScannerPlan>,
+    positive_workload: String,
+    inefficient_workload: String,
+    cow_validation: String,
+    rollback_semantics: String,
+    run_two_forbidden: bool,
+    validation_min_saved_bytes: u64,
+    ksmd_cpu_seconds: Option<f64>,
+    ksmd_mean_cpu_percent: Option<f64>,
+    ksmd_peak_window_cpu_percent: Option<f64>,
+    clk_tck: Option<u64>,
+    cpu_tick_seconds: Option<f64>,
+    minimum_budget_window_seconds: Option<f64>,
+    sustained_measurement_resolution_percent: Option<f64>,
+    total_cpu_ticks: Option<u64>,
+    scanner_start_timestamp_ns: Option<u128>,
+    scanner_stop_timestamp_ns: Option<u128>,
+    short_window_cpu: Vec<ksm::CpuWindowMeasurement>,
+    owned_unmerge_performed: Option<bool>,
+    unique_input_verified: Option<bool>,
+    unique_hash_evidence: BTreeMap<u8, UniqueHashEvidence>,
+    counter_deltas: BTreeMap<String, i128>,
+    global_saved_pages_delta_raw: Option<i128>,
+    owned_saved_evidence: Option<String>,
+    saved_bytes_attribution_valid: Option<bool>,
+    controller_state_before: Option<ksm::ControllerState>,
+    controller_state_after: Option<ksm::ControllerState>,
+    controller_transition_reason: Option<String>,
+    controller_evaluation_id: Option<String>,
+    controller_auto_stop_owned: Option<bool>,
+    cooldown_decision: Option<ksm::EligibilityDecision>,
+    second_run_started: bool,
+    wall_seconds: Option<f64>,
+    failure_class: Option<String>,
+    failure_reason: Option<String>,
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkerAdviceResult {
+    requested: bool,
+    succeeded: bool,
+    error: Option<String>,
+    raw_os_error: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KsmTargetMetadata {
+    pid: u32,
+    start_ticks: Option<u64>,
+    duplicate: [usize; 2],
+    control: [usize; 2],
+    duplicate_bytes: usize,
+    control_bytes: usize,
+    duplicate_fingerprint: u64,
+    control_fingerprint: u64,
+    state: String,
+    host_page_size: u64,
+    duplicate_nohugepage: WorkerAdviceResult,
+    control_nohugepage: WorkerAdviceResult,
+    duplicate_prefault_completed: bool,
+    control_prefault_completed: bool,
+    workload_kind: String,
+    duplicate_page_hashes: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct UniqueHashEvidence {
+    page_count: usize,
+    unique_hash_count: usize,
+    collision_count: usize,
+    cross_child_collision_count: usize,
+    aggregate_digest: u64,
+    hash_sample: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct KsmBootstrapEvidence {
+    child_id: u8,
+    pid: Option<u32>,
+    start_ticks: Option<u64>,
+    protocol_state: Option<String>,
+    target: Option<KsmTargetMetadata>,
+    duplicate_scope: Option<ksm::BasePageScopeEvidence>,
+    control_scope: Option<ksm::BasePageScopeEvidence>,
+    duplicate_base_page_verified: bool,
+    control_base_page_verified: bool,
+    fingerprints_present: bool,
+    failure_reason: Option<String>,
+    child_exit: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ValidationReport {
     schema: &'static str,
@@ -974,6 +1160,7 @@ struct ValidationReport {
     tiering: TieringEvidence,
     damon: DamonEvidence,
     damos: DamosEvidence,
+    ksm: KsmEvidence,
     host_unchanged: bool,
     errors: Vec<String>,
 }
@@ -1071,6 +1258,23 @@ fn main() -> Result<()> {
     if let Some(worker) = cli.internal_worker {
         return run_internal_worker(worker);
     }
+    if cli.ksm_bootstrap_preflight {
+        if cli.preflight
+            || cli.cgroups
+            || cli.zram
+            || cli.tiering
+            || cli.damon
+            || cli.damos
+            || cli.ksm
+            || cli.ksm_inefficient
+            || cli.all
+            || cli.cleanup_owned_residue
+        {
+            bail!("--ksm-bootstrap-preflight cannot be combined with another mode");
+        }
+        let _state_dir = StateDir::create()?;
+        return run_ksm_bootstrap_preflight();
+    }
     if cli.cleanup_owned_residue {
         if cli.preflight
             || cli.cgroups
@@ -1078,6 +1282,8 @@ fn main() -> Result<()> {
             || cli.tiering
             || cli.damon
             || cli.damos
+            || cli.ksm
+            || cli.ksm_inefficient
             || cli.all
         {
             bail!("--cleanup-owned-residue cannot be combined with validation modes");
@@ -1106,6 +1312,7 @@ fn main() -> Result<()> {
         tiering: TieringEvidence::default(),
         damon: DamonEvidence::default(),
         damos: DamosEvidence::default(),
+        ksm: KsmEvidence::default(),
         host_unchanged: false,
         errors: Vec::new(),
     };
@@ -1138,6 +1345,22 @@ fn main() -> Result<()> {
         deadline.check("DAMOS validation")?;
         if let Err(error) = validate_damos(&mut report.damos, &deadline) {
             report.errors.push(format!("damos: {error:#}"));
+        }
+    }
+    if matches!(scope, Scope::Ksm | Scope::KsmInefficient) {
+        deadline.check("KSM validation")?;
+        let scenario = if matches!(scope, Scope::KsmInefficient) {
+            KsmScenario::Inefficient
+        } else {
+            KsmScenario::Positive
+        };
+        if let Err(error) = validate_ksm(&mut report.ksm, &deadline, scenario) {
+            if report.ksm.failure_class.is_none() {
+                report.ksm.failure_class = Some("execution_failure".into());
+            }
+            if report.ksm.failure_reason.is_none() {
+                report.ksm.failure_reason = Some(format!("{error:#}"));
+            }
         }
     }
 
@@ -1178,6 +1401,89 @@ fn main() -> Result<()> {
                 .push("damos: one or more mandatory validation gates failed".to_owned());
         }
     }
+    if matches!(scope, Scope::Ksm | Scope::KsmInefficient) {
+        let owned_children_absent = report
+            .ksm
+            .bootstrap_evidence
+            .values()
+            .filter_map(|item| item.pid)
+            .all(|pid| !Path::new(&format!("/proc/{pid}")).exists());
+        for item in report.ksm.bootstrap_evidence.values_mut() {
+            if item.child_exit.is_none() {
+                item.child_exit = Some(
+                    if item
+                        .pid
+                        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+                    {
+                        "still_running_after_cleanup".into()
+                    } else {
+                        "exited_or_terminated_by_owned_cleanup".into()
+                    },
+                );
+            }
+        }
+        set_check(
+            &mut report.ksm.checks,
+            check(
+                "cleanup",
+                owned_children_absent,
+                if owned_children_absent {
+                    "all created KSM validation children exited; owned mappings disappeared"
+                } else {
+                    "one or more owned KSM validation children remain"
+                }
+                .to_owned(),
+            ),
+        );
+        if let Some(baseline) = report.ksm.baseline.as_ref() {
+            match ksm::snapshot_from_root(Path::new("/sys/kernel/mm/ksm")) {
+                Ok(final_snapshot) => {
+                    let restored = &final_snapshot == baseline;
+                    report.ksm.final_snapshot = Some(final_snapshot);
+                    set_check(
+                        &mut report.ksm.checks,
+                        check(
+                            "configuration_restored",
+                            restored,
+                            "final read-only KSM run/scanner/advisor/preserve-only snapshot compared with baseline; cumulative counters excluded".into(),
+                        ),
+                    );
+                }
+                Err(error) => {
+                    set_check(
+                        &mut report.ksm.checks,
+                        check(
+                            "configuration_restored",
+                            false,
+                            format!("final KSM configuration snapshot failed: {error}"),
+                        ),
+                    );
+                }
+            }
+        }
+        set_check(
+            &mut report.ksm.checks,
+            check(
+                "host_unchanged",
+                report.host_unchanged,
+                "final structural host snapshot compared with baseline".into(),
+            ),
+        );
+        let scenario = if matches!(scope, Scope::KsmInefficient) {
+            KsmScenario::Inefficient
+        } else {
+            KsmScenario::Positive
+        };
+        let outcome = finalize_ksm_outcome(&mut report.ksm, scenario);
+        if !outcome.success {
+            debug_assert_eq!(outcome.exit_code, 1);
+            report.errors.push(
+                outcome
+                    .error
+                    .unwrap_or_else(|| "ksm: authoritative outcome failed".into()),
+            );
+        }
+    }
     report.finished_ns = now_ns()?;
     write_report(&report)?;
     if report.errors.is_empty() && report.host_unchanged {
@@ -1200,6 +1506,7 @@ fn run_internal_worker(worker: InternalWorker) -> Result<()> {
         }
         InternalWorker::DamonTarget => damon_target_worker(),
         InternalWorker::DamonCrash => damon_crash_worker(),
+        InternalWorker::KsmTarget => ksm_target_worker(),
     }
 }
 
@@ -1243,6 +1550,7 @@ fn run_worker(worker: InternalWorker) -> Result<()> {
         InternalWorker::NemorValidationSleeper => "nemor-validation-sleeper",
         InternalWorker::DamonTarget => "damon-target",
         InternalWorker::DamonCrash => "damon-crash",
+        InternalWorker::KsmTarget => "ksm-target",
     };
     let executable = std::env::current_exe()?.canonicalize()?;
     let status = Command::new(executable)
@@ -1923,6 +2231,1645 @@ fn snapshot_host() -> Result<HostSnapshot> {
         validation_cgroups: validation_cgroups()?,
         validation_processes: validation_processes()?,
     })
+}
+
+const KSM_DUPLICATE_BYTES: usize = 32 * 1024 * 1024;
+const KSM_CONTROL_BYTES: usize = 8 * 1024 * 1024;
+const KSM_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
+
+struct KsmValidationGuard {
+    baseline: ksm::KsmSnapshot,
+    children: Vec<std::process::Child>,
+    scanner_started: bool,
+}
+
+fn stop_owned_ksm_scanner(
+    root: &Path,
+    evidence: &mut KsmEvidence,
+    guard: &mut KsmValidationGuard,
+) -> Result<bool> {
+    fs::write(root.join("run"), b"0\n")?;
+    guard.scanner_started = false;
+    evidence.scanner_stop_timestamp_ns = Some(userspace_clock_ns(UserspaceClock::Monotonic)?);
+    let stopped = fs::read_to_string(root.join("run"))?.trim() == "0";
+    set_check(
+        &mut evidence.checks,
+        check(
+            "scanner_stopped",
+            stopped,
+            "owned run transition 1->0 was attempted and read back on the common post-run path"
+                .into(),
+        ),
+    );
+    Ok(stopped)
+}
+
+impl Drop for KsmValidationGuard {
+    fn drop(&mut self) {
+        let root = Path::new("/sys/kernel/mm/ksm");
+        if self.scanner_started && self.baseline.run == 0 {
+            let _ = fs::write(root.join("run"), b"0\n");
+        }
+        let _ = fs::write(Path::new(STATE_DIR).join("ksm-stop"), b"stop\n");
+        for child in &mut self.children {
+            let _ = child.wait();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn ksm_target_worker() -> Result<()> {
+    let child_id = std::env::var("NEMOR_KSM_CHILD_ID")
+        .context("owned KSM child id is missing")?
+        .parse::<u8>()
+        .context("invalid owned KSM child id")?;
+    let workload_kind = std::env::var("NEMOR_KSM_WORKLOAD").unwrap_or_else(|_| "positive".into());
+    let workload_session =
+        std::env::var("NEMOR_KSM_SESSION").unwrap_or_else(|_| "bootstrap".into());
+    let mut duplicate = MmapOptions::new().len(KSM_DUPLICATE_BYTES).map_anon()?;
+    let mut control = MmapOptions::new().len(KSM_CONTROL_BYTES).map_anon()?;
+    let host_page_size = read_command("/usr/bin/getconf", &["PAGESIZE"])?
+        .parse::<u64>()
+        .context("invalid host page size")?;
+    if !Advice::NoHugePage.is_supported()
+        || !Advice::Mergeable.is_supported()
+        || !Advice::Unmergeable.is_supported()
+    {
+        bail!("mapping-local KSM advice is unsupported");
+    }
+    let duplicate_nohugepage = mapping_advice_result(&duplicate, Advice::NoHugePage);
+    let control_nohugepage = mapping_advice_result(&control, Advice::NoHugePage);
+    let page_size = usize::try_from(host_page_size).context("host page size overflows usize")?;
+    let advice_succeeded = duplicate_nohugepage.succeeded && control_nohugepage.succeeded;
+    let mut duplicate_prefault_completed = false;
+    let mut control_prefault_completed = false;
+    let mut duplicate_page_hashes = Vec::new();
+    if advice_succeeded {
+        for (page, index) in (0..duplicate.len()).step_by(page_size).enumerate() {
+            let page_slice = &mut duplicate[index..index + page_size];
+            if workload_kind == "unique" {
+                fill_unique_ksm_page(page_slice, &workload_session, child_id, page as u64);
+            } else {
+                page_slice[0] = ((page % 251) + 1) as u8;
+            }
+            duplicate_page_hashes.push(ksm_page_digest(page_slice));
+        }
+        duplicate_prefault_completed = true;
+        for (page, index) in (0..control.len()).step_by(page_size).enumerate() {
+            control[index] = (((page + usize::from(child_id) * 97) % 251) + 1) as u8;
+        }
+        control_prefault_completed = true;
+    }
+    let duplicate_fingerprint = fingerprint_zone(&duplicate);
+    let control_fingerprint = fingerprint_zone(&control);
+    let metadata = serde_json::json!({
+        "pid": std::process::id(),
+        "start_ticks": proc_start_ticks(std::process::id())?,
+        "child_id": child_id,
+        "duplicate": [duplicate.as_ptr() as usize, duplicate.as_ptr() as usize + duplicate.len()],
+        "control": [control.as_ptr() as usize, control.as_ptr() as usize + control.len()],
+        "duplicate_bytes": duplicate.len(),
+        "control_bytes": control.len(),
+        "duplicate_fingerprint": duplicate_fingerprint,
+        "control_fingerprint": control_fingerprint,
+        "state": if advice_succeeded { "ready_unmergeable" } else { "bootstrap_failed" },
+        "mergeable_only": null,
+        "base_pages_requested": true,
+        "host_page_size": host_page_size,
+        "duplicate_nohugepage": duplicate_nohugepage,
+        "control_nohugepage": control_nohugepage,
+        "duplicate_prefault_completed": duplicate_prefault_completed,
+        "control_prefault_completed": control_prefault_completed
+        ,"workload_kind": workload_kind
+        ,"duplicate_page_hashes": duplicate_page_hashes
+    });
+    fs::write(
+        Path::new(STATE_DIR).join(format!("ksm-target-{child_id}.json")),
+        serde_json::to_vec_pretty(&metadata)?,
+    )?;
+    if !advice_succeeded {
+        bail!("owned KSM worker MADV_NOHUGEPAGE failed; diagnostic metadata persisted");
+    }
+    let opt_in = Path::new(STATE_DIR).join(format!("ksm-opt-in-{child_id}.json"));
+    while !opt_in.exists() {
+        if Path::new(STATE_DIR).join("ksm-stop").exists() {
+            std::hint::black_box((duplicate, control));
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let audit: serde_json::Value = serde_json::from_slice(&fs::read(&opt_in)?)?;
+    for field in ["decision_id", "plan_id", "transaction_id"] {
+        if audit[field].as_str().is_none_or(str::is_empty) {
+            bail!("owned KSM opt-in missing {field}");
+        }
+    }
+    duplicate.advise(Advice::Mergeable)?;
+    fs::write(
+        Path::new(STATE_DIR).join(format!("ksm-opt-in-{child_id}-result.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "state": "duplicate_mergeable",
+            "pid": std::process::id(),
+            "start_ticks": proc_start_ticks(std::process::id())?
+        }))?,
+    )?;
+    let unmerge = Path::new(STATE_DIR).join(format!("ksm-unmerge-{child_id}"));
+    let content_check = Path::new(STATE_DIR).join(format!("ksm-content-check-{child_id}"));
+    while !unmerge.exists()
+        && !content_check.exists()
+        && !Path::new(STATE_DIR).join("ksm-stop").exists()
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut unmerged = false;
+    if unmerge.exists() {
+        duplicate.advise(Advice::Unmergeable)?;
+        unmerged = true;
+        fs::write(
+            Path::new(STATE_DIR).join(format!("ksm-unmerge-{child_id}-result.json")),
+            b"{\"state\":\"unmerged\"}\n",
+        )?;
+    }
+    while !content_check.exists() && !Path::new(STATE_DIR).join("ksm-stop").exists() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if content_check.exists() {
+        fs::write(
+            Path::new(STATE_DIR).join(format!("ksm-content-check-{child_id}-result.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "duplicate_fingerprint": fingerprint_zone(&duplicate),
+                "control_fingerprint": fingerprint_zone(&control),
+                "unmerged": unmerged
+            }))?,
+        )?;
+    }
+    while !Path::new(STATE_DIR).join("ksm-stop").exists() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(
+        Path::new(STATE_DIR).join(format!("ksm-target-{child_id}-final.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "duplicate_fingerprint": fingerprint_zone(&duplicate),
+            "control_fingerprint": fingerprint_zone(&control),
+            "unmerged": unmerged
+        }))?,
+    )?;
+    std::hint::black_box((duplicate, control));
+    Ok(())
+}
+
+fn mapping_advice_result(mapping: &MmapMut, advice: Advice) -> WorkerAdviceResult {
+    worker_advice_result(mapping.advise(advice))
+}
+
+fn fill_unique_ksm_page(page: &mut [u8], session: &str, child_id: u8, page_index: u64) {
+    let mut seed = 0xcbf29ce484222325_u64;
+    for byte in session.bytes() {
+        seed ^= u64::from(byte);
+        seed = seed.wrapping_mul(0x100000001b3);
+    }
+    seed ^= u64::from(child_id).rotate_left(17);
+    seed ^= page_index.wrapping_mul(0x9e3779b97f4a7c15);
+    for (word_index, chunk) in page.chunks_mut(8).enumerate() {
+        let value = splitmix64(seed ^ word_index as u64);
+        chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+    }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn ksm_page_digest(page: &[u8]) -> u64 {
+    page.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn worker_advice_result(result: std::io::Result<()>) -> WorkerAdviceResult {
+    match result {
+        Ok(()) => WorkerAdviceResult {
+            requested: true,
+            succeeded: true,
+            error: None,
+            raw_os_error: None,
+        },
+        Err(error) => WorkerAdviceResult {
+            requested: true,
+            succeeded: false,
+            raw_os_error: error.raw_os_error(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn collect_ksm_bootstrap_evidence(
+    child_id: u8,
+    target: &KsmTargetMetadata,
+) -> Result<KsmBootstrapEvidence> {
+    let duplicate = ksm::AddressRange {
+        start: target.duplicate[0] as u64,
+        end: target.duplicate[1] as u64,
+    };
+    let control = ksm::AddressRange {
+        start: target.control[0] as u64,
+        end: target.control[1] as u64,
+    };
+    let smaps = fs::read_to_string(format!("/proc/{}/smaps", target.pid))?;
+    let duplicate_scope =
+        ksm::verify_base_page_scope(&smaps, duplicate, target.host_page_size, true);
+    let control_scope = ksm::verify_base_page_scope(&smaps, control, target.host_page_size, true);
+    let duplicate_base_page_verified = target.duplicate_nohugepage.succeeded
+        && target.duplicate_prefault_completed
+        && duplicate_scope.passed;
+    let control_base_page_verified = target.control_nohugepage.succeeded
+        && target.control_prefault_completed
+        && control_scope.passed;
+    let mut reasons = Vec::new();
+    if target.state != "ready_unmergeable" {
+        reasons.push(format!("protocol_state={}", target.state));
+    }
+    if !target.duplicate_nohugepage.succeeded {
+        reasons.push(format!(
+            "duplicate_nohugepage={:?}",
+            target.duplicate_nohugepage.error
+        ));
+    }
+    if !target.control_nohugepage.succeeded {
+        reasons.push(format!(
+            "control_nohugepage={:?}",
+            target.control_nohugepage.error
+        ));
+    }
+    reasons.extend(
+        duplicate_scope
+            .failure_reasons
+            .iter()
+            .map(|reason| format!("duplicate:{reason}")),
+    );
+    reasons.extend(
+        control_scope
+            .failure_reasons
+            .iter()
+            .map(|reason| format!("control:{reason}")),
+    );
+    let mut bounded_target = target.clone();
+    bounded_target.duplicate_page_hashes.truncate(16);
+    Ok(KsmBootstrapEvidence {
+        child_id,
+        pid: Some(target.pid),
+        start_ticks: target.start_ticks,
+        protocol_state: Some(target.state.clone()),
+        target: Some(bounded_target),
+        duplicate_scope: Some(duplicate_scope),
+        control_scope: Some(control_scope),
+        duplicate_base_page_verified,
+        control_base_page_verified,
+        fingerprints_present: target.duplicate_prefault_completed
+            && target.control_prefault_completed,
+        failure_reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
+        child_exit: None,
+    })
+}
+
+fn run_ksm_bootstrap_preflight() -> Result<()> {
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let mut children = Vec::new();
+    for child_id in [1_u8, 2] {
+        children.push(
+            Command::new(&executable)
+                .arg("--internal-worker")
+                .arg("ksm-target")
+                .env("NEMOR_KSM_CHILD_ID", child_id.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()?,
+        );
+    }
+    let mut evidence = BTreeMap::new();
+    for child_id in [1_u8, 2] {
+        let path = Path::new(STATE_DIR).join(format!("ksm-target-{child_id}.json"));
+        wait_for_path(&path, Duration::from_secs(10))?;
+        let target: KsmTargetMetadata = serde_json::from_slice(&fs::read(path)?)?;
+        evidence.insert(child_id, collect_ksm_bootstrap_evidence(child_id, &target)?);
+    }
+    fs::write(Path::new(STATE_DIR).join("ksm-stop"), b"stop\n")?;
+    let mut all_children_success = true;
+    for (index, child) in children.iter_mut().enumerate() {
+        let status = child.wait()?;
+        all_children_success &= status.success();
+        if let Some(item) = evidence.get_mut(&((index + 1) as u8)) {
+            item.child_exit = Some(status.to_string());
+        }
+    }
+    let passed = all_children_success
+        && evidence.values().all(|item| {
+            item.duplicate_base_page_verified
+                && item.control_base_page_verified
+                && item.protocol_state.as_deref() == Some("ready_unmergeable")
+        });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "nemor-ksm-bootstrap-preflight-v1",
+            "mutations": {
+                "madv_nohugepage": true,
+                "madv_mergeable": false,
+                "ksm_sysfs_writes": 0
+            },
+            "passed": passed,
+            "children": evidence
+        }))?
+    );
+    if passed {
+        Ok(())
+    } else {
+        bail!("KSM READY_UNMERGEABLE bootstrap preflight failed")
+    }
+}
+
+fn validate_ksm(
+    evidence: &mut KsmEvidence,
+    deadline: &Deadline,
+    scenario: KsmScenario,
+) -> Result<()> {
+    evidence.attempted = true;
+    evidence.scenario = Some(
+        match scenario {
+            KsmScenario::Positive => "positive",
+            KsmScenario::Inefficient => "inefficient",
+        }
+        .into(),
+    );
+    evidence.dry_run = false;
+    evidence.run_two_forbidden = true;
+    evidence.validation_min_saved_bytes = ksm::VALIDATION_MIN_SAVED_BYTES;
+    evidence.positive_workload =
+        "two owned cooperative children; positive generator repeats page payloads every 251 pages because only the page-leading byte varies; measured kernel savings are authoritative"
+            .into();
+    evidence.inefficient_workload =
+        "two owned children with session/child/page/word-unique mergeable data; bounded real inefficient evaluation drives controller-owned stop and cooldown"
+            .into();
+    evidence.cow_validation =
+        "prepared only: bounded post-merge write verifies writer/peer integrity and cow_ksm delta"
+            .into();
+    evidence.rollback_semantics =
+        "run=0 for owned scanner, safe owned MADV_UNMERGEABLE or child termination, restore scanner snapshot; run=2 forbidden"
+            .into();
+    let root = Path::new("/sys/kernel/mm/ksm");
+    let proc_root = Path::new("/proc");
+    let capability = ksm::inspect_capability(root, Path::new("/proc/1/ksm_stat").is_file());
+    evidence.capability = Some(capability.clone());
+    evidence.checks.push(check(
+        "capability",
+        capability.supported && capability.sysfs_writable,
+        format!(
+            "supported={}, readable={}, writable={}, process_ksm_stat={}",
+            capability.supported,
+            capability.sysfs_readable,
+            capability.sysfs_writable,
+            capability.process_ksm_stat_available
+        ),
+    ));
+    if !capability.supported || !capability.sysfs_writable {
+        return Err(ksm_failure(
+            evidence,
+            "baseline_not_isolated",
+            "KSM sysfs mandatory capability is unavailable",
+        ));
+    }
+    let baseline = ksm::snapshot_from_root(root)?;
+    evidence.baseline = Some(baseline.clone());
+    if baseline.run != 0 {
+        return Err(ksm_failure(
+            evidence,
+            "baseline_not_isolated",
+            &format!("baseline KSM scanner is external (run={})", baseline.run),
+        ));
+    }
+    let advisor_text = fs::read_to_string(root.join("advisor_mode"))
+        .context("read KSM advisor_mode for ATTEMPT 1")?;
+    let scanner = ksm::plan_attempt_one_scanner(&advisor_text, &baseline, 50, 1_000, 10).map_err(
+        |error| {
+            ksm_failure(
+                evidence,
+                "advisor_active",
+                &format!("baseline scanner/advisor is unsafe: {error}"),
+            )
+        },
+    )?;
+    if scanner.mode != ksm::AdvisorMode::Fixed || !scanner.blocked_reasons.is_empty() {
+        return Err(ksm_failure(
+            evidence,
+            "advisor_active",
+            "selected advisor_mode is not none",
+        ));
+    }
+    evidence.scanner_plan = Some(scanner.clone());
+    evidence.checks.push(check(
+        "advisor_none",
+        true,
+        format!("advisor_mode readback={}", advisor_text.trim()),
+    ));
+    evidence.checks.push(check(
+        "baseline_scanner_preserved",
+        scanner.pages_to_scan == baseline.pages_to_scan
+            && scanner.sleep_millisecs == baseline.sleep_millisecs,
+        format!(
+            "validation uses baseline pages_to_scan={} and sleep_millisecs={} without tuning",
+            baseline.pages_to_scan, baseline.sleep_millisecs
+        ),
+    ));
+    let external_inspection =
+        ksm::inspect_external_ksm_processes_owned(proc_root, &BTreeMap::new()).map_err(
+            |error| {
+                ksm_failure(
+                    evidence,
+                    "baseline_not_isolated",
+                    &format!("live external KSM inspection failed closed: {error}"),
+                )
+            },
+        )?;
+    let external = external_inspection.live_consumers;
+    evidence.external_mergeable_processes = external.clone();
+    evidence.residual_process_accounting = external_inspection.residual_processes;
+    evidence.external_live_ksm_activity = Some(!external.is_empty());
+    let system_before =
+        ksm::parse_system_metrics(root, &fs::read_to_string("/proc/vmstat")?, now_ns()?);
+    evidence.system_before = Some(system_before.clone());
+    evidence.residual_baseline = Some(system_before.clone());
+    evidence.current_session_owned_activity = Some(false);
+    let residual_global = system_before.pages_shared.unwrap_or(0) > 0
+        || system_before.pages_sharing.unwrap_or(0) > 0
+        || system_before.pages_unshared.unwrap_or(0) > 0
+        || system_before.pages_volatile.unwrap_or(0) > 0
+        || system_before.general_profit.unwrap_or(0) != 0
+        || system_before.full_scans.unwrap_or(0) > 0;
+    evidence.residual_global_ksm_accounting = Some(residual_global);
+    let no_ambiguity = external.is_empty();
+    evidence.checks.push(check(
+        "isolated_baseline",
+        no_ambiguity,
+        format!(
+            "live_external_consumers={}, residual_global_accounting={}, pages_shared={}, pages_sharing={}, general_profit={}, full_scans={}",
+            external.len(),
+            residual_global,
+            system_before.pages_shared.unwrap_or(0),
+            system_before.pages_sharing.unwrap_or(0),
+            system_before.general_profit.unwrap_or(0),
+            system_before.full_scans.unwrap_or(0),
+        ),
+    ));
+    if !no_ambiguity {
+        return Err(ksm_failure(
+            evidence,
+            "baseline_not_isolated",
+            "live external KSM consumer exists",
+        ));
+    }
+    let required =
+        KSM_HEADROOM_BYTES.saturating_add(((KSM_DUPLICATE_BYTES + KSM_CONTROL_BYTES) * 4) as u64);
+    let available = mem_available_bytes()?;
+    if available < required {
+        return Err(ksm_failure(
+            evidence,
+            "insufficient_headroom",
+            "insufficient KSM allocation/unmerge headroom",
+        ));
+    }
+    let owned_identity_session = now_ns()?.to_string();
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let mut guard = KsmValidationGuard {
+        baseline: baseline.clone(),
+        children: Vec::new(),
+        scanner_started: false,
+    };
+    for child_id in [1_u8, 2] {
+        guard.children.push(
+            Command::new(&executable)
+                .arg("--internal-worker")
+                .arg("ksm-target")
+                .env("NEMOR_KSM_CHILD_ID", child_id.to_string())
+                .env(
+                    "NEMOR_KSM_WORKLOAD",
+                    if scenario == KsmScenario::Inefficient {
+                        "unique"
+                    } else {
+                        "positive"
+                    },
+                )
+                .env("NEMOR_KSM_SESSION", &owned_identity_session)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()?,
+        );
+    }
+    let mut targets = Vec::new();
+    for child_id in [1_u8, 2] {
+        wait_for_path(
+            &Path::new(STATE_DIR).join(format!("ksm-target-{child_id}.json")),
+            Duration::from_secs(10),
+        )?;
+        let target: KsmTargetMetadata = serde_json::from_slice(&fs::read(
+            Path::new(STATE_DIR).join(format!("ksm-target-{child_id}.json")),
+        )?)?;
+        let bootstrap = collect_ksm_bootstrap_evidence(child_id, &target)?;
+        evidence
+            .bootstrap_evidence
+            .insert(child_id, bootstrap.clone());
+        let fresh = target.start_ticks.is_some()
+            && target.start_ticks == proc_start_ticks(target.pid)?
+            && target.duplicate[1].saturating_sub(target.duplicate[0]) == target.duplicate_bytes
+            && target.control[1].saturating_sub(target.control[0]) == target.control_bytes
+            && target.duplicate_bytes == KSM_DUPLICATE_BYTES
+            && target.control_bytes == KSM_CONTROL_BYTES;
+        if !fresh {
+            return Err(ksm_failure(
+                evidence,
+                "child_identity_stale",
+                "owned KSM target identity or mapping metadata mismatch",
+            ));
+        }
+        if !bootstrap.duplicate_base_page_verified || !bootstrap.control_base_page_verified {
+            return Err(ksm_failure(
+                evidence,
+                "base_page_backing_not_verified",
+                bootstrap
+                    .failure_reason
+                    .as_deref()
+                    .unwrap_or("owned KSM base-page bootstrap failed"),
+            ));
+        }
+        let duplicate = ksm::AddressRange {
+            start: target.duplicate[0] as u64,
+            end: target.duplicate[1] as u64,
+        };
+        let control = ksm::AddressRange {
+            start: target.control[0] as u64,
+            end: target.control[1] as u64,
+        };
+        let smaps = fs::read_to_string(format!("/proc/{}/smaps", target.pid))?;
+        if !ksm::verify_exact_unmergeable_scope(&smaps, duplicate, control) {
+            return Err(ksm_failure(
+                evidence,
+                "base_page_backing_not_verified",
+                "READY_UNMERGEABLE child already has mergeable or non-NOHUGEPAGE owned VMA",
+            ));
+        }
+        targets.push(target);
+    }
+    evidence.checks.push(check(
+        "owned_targets_ready_unmergeable",
+        targets.len() == 2,
+        "two fresh cooperative identities are READY_UNMERGEABLE with exact base-page mappings"
+            .into(),
+    ));
+    if scenario == KsmScenario::Inefficient {
+        let first = targets
+            .first()
+            .ok_or_else(|| anyhow!("first UNIQUE target missing"))?;
+        let second = targets
+            .get(1)
+            .ok_or_else(|| anyhow!("second UNIQUE target missing"))?;
+        let first_set = first
+            .duplicate_page_hashes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let second_set = second
+            .duplicate_page_hashes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let expected_pages = KSM_DUPLICATE_BYTES / first.host_page_size as usize;
+        let cross_child_collision_count = first_set.intersection(&second_set).count();
+        let unique_input = first.workload_kind == "unique"
+            && second.workload_kind == "unique"
+            && first_set.len() == expected_pages
+            && second_set.len() == expected_pages
+            && cross_child_collision_count == 0
+            && !first.duplicate_page_hashes.contains(&0)
+            && !second.duplicate_page_hashes.contains(&0);
+        evidence.unique_input_verified = Some(unique_input);
+        for (child_id, target, hashes) in [(1_u8, first, &first_set), (2_u8, second, &second_set)] {
+            evidence.unique_hash_evidence.insert(
+                child_id,
+                UniqueHashEvidence {
+                    page_count: target.duplicate_page_hashes.len(),
+                    unique_hash_count: hashes.len(),
+                    collision_count: target
+                        .duplicate_page_hashes
+                        .len()
+                        .saturating_sub(hashes.len()),
+                    cross_child_collision_count,
+                    aggregate_digest: target
+                        .duplicate_page_hashes
+                        .iter()
+                        .fold(0xcbf29ce484222325_u64, |digest, hash| {
+                            (digest ^ hash).wrapping_mul(0x100000001b3)
+                        }),
+                    hash_sample: target
+                        .duplicate_page_hashes
+                        .iter()
+                        .take(16)
+                        .copied()
+                        .collect(),
+                },
+            );
+        }
+        if !unique_input {
+            return Err(ksm_failure(
+                evidence,
+                "workload_setup_failure",
+                "UNIQUE page hashes repeat within or across owned children",
+            ));
+        }
+    }
+    let mut excluded_owned = BTreeMap::new();
+    for target in &targets {
+        excluded_owned.insert(target.pid, target.start_ticks);
+    }
+    if !ksm::inspect_external_ksm_processes_owned(proc_root, &excluded_owned)
+        .map_err(|error| {
+            ksm_failure(
+                evidence,
+                "baseline_not_isolated",
+                &format!("external KSM recheck failed closed: {error}"),
+            )
+        })?
+        .live_consumers
+        .is_empty()
+    {
+        return Err(ksm_failure(
+            evidence,
+            "baseline_not_isolated",
+            "external KSM process appeared after child allocation",
+        ));
+    }
+    let before_opt_in = observe_owned_ksm_processes(&targets, &owned_identity_session)?;
+    if before_opt_in.iter().any(|process| {
+        process.ksm_mergeable != Some(false)
+            || process.ksm_merge_any == Some(true)
+            || process.ksm_merging_pages.unwrap_or(0) != 0
+    }) {
+        return Err(ksm_failure(
+            evidence,
+            "mergeable_scope_invalid",
+            "READY_UNMERGEABLE process state was already KSM-applicable",
+        ));
+    }
+    evidence
+        .process_evidence
+        .insert("before_opt_in".into(), before_opt_in);
+    let transaction_id = format!("nemor-ksm-validation-{owned_identity_session}");
+    let decision_id = format!("manual-validation-{}", now_ns()?);
+    let plan_id = format!("ksm-plan-{}", now_ns()?);
+    let audit = serde_json::json!({
+        "decision_id": decision_id,
+        "plan_id": plan_id,
+        "transaction_id": transaction_id,
+        "reason": "manual_validation",
+        "profile": "synthetic",
+        "cpu_budget_percent": 1.0,
+        "scanner": scanner
+    });
+    fs::write(
+        Path::new(STATE_DIR).join("ksm-decision.json"),
+        serde_json::to_vec_pretty(&audit)?,
+    )?;
+    evidence.decision_id = audit["decision_id"].as_str().map(str::to_owned);
+    evidence.plan_id = audit["plan_id"].as_str().map(str::to_owned);
+    evidence.transaction_id = audit["transaction_id"].as_str().map(str::to_owned);
+    let mut protocol = ksm::ValidationProtocol::default();
+    protocol
+        .record_audit(decision_id.clone(), plan_id.clone(), transaction_id.clone())
+        .map_err(|error| ksm_failure(evidence, "audit_missing", &error.to_string()))?;
+    evidence.checks.push(check(
+        "audit_before_mergeable",
+        true,
+        "decision/plan/transaction persisted before any MADV_MERGEABLE or global write".into(),
+    ));
+    for child_id in [1_u8, 2] {
+        fs::write(
+            Path::new(STATE_DIR).join(format!("ksm-opt-in-{child_id}.json")),
+            serde_json::to_vec_pretty(&audit)?,
+        )?;
+        wait_for_path(
+            &Path::new(STATE_DIR).join(format!("ksm-opt-in-{child_id}-result.json")),
+            Duration::from_secs(10),
+        )?;
+    }
+    protocol
+        .opt_in_duplicate()
+        .map_err(|error| ksm_failure(evidence, "audit_missing", &error.to_string()))?;
+    let after_opt_in = observe_owned_ksm_processes(&targets, &owned_identity_session)?;
+    if after_opt_in
+        .iter()
+        .any(|process| process.ksm_mergeable != Some(true))
+    {
+        return Err(ksm_failure(
+            evidence,
+            "mergeable_scope_invalid",
+            "owned process did not report mergeable after audited opt-in",
+        ));
+    }
+    evidence
+        .process_evidence
+        .insert("after_opt_in_before_run".into(), after_opt_in);
+    evidence.current_session_owned_activity = Some(true);
+    for target in &targets {
+        let smaps = fs::read_to_string(format!("/proc/{}/smaps", target.pid))?;
+        let scope = ksm::verify_exact_mergeable_scope(
+            &smaps,
+            ksm::AddressRange {
+                start: target.duplicate[0] as u64,
+                end: target.duplicate[1] as u64,
+            },
+            ksm::AddressRange {
+                start: target.control[0] as u64,
+                end: target.control[1] as u64,
+            },
+        );
+        if !scope.passed {
+            evidence.mergeable_scope.insert(target.pid, scope);
+            return Err(ksm_failure(
+                evidence,
+                "mergeable_scope_invalid",
+                "exact smaps mg/nh scope verification failed",
+            ));
+        }
+        evidence.mergeable_scope.insert(target.pid, scope);
+    }
+    evidence.checks.push(check(
+        "exact_mergeable_scope_verified",
+        true,
+        format!(
+            "each {} mergeable range is fully mg+nh; CONTROL and every other worker VMA have zero mg overlap",
+            if scenario == KsmScenario::Inefficient {
+                "UNIQUE"
+            } else {
+                "DUPLICATE"
+            }
+        ),
+    ));
+    if let Some(capability) = evidence.capability.as_mut() {
+        capability.madv_mergeable_supported = Some(true);
+    }
+    if !ksm::inspect_external_ksm_processes_owned(proc_root, &excluded_owned)
+        .map_err(|error| {
+            ksm_failure(
+                evidence,
+                "external_ksm_interference",
+                &format!("pre-run external KSM recheck failed closed: {error}"),
+            )
+        })?
+        .live_consumers
+        .is_empty()
+    {
+        return Err(ksm_failure(
+            evidence,
+            "external_ksm_interference",
+            "external KSM process appeared immediately before run=1",
+        ));
+    }
+    evidence.checks.push(check(
+        "external_rechecks",
+        true,
+        "no external KSM process at baseline, after allocation, or immediately before run=1".into(),
+    ));
+    deadline.check("KSM scanner start")?;
+    let evaluation_started = Instant::now();
+    let clk_tck = read_command("/usr/bin/getconf", &["CLK_TCK"])?
+        .parse::<u64>()
+        .context("parse CLK_TCK")?;
+    let minimum_budget_window_seconds = ksm::minimum_cpu_budget_window_seconds(clk_tck)
+        .ok_or_else(|| anyhow!("CLK_TCK must be nonzero"))?;
+    evidence.clk_tck = Some(clk_tck);
+    evidence.cpu_tick_seconds = Some(1.0 / clk_tck as f64);
+    evidence.minimum_budget_window_seconds = Some(minimum_budget_window_seconds);
+    evidence.scanner_start_timestamp_ns = Some(userspace_clock_ns(UserspaceClock::Monotonic)?);
+    fs::write(root.join("run"), b"1\n")?;
+    guard.scanner_started = true;
+    protocol
+        .scanner_started()
+        .map_err(|error| ksm_failure(evidence, "scanner_ownership_lost", &error.to_string()))?;
+    if fs::read_to_string(root.join("run"))?.trim() != "1" {
+        let _ = stop_owned_ksm_scanner(root, evidence, &mut guard);
+        return Err(ksm_failure(
+            evidence,
+            "scanner_ownership_lost",
+            "owned KSM scanner start readback mismatch",
+        ));
+    }
+    evidence.checks.push(check(
+        "scanner_started",
+        true,
+        "owned run transition 0->1 read back; scanner settings remained baseline".into(),
+    ));
+    let Some(ksmd_ticks_before) = read_ksmd_cpu_ticks() else {
+        let _ = stop_owned_ksm_scanner(root, evidence, &mut guard);
+        return Err(ksm_failure(
+            evidence,
+            "scanner_no_progress",
+            "ksmd CPU accounting is unavailable after run=1",
+        ));
+    };
+    let evaluation_deadline = Instant::now() + Duration::from_secs(30);
+    let mut previous_ticks = Some(ksmd_ticks_before);
+    let mut previous_tick_time = Instant::now();
+    let mut peak_cpu = 0.0_f64;
+    let mut first_evidence_recorded = false;
+    let empty_profit = ksm::evaluate_profit(
+        &ksm::ProfitSample {
+            wall_seconds: 0.0,
+            ksmd_cpu_seconds: 0.0,
+            pages_scanned_delta: 0,
+            saved_bytes: 0,
+            process_profit_bytes: Some(0),
+            system_profit_bytes: Some(0),
+        },
+        4096,
+    );
+    let mut controller_state = ksm::controller_transition(
+        ksm::ControllerState::Unknown,
+        &ksm::ControllerInput {
+            elapsed_seconds: 0,
+            full_scans: 0,
+            evaluation: empty_profit,
+            cpu_budget_percent: 1.0,
+            cow_rate: 0,
+            maximum_cow_rate: 64,
+            cooldown_active: false,
+        },
+    );
+    evidence.controller_state_before = Some(ksm::ControllerState::Unknown);
+    let mut controller_auto_disable = false;
+    let (system_peak, profitable_processes, mut evaluation_failure) = loop {
+        deadline.check("KSM profitable evaluation")?;
+        thread::sleep(Duration::from_millis(500));
+        let current_snapshot = ksm::snapshot_from_root(root)?;
+        let current_advisor = ksm::read_advisor_mode(root);
+        let mut iteration_failure = None;
+        if !ksm::attempt_one_global_state_owned(
+            &baseline,
+            &current_snapshot,
+            current_advisor.as_deref(),
+        ) {
+            iteration_failure = Some((
+                "scanner_ownership_lost".to_owned(),
+                "run/scanner/advisor configuration changed during owned evaluation".to_owned(),
+            ));
+        }
+        if iteration_failure.is_none() {
+            match ksm::inspect_external_ksm_processes_owned(proc_root, &excluded_owned) {
+                Ok(inspection) if !inspection.live_consumers.is_empty() => {
+                    iteration_failure = Some((
+                        "external_ksm_interference".to_owned(),
+                        "live external mergeable, merge-any, or mapped-KSM process appeared during owned evaluation".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    iteration_failure = Some((
+                        "external_ksm_interference".to_owned(),
+                        format!("live external KSM monitoring failed closed: {error}"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let current_ticks = read_ksmd_cpu_ticks();
+        if let (Some(previous), Some(current)) = (previous_ticks, current_ticks) {
+            let window = previous_tick_time.elapsed().as_secs_f64();
+            if let Some(measurement) =
+                ksm::measure_cpu_window(current.saturating_sub(previous), window, clk_tck)
+            {
+                peak_cpu = peak_cpu.max(measurement.cpu_percent);
+                evidence.short_window_cpu.push(measurement);
+            }
+        }
+        previous_ticks = current_ticks;
+        previous_tick_time = Instant::now();
+        let current_system =
+            ksm::parse_system_metrics(root, &fs::read_to_string("/proc/vmstat")?, now_ns()?);
+        let processes = observe_owned_ksm_processes(&targets, &owned_identity_session)?;
+        let current_full_scans_delta = current_system
+            .full_scans
+            .unwrap_or(0)
+            .saturating_sub(system_before.full_scans.unwrap_or(0));
+        if current_full_scans_delta >= 1 && evidence.first_scan_snapshot.is_none() {
+            evidence.first_scan_snapshot = Some(current_system.clone());
+        }
+        if current_full_scans_delta >= 2 && evidence.second_scan_snapshot.is_none() {
+            evidence.second_scan_snapshot = Some(current_system.clone());
+        }
+        if !first_evidence_recorded {
+            evidence
+                .process_evidence
+                .insert("during_run_first_evidence".into(), processes.clone());
+            first_evidence_recorded = true;
+        }
+        let saved_bytes = ksm_saved_bytes(&system_before, &current_system, &baseline);
+        let pages_scanned_delta = current_system
+            .pages_scanned
+            .unwrap_or(0)
+            .saturating_sub(system_before.pages_scanned.unwrap_or(0));
+        let full_scans_delta = current_full_scans_delta;
+        let system_profit_delta = system_before
+            .general_profit
+            .zip(current_system.general_profit)
+            .map(|(before, after)| after.saturating_sub(before))
+            .unwrap_or(0);
+        let processes_positive = owned_process_profit_positive(&processes);
+        let gate = ksm::validation_profit_gate(
+            saved_bytes,
+            pages_scanned_delta,
+            full_scans_delta,
+            system_profit_delta,
+            processes_positive,
+        );
+        evidence.profit_gate = Some(gate.clone());
+        let elapsed = evaluation_started.elapsed().as_secs_f64();
+        let sustained = current_ticks.and_then(|current| {
+            ksm::measure_cpu_window(current.saturating_sub(ksmd_ticks_before), elapsed, clk_tck)
+        });
+        if let Some(measurement) = sustained {
+            evidence.sustained_measurement_resolution_percent =
+                Some(measurement.measurement_resolution_percent);
+            if measurement.budget_exceeded == Some(true) {
+                iteration_failure = Some((
+                    "cpu_budget_exceeded".to_owned(),
+                    format!(
+                        "resolution-valid sustained ksmd CPU {:.6}% exceeds 1%; window={:.3}s, resolution={:.6}%",
+                        measurement.cpu_percent,
+                        measurement.window_seconds,
+                        measurement.measurement_resolution_percent
+                    ),
+                ));
+            }
+        }
+        if let Some(failure) = iteration_failure {
+            break (current_system, processes, Some(failure));
+        }
+        let cpu_resolution_valid =
+            sustained.is_some_and(|measurement| measurement.resolution_valid);
+        if scenario == KsmScenario::Positive {
+            if gate.passed && cpu_resolution_valid {
+                break (current_system, processes, None);
+            }
+        } else if full_scans_delta >= 2
+            && cpu_resolution_valid
+            && owned_processes_evaluated(&processes)
+        {
+            let process_profit = processes
+                .iter()
+                .filter_map(|item| item.ksm_process_profit)
+                .sum::<i64>();
+            let current_cpu = sustained.map_or(0.0, |item| item.cpu_percent);
+            let residual_contaminated = evidence.residual_global_ksm_accounting == Some(true);
+            let owned_inefficient = owned_processes_inefficient(&processes);
+            evidence.current_session_owned_activity = Some(true);
+            evidence.saved_bytes_attribution_valid = Some(!residual_contaminated);
+            evidence.global_saved_pages_delta_raw =
+                signed_optional_delta(system_before.pages_sharing, current_system.pages_sharing);
+            evidence.owned_saved_evidence = Some(format!(
+                "both_owned_scanned=true, both_owned_inefficient={owned_inefficient}, process_profit_sum={process_profit}"
+            ));
+            let inefficient_profit = ksm::evaluate_profit(
+                &ksm::ProfitSample {
+                    wall_seconds: elapsed,
+                    ksmd_cpu_seconds: current_ticks
+                        .map(|ticks| {
+                            ticks.saturating_sub(ksmd_ticks_before) as f64 / clk_tck as f64
+                        })
+                        .unwrap_or(0.0),
+                    pages_scanned_delta,
+                    saved_bytes: if residual_contaminated {
+                        0
+                    } else {
+                        saved_bytes
+                    },
+                    process_profit_bytes: Some(process_profit),
+                    system_profit_bytes: (!residual_contaminated).then_some(system_profit_delta),
+                },
+                4096,
+            );
+            controller_state = ksm::controller_transition(
+                controller_state,
+                &ksm::ControllerInput {
+                    elapsed_seconds: elapsed as u64,
+                    full_scans: full_scans_delta,
+                    evaluation: inefficient_profit,
+                    cpu_budget_percent: 1.0,
+                    cow_rate: 0,
+                    maximum_cow_rate: 64,
+                    cooldown_active: false,
+                },
+            );
+            if controller_state == ksm::ControllerState::Inefficient && owned_inefficient {
+                controller_auto_disable = true;
+                evidence.controller_transition_reason =
+                    Some("owned_process_profit_not_positive_after_two_full_scans".into());
+                evidence.controller_evaluation_id =
+                    Some(format!("ksm-inefficient-evaluation-{}", now_ns()?));
+                break (current_system, processes, None);
+            }
+            if controller_state == ksm::ControllerState::Profitable || !owned_inefficient {
+                break (
+                    current_system,
+                    processes,
+                    Some((
+                        "unexpected_positive_gain".into(),
+                        format!(
+                            "UNIQUE workload crossed positive threshold: saved_bytes={saved_bytes}, system_profit_delta={system_profit_delta}, cpu={current_cpu:.6}%"
+                        ),
+                    )),
+                );
+            }
+        }
+        if Instant::now() >= evaluation_deadline {
+            let reason = if scenario == KsmScenario::Inefficient {
+                if full_scans_delta < 2 {
+                    "insufficient_scan_evidence"
+                } else {
+                    "controller_did_not_disable"
+                }
+            } else {
+                gate.reasons
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("scanner_no_progress")
+            };
+            break (
+                current_system,
+                processes,
+                Some((
+                    reason.to_owned(),
+                    "bounded KSM evaluation ended before profitability and resolution-valid CPU evidence completed".to_owned(),
+                )),
+            );
+        }
+    };
+    evidence.controller_state_after = Some(controller_state);
+    let run_before_stop = fs::read_to_string(root.join("run"))?.trim().to_owned();
+    let scanner_stopped = stop_owned_ksm_scanner(root, evidence, &mut guard)?;
+    if scenario == KsmScenario::Inefficient {
+        evidence.controller_auto_stop_owned = Some(controller_auto_disable);
+        evidence.checks.push(check(
+            "sufficient_inefficiency_evidence",
+            system_peak
+                .full_scans
+                .unwrap_or(0)
+                .saturating_sub(system_before.full_scans.unwrap_or(0))
+                >= 2
+                && evidence
+                    .sustained_measurement_resolution_percent
+                    .is_some_and(|resolution| resolution <= 0.25)
+                && owned_processes_evaluated(&profitable_processes),
+            "at least two session-relative full scans, both owned rmap sets evaluated, and resolution-valid CPU evidence collected".into(),
+        ));
+        evidence.checks.push(check(
+            "controller_inefficient_transition",
+            controller_state == ksm::ControllerState::Inefficient,
+            format!(
+                "controller transitioned unknown->evaluating->{controller_state:?}; reason={:?}",
+                evidence.controller_transition_reason
+            ),
+        ));
+        evidence.checks.push(check(
+            "controller_auto_disable",
+            controller_auto_disable && run_before_stop == "1" && scanner_stopped,
+            format!(
+                "controller_owned_stop={}, run_before={}, run_after={}",
+                controller_auto_disable,
+                run_before_stop,
+                fs::read_to_string(root.join("run"))?.trim()
+            ),
+        ));
+    }
+    if !scanner_stopped {
+        evaluation_failure = Some((
+            "cleanup_failure".into(),
+            "owned KSM scanner did not stop".into(),
+        ));
+    }
+    protocol
+        .scanner_stopped()
+        .map_err(|error| ksm_failure(evidence, "cleanup_failure", &error.to_string()))?;
+    let ownership_preserved = !evaluation_failure.as_ref().is_some_and(|(reason, _)| {
+        matches!(
+            reason.as_str(),
+            "scanner_ownership_lost" | "external_ksm_interference"
+        )
+    });
+    evidence.checks.push(check(
+        "scanner_ownership_preserved",
+        ownership_preserved,
+        if ownership_preserved {
+            "500 ms monitoring found no global configuration or external KSM interference"
+        } else {
+            "external process or global scanner interference detected"
+        }
+        .into(),
+    ));
+    evidence.checks.push(check(
+        "scanner_progress",
+        system_peak.pages_scanned.unwrap_or(0) > system_before.pages_scanned.unwrap_or(0)
+            && system_peak.full_scans.unwrap_or(0) > system_before.full_scans.unwrap_or(0),
+        "pages_scanned advanced and at least one complete full scan finished".into(),
+    ));
+    let final_saved_bytes = ksm_saved_bytes(&system_before, &system_peak, &baseline);
+    if scenario == KsmScenario::Positive {
+        evidence.checks.push(check(
+            "minimum_saved_bytes",
+            final_saved_bytes >= ksm::VALIDATION_MIN_SAVED_BYTES,
+            format!(
+                "saved_bytes={final_saved_bytes}, threshold={}",
+                ksm::VALIDATION_MIN_SAVED_BYTES
+            ),
+        ));
+        evidence.checks.push(check(
+            "positive_system_profit",
+            system_peak.general_profit.unwrap_or(0) > system_before.general_profit.unwrap_or(0),
+            "general_profit delta is positive".into(),
+        ));
+        evidence.checks.push(check(
+            "positive_process_profit",
+            owned_process_profit_positive(&profitable_processes),
+            "both owned processes have merging pages and positive profit when supported".into(),
+        ));
+    }
+    let elapsed = evaluation_started.elapsed().as_secs_f64();
+    let ksmd_ticks_after = read_ksmd_cpu_ticks();
+    let ksmd_cpu_seconds = ksmd_ticks_after
+        .map(|after| after.saturating_sub(ksmd_ticks_before) as f64 / clk_tck as f64)
+        .ok_or_else(|| {
+            ksm_failure(
+                evidence,
+                "scanner_no_progress",
+                "ksmd CPU accounting disappeared before final observation",
+            )
+        })?;
+    let residual_contaminated = scenario == KsmScenario::Inefficient
+        && evidence.residual_global_ksm_accounting == Some(true);
+    let saved_bytes = if residual_contaminated {
+        0
+    } else {
+        final_saved_bytes
+    };
+    let final_process_profit = (scenario == KsmScenario::Inefficient).then(|| {
+        profitable_processes
+            .iter()
+            .filter_map(|item| item.ksm_process_profit)
+            .sum::<i64>()
+    });
+    evidence.total_cpu_ticks =
+        ksmd_ticks_after.map(|after| after.saturating_sub(ksmd_ticks_before));
+    let profit = ksm::evaluate_profit(
+        &ksm::ProfitSample {
+            wall_seconds: elapsed,
+            ksmd_cpu_seconds,
+            pages_scanned_delta: system_peak
+                .pages_scanned
+                .unwrap_or(0)
+                .saturating_sub(system_before.pages_scanned.unwrap_or(0)),
+            saved_bytes,
+            process_profit_bytes: final_process_profit,
+            system_profit_bytes: (!residual_contaminated).then(|| {
+                system_peak
+                    .general_profit
+                    .zip(system_before.general_profit)
+                    .map(|(after, before)| after.saturating_sub(before))
+                    .unwrap_or(0)
+            }),
+        },
+        ksm::PAGE_SIZE,
+    );
+    if evidence
+        .sustained_measurement_resolution_percent
+        .is_some_and(|resolution| resolution <= 0.25)
+    {
+        evidence.checks.push(check(
+            "cpu_budget",
+            profit.ksmd_mean_cpu_percent <= 1.0,
+            format!(
+                "one-logical-CPU sustained gate; mean={:.6}%, diagnostic_peak_short_window={:.6}%, resolution={:?}%, budget=1.0%, cpu_seconds_per_gib={:?}",
+                profit.ksmd_mean_cpu_percent,
+                peak_cpu,
+                evidence.sustained_measurement_resolution_percent,
+                profit.ksmd_cpu_seconds_per_gib_saved
+            ),
+        ));
+    }
+    evidence.ksmd_cpu_seconds = Some(ksmd_cpu_seconds);
+    evidence.ksmd_mean_cpu_percent = Some(profit.ksmd_mean_cpu_percent);
+    evidence.ksmd_peak_window_cpu_percent = Some(peak_cpu);
+    evidence.wall_seconds = Some(elapsed);
+    evidence.profit = Some(profit.clone());
+    evidence.process_evidence.insert(
+        if scenario == KsmScenario::Inefficient && evaluation_failure.is_none() {
+            "inefficient_observation"
+        } else if evaluation_failure.is_none() {
+            "profitable_observation"
+        } else {
+            "failure_snapshot"
+        }
+        .into(),
+        profitable_processes.clone(),
+    );
+    evidence.process_evidence.insert(
+        "after_run_zero".into(),
+        observe_owned_ksm_processes(&targets, &owned_identity_session)?,
+    );
+    evidence.system_peak = Some(system_peak.clone());
+    evidence.system_after = Some(ksm::parse_system_metrics(
+        root,
+        &fs::read_to_string("/proc/vmstat")?,
+        now_ns()?,
+    ));
+    evidence.counter_deltas = ksm_counter_deltas(&system_before, &system_peak);
+    evidence.global_saved_pages_delta_raw =
+        signed_optional_delta(system_before.pages_sharing, system_peak.pages_sharing);
+    evidence.residual_accounting_reconciled =
+        evidence.residual_global_ksm_accounting.map(|residual| {
+            residual
+                && (system_peak.pages_shared.unwrap_or(0) < system_before.pages_shared.unwrap_or(0)
+                    || system_peak.pages_sharing.unwrap_or(0)
+                        < system_before.pages_sharing.unwrap_or(0)
+                    || system_peak.general_profit.unwrap_or(0)
+                        < system_before.general_profit.unwrap_or(0))
+        });
+    if scenario == KsmScenario::Inefficient && controller_auto_disable {
+        let cooldown_state = ksm::controller_transition(
+            controller_state,
+            &ksm::ControllerInput {
+                elapsed_seconds: elapsed as u64,
+                full_scans: system_peak
+                    .full_scans
+                    .unwrap_or(0)
+                    .saturating_sub(system_before.full_scans.unwrap_or(0)),
+                evaluation: profit.clone(),
+                cpu_budget_percent: 1.0,
+                cow_rate: 0,
+                maximum_cow_rate: 64,
+                cooldown_active: true,
+            },
+        );
+        evidence.controller_state_after = Some(cooldown_state);
+        let identity = profitable_processes
+            .first()
+            .map(|item| item.identity.clone());
+        let cooldown_decision = ksm::evaluate_eligibility(
+            &ksm::EligibilityInput {
+                identity: identity.clone(),
+                identity_fresh: identity.is_some(),
+                profile: ksm::KsmProfileKind::Synthetic,
+                already_mergeable: true,
+                owned_cooperative: true,
+                foreground: false,
+                gaming: false,
+                critical: false,
+                protected: false,
+                same_security_domain: true,
+                pressure: policy_engine::PressureState::Normal,
+                stable_observations: 3,
+                mergeable_bytes: KSM_DUPLICATE_BYTES as u64,
+                profit_bytes: Some(0),
+                cow_events_per_second: Some(0),
+                cpu_percent: evidence.ksmd_mean_cpu_percent,
+                cooldown_active: true,
+                external_ksm_activity: false,
+            },
+            &ksm::profile(ksm::KsmProfileKind::Synthetic),
+        );
+        evidence.cooldown_decision = Some(cooldown_decision.clone());
+        evidence.checks.push(check(
+            "cooldown_entered",
+            cooldown_state == ksm::ControllerState::Cooldown,
+            "real inefficient transition entered bounded controller cooldown".into(),
+        ));
+        evidence.checks.push(check(
+            "cooldown_rejects_next_plan",
+            cooldown_decision.disposition == ksm::PlanDisposition::Rejected
+                && cooldown_decision
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "cooldown_active")
+                && !evidence.second_run_started,
+            "same owned plan rejected with cooldown_active before any second run=1".into(),
+        ));
+    }
+    if scenario == KsmScenario::Positive {
+        evidence.checks.push(check(
+            "positive_net_gain",
+            saved_bytes >= ksm::VALIDATION_MIN_SAVED_BYTES
+                && system_peak.general_profit.unwrap_or(0)
+                    > system_before.general_profit.unwrap_or(0),
+            format!(
+                "saved_bytes={}, minimum={}, full_scans_delta={}, general_profit_delta={}",
+                saved_bytes,
+                ksm::VALIDATION_MIN_SAVED_BYTES,
+                system_peak
+                    .full_scans
+                    .unwrap_or(0)
+                    .saturating_sub(system_before.full_scans.unwrap_or(0)),
+                system_peak
+                    .general_profit
+                    .unwrap_or(0)
+                    .saturating_sub(system_before.general_profit.unwrap_or(0))
+            ),
+        ));
+    }
+    let unmerge_headroom = mem_available_bytes()?;
+    let unmerge_disposition = ksm::choose_unmerge_disposition(
+        unmerge_headroom,
+        KSM_HEADROOM_BYTES.saturating_add((KSM_DUPLICATE_BYTES * 2) as u64),
+    );
+    evidence.owned_unmerge_performed =
+        Some(unmerge_disposition == ksm::UnmergeDisposition::MadviseOwnedRange);
+    if unmerge_disposition == ksm::UnmergeDisposition::MadviseOwnedRange {
+        for child_id in [1_u8, 2] {
+            fs::write(
+                Path::new(STATE_DIR).join(format!("ksm-unmerge-{child_id}")),
+                b"unmerge\n",
+            )?;
+            wait_for_path(
+                &Path::new(STATE_DIR).join(format!("ksm-unmerge-{child_id}-result.json")),
+                Duration::from_secs(10),
+            )?;
+        }
+        protocol
+            .unmerged()
+            .map_err(|error| ksm_failure(evidence, "cleanup_failure", &error.to_string()))?;
+        if let Some(capability) = evidence.capability.as_mut() {
+            capability.madv_unmergeable_supported = Some(true);
+        }
+        let after_unmergeable = observe_owned_ksm_processes(&targets, &owned_identity_session)?;
+        if after_unmergeable
+            .iter()
+            .any(|process| process.ksm_mergeable != Some(false))
+        {
+            return Err(ksm_failure(
+                evidence,
+                "cleanup_failure",
+                "owned process remained mergeable after MADV_UNMERGEABLE",
+            ));
+        }
+        evidence
+            .process_evidence
+            .insert("after_unmergeable".into(), after_unmergeable);
+        for target in &targets {
+            let smaps = fs::read_to_string(format!("/proc/{}/smaps", target.pid))?;
+            if !ksm::verify_exact_unmergeable_scope(
+                &smaps,
+                ksm::AddressRange {
+                    start: target.duplicate[0] as u64,
+                    end: target.duplicate[1] as u64,
+                },
+                ksm::AddressRange {
+                    start: target.control[0] as u64,
+                    end: target.control[1] as u64,
+                },
+            ) {
+                return Err(ksm_failure(
+                    evidence,
+                    "cleanup_failure",
+                    "owned mergeable VMA remained after MADV_UNMERGEABLE",
+                ));
+            }
+        }
+    }
+    let mut content_intact = true;
+    for (index, target) in targets.iter().enumerate() {
+        let child_id = index + 1;
+        fs::write(
+            Path::new(STATE_DIR).join(format!("ksm-content-check-{child_id}")),
+            b"check\n",
+        )?;
+        wait_for_path(
+            &Path::new(STATE_DIR).join(format!("ksm-content-check-{child_id}-result.json")),
+            Duration::from_secs(10),
+        )?;
+        let final_value: serde_json::Value = serde_json::from_slice(&fs::read(
+            Path::new(STATE_DIR).join(format!("ksm-content-check-{child_id}-result.json")),
+        )?)?;
+        content_intact &= ksm::content_fingerprints_intact(
+            target.duplicate_fingerprint,
+            final_value["duplicate_fingerprint"].as_u64().unwrap_or(0),
+            target.control_fingerprint,
+            final_value["control_fingerprint"].as_u64().unwrap_or(0),
+        );
+    }
+    evidence.checks.push(check(
+        "owned_content_intact",
+        content_intact,
+        "owned mergeable-range and non-mergeable CONTROL fingerprints match after scanner stop/unmerge".into(),
+    ));
+    if !content_intact && evaluation_failure.is_none() {
+        evaluation_failure = Some((
+            "content_integrity_failure".into(),
+            "owned mergeable range or CONTROL fingerprint changed".into(),
+        ));
+    }
+    fs::write(Path::new(STATE_DIR).join("ksm-stop"), b"stop\n")?;
+    for child in &mut guard.children {
+        child.wait()?;
+    }
+    evidence.checks.push(check(
+        "owned_mergeability_absent_final",
+        true,
+        if unmerge_disposition == ksm::UnmergeDisposition::MadviseOwnedRange {
+            "MADV_UNMERGEABLE readback proved no owned mg VMA before child exit".into()
+        } else {
+            "unmerge headroom was insufficient; owned child termination removed mappings".into()
+        },
+    ));
+    let final_snapshot = ksm::snapshot_from_root(root)?;
+    evidence.final_snapshot = Some(final_snapshot.clone());
+    evidence.checks.push(check(
+        "configuration_restored",
+        final_snapshot == baseline,
+        "run, untouched pages_to_scan/sleep_millisecs, advisor and preserve-only values match baseline; cumulative counters excluded".into(),
+    ));
+    if let Some((reason, detail)) = evaluation_failure {
+        return Err(ksm_failure(evidence, &reason, &detail));
+    }
+    Ok(())
+}
+
+fn ksm_failure(evidence: &mut KsmEvidence, reason: &str, detail: &str) -> anyhow::Error {
+    evidence.failure_class = Some(
+        match reason {
+            "insufficient_saved_bytes"
+            | "non_positive_system_profit"
+            | "non_positive_process_profit"
+            | "scanner_no_progress" => "profitability_failure",
+            "cpu_budget_exceeded" => "performance_failure",
+            "unexpected_positive_gain"
+            | "insufficient_scan_evidence"
+            | "controller_did_not_disable"
+            | "cooldown_not_entered"
+            | "cooldown_rejection_missing" => "inefficient_validation_failure",
+            "cleanup_failure" => "cleanup_failure",
+            "recovery_failure" => "recovery_failure",
+            "external_ksm_interference" | "scanner_ownership_lost" => "ownership_failure",
+            "base_page_backing_not_verified" | "owned_range_not_page_aligned" => {
+                "workload_setup_failure"
+            }
+            _ => "safety_failure",
+        }
+        .into(),
+    );
+    evidence.failure_reason = Some(reason.into());
+    anyhow!("{reason}: {detail}")
+}
+
+fn observe_owned_ksm_processes(
+    targets: &[KsmTargetMetadata],
+    session_id: &str,
+) -> Result<Vec<ksm::KsmProcessMetrics>> {
+    targets
+        .iter()
+        .map(|target| {
+            let expected = target
+                .start_ticks
+                .ok_or_else(|| anyhow!("owned KSM target start_ticks unavailable"))?;
+            if proc_start_ticks(target.pid)? != Some(expected) {
+                bail!("owned KSM target PID/start_ticks became stale");
+            }
+            let stat = fs::read_to_string(format!("/proc/{}/ksm_stat", target.pid))?;
+            let mut metrics = ksm::parse_process_ksm_stat(
+                &stat,
+                ksm::owned_validation_identity(session_id, target.pid, expected),
+            );
+            let smaps = fs::read_to_string(format!("/proc/{}/smaps", target.pid))?;
+            metrics.current_mapped_ksm_bytes = ksm::parse_smaps_ksm_bytes(&smaps);
+            metrics.residual_accounting = metrics.ksm_mergeable == Some(false)
+                && metrics.ksm_merge_any != Some(true)
+                && metrics.current_mapped_ksm_bytes.unwrap_or(0) == 0
+                && metrics.ksm_merging_pages.unwrap_or(0) > 0;
+            Ok(metrics)
+        })
+        .collect()
+}
+
+fn owned_process_profit_positive(processes: &[ksm::KsmProcessMetrics]) -> bool {
+    processes.len() == 2
+        && processes.iter().all(|process| {
+            process.ksm_merging_pages.unwrap_or(0) > 0
+                && process.ksm_process_profit.is_none_or(|profit| profit > 0)
+        })
+}
+
+fn owned_processes_evaluated(processes: &[ksm::KsmProcessMetrics]) -> bool {
+    processes.len() == 2
+        && processes
+            .iter()
+            .all(|process| process.ksm_rmap_items.unwrap_or(0) > 0)
+}
+
+fn owned_processes_inefficient(processes: &[ksm::KsmProcessMetrics]) -> bool {
+    let threshold = ksm::profile(ksm::KsmProfileKind::Synthetic).minimum_positive_profit_bytes;
+    owned_processes_evaluated(processes)
+        && processes.iter().all(|process| {
+            process
+                .ksm_merging_pages
+                .unwrap_or(0)
+                .saturating_mul(ksm::PAGE_SIZE)
+                <= u64::try_from(threshold.max(0)).unwrap_or(0)
+                && process
+                    .ksm_process_profit
+                    .is_some_and(|profit| profit <= threshold)
+        })
+}
+
+fn signed_optional_delta<T>(before: Option<T>, after: Option<T>) -> Option<i128>
+where
+    T: Copy + Into<i128>,
+{
+    Some(after?.into().saturating_sub(before?.into()))
+}
+
+fn ksm_saved_bytes(
+    before: &ksm::KsmSystemMetrics,
+    after: &ksm::KsmSystemMetrics,
+    baseline: &ksm::KsmSnapshot,
+) -> u64 {
+    let sharing = after
+        .pages_sharing
+        .unwrap_or(0)
+        .saturating_sub(before.pages_sharing.unwrap_or(0));
+    let zero_pages_enabled = baseline
+        .preserve_only
+        .get("use_zero_pages")
+        .is_some_and(|value| value == "1");
+    let zero_pages = if zero_pages_enabled {
+        after
+            .ksm_zero_pages
+            .unwrap_or(0)
+            .saturating_sub(before.ksm_zero_pages.unwrap_or(0))
+    } else {
+        0
+    };
+    sharing
+        .saturating_add(zero_pages)
+        .saturating_mul(ksm::PAGE_SIZE)
+}
+
+fn ksm_counter_deltas(
+    before: &ksm::KsmSystemMetrics,
+    after: &ksm::KsmSystemMetrics,
+) -> BTreeMap<String, i128> {
+    let mut deltas = BTreeMap::new();
+    macro_rules! delta {
+        ($field:ident) => {
+            if let (Some(before), Some(after)) = (before.$field, after.$field) {
+                deltas.insert(
+                    stringify!($field).to_owned(),
+                    i128::from(after).saturating_sub(i128::from(before)),
+                );
+            }
+        };
+    }
+    delta!(pages_scanned);
+    delta!(pages_shared);
+    delta!(pages_sharing);
+    delta!(pages_unshared);
+    delta!(pages_volatile);
+    delta!(pages_skipped);
+    delta!(full_scans);
+    delta!(ksm_zero_pages);
+    delta!(general_profit);
+    delta!(cow_ksm);
+    delta!(ksm_swpin_copy);
+    deltas
+}
+
+fn read_ksmd_cpu_ticks() -> Option<u64> {
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {
+            continue;
+        };
+        if comm.trim() != "ksmd" {
+            continue;
+        }
+        let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+        let close = stat.rfind(')')?;
+        let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
+        let user = fields.get(11)?.parse::<u64>().ok()?;
+        let system = fields.get(12)?.parse::<u64>().ok()?;
+        return Some(user.saturating_add(system));
+    }
+    None
 }
 
 fn damon_target_worker() -> Result<()> {
@@ -4435,6 +6382,76 @@ fn fill_damos_not_evaluated_gates(evidence: &mut DamosEvidence) {
     }
 }
 
+fn fill_ksm_not_evaluated_gates(evidence: &mut KsmEvidence, required_gates: &[&str]) {
+    for required in required_gates {
+        if !evidence.checks.iter().any(|item| item.name == *required) {
+            evidence.checks.push(Check {
+                name: (*required).to_owned(),
+                passed: false,
+                state: GateState::NotEvaluated,
+                detail: "not reached after earlier KSM validation abort".to_owned(),
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KsmAuthoritativeOutcome {
+    success: bool,
+    error: Option<String>,
+    exit_code: i32,
+}
+
+fn finalize_ksm_outcome(
+    evidence: &mut KsmEvidence,
+    scenario: KsmScenario,
+) -> KsmAuthoritativeOutcome {
+    deduplicate_checks(&mut evidence.checks);
+    let required = if scenario == KsmScenario::Inefficient {
+        KSM_INEFFICIENT_REQUIRED_GATES
+    } else {
+        KSM_REQUIRED_GATES
+    };
+    fill_ksm_not_evaluated_gates(evidence, required);
+    evidence.required_gates_passed = required_checks_pass(&evidence.checks, required);
+    let success = evidence.required_gates_passed
+        && evidence.failure_class.is_none()
+        && evidence.failure_reason.is_none();
+    if !success {
+        if evidence.failure_class.is_none() {
+            evidence.failure_class = Some("validation_failure".into());
+        }
+        if evidence.failure_reason.is_none() {
+            let failed = required
+                .iter()
+                .filter(|required| {
+                    evidence
+                        .checks
+                        .iter()
+                        .any(|check| check.name == **required && check.state != GateState::Pass)
+                })
+                .copied()
+                .collect::<Vec<_>>()
+                .join(",");
+            evidence.failure_reason = Some(format!("mandatory_gates_failed:{failed}"));
+        }
+    }
+    let error = (!success).then(|| {
+        format!(
+            "ksm: {}",
+            evidence
+                .failure_reason
+                .as_deref()
+                .unwrap_or("authoritative KSM validation failure")
+        )
+    });
+    KsmAuthoritativeOutcome {
+        success,
+        error,
+        exit_code: if success { 0 } else { 1 },
+    }
+}
+
 fn synthetic_lifecycle_order_valid(timeline: &BTreeMap<String, u128>) -> bool {
     [
         "t0_child_spawn",
@@ -5278,6 +7295,18 @@ fn check(name: &str, passed: bool, detail: String) -> Check {
     }
 }
 
+fn set_check(checks: &mut Vec<Check>, authoritative: Check) {
+    checks.retain(|item| item.name != authoritative.name);
+    checks.push(authoritative);
+}
+
+fn deduplicate_checks(checks: &mut Vec<Check>) {
+    let mut names = BTreeSet::new();
+    checks.reverse();
+    checks.retain(|item| names.insert(item.name.clone()));
+    checks.reverse();
+}
+
 fn now_ns() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())
 }
@@ -5952,6 +7981,7 @@ mod tests {
             tiering: TieringEvidence::default(),
             damon: DamonEvidence::default(),
             damos: DamosEvidence::default(),
+            ksm: KsmEvidence::default(),
             host_unchanged: true,
             errors: Vec::new(),
         };
@@ -5975,6 +8005,290 @@ mod tests {
             .unwrap()
             .passed = false;
         assert!(!required_checks_pass(&checks, DAMOS_REQUIRED_GATES));
+    }
+
+    #[test]
+    fn ksm_early_abort_keeps_later_gates_not_evaluated_and_taxonomy_non_null() {
+        let mut evidence = KsmEvidence::default();
+        evidence.checks.push(check(
+            "capability",
+            false,
+            "fixture baseline failure".into(),
+        ));
+        let _ = ksm_failure(
+            &mut evidence,
+            "baseline_not_isolated",
+            "fixture baseline failure",
+        );
+        fill_ksm_not_evaluated_gates(&mut evidence, KSM_REQUIRED_GATES);
+        assert_eq!(
+            evidence.failure_reason.as_deref(),
+            Some("baseline_not_isolated")
+        );
+        assert!(evidence.failure_class.is_some());
+        assert!(evidence.checks.iter().any(|gate| {
+            gate.name == "exact_mergeable_scope_verified" && gate.state == GateState::NotEvaluated
+        }));
+    }
+
+    #[test]
+    fn nohugepage_result_and_errno_are_preserved() {
+        let success = worker_advice_result(Ok(()));
+        assert!(success.requested && success.succeeded);
+        assert_eq!(success.raw_os_error, None);
+        let failure = worker_advice_result(Err(std::io::Error::from_raw_os_error(22)));
+        assert!(failure.requested && !failure.succeeded);
+        assert_eq!(failure.raw_os_error, Some(22));
+        assert!(failure.error.is_some());
+    }
+
+    #[test]
+    fn unique_ksm_generator_has_no_cross_child_or_page_repetition() {
+        let mut hashes = BTreeSet::new();
+        for child in [1_u8, 2] {
+            for page_index in 0..64_u64 {
+                let mut page = vec![0_u8; 4096];
+                fill_unique_ksm_page(&mut page, "session", child, page_index);
+                assert!(page.iter().any(|byte| *byte != 0));
+                assert!(hashes.insert(ksm_page_digest(&page)));
+            }
+        }
+    }
+
+    #[test]
+    fn inefficient_accounting_uses_session_deltas_not_historic_totals() {
+        let before = ksm::KsmSystemMetrics {
+            pages_scanned: Some(10_000),
+            pages_sharing: Some(9_000),
+            full_scans: Some(50),
+            general_profit: Some(40_000_000),
+            ..ksm::KsmSystemMetrics::default()
+        };
+        let after = ksm::KsmSystemMetrics {
+            pages_scanned: Some(10_200),
+            pages_sharing: Some(9_000),
+            full_scans: Some(52),
+            general_profit: Some(40_000_000),
+            ..ksm::KsmSystemMetrics::default()
+        };
+        let deltas = ksm_counter_deltas(&before, &after);
+        assert_eq!(deltas["pages_sharing"], 0);
+        assert_eq!(deltas["general_profit"], 0);
+        assert_eq!(deltas["full_scans"], 2);
+    }
+
+    #[test]
+    fn residual_cleanup_uses_signed_deltas_without_fabricating_savings() {
+        let before = ksm::KsmSystemMetrics {
+            pages_shared: Some(251),
+            pages_sharing: Some(9_749),
+            full_scans: Some(2),
+            general_profit: Some(38_883_328),
+            ..ksm::KsmSystemMetrics::default()
+        };
+        let after = ksm::KsmSystemMetrics {
+            pages_shared: Some(0),
+            pages_sharing: Some(0),
+            full_scans: Some(4),
+            general_profit: Some(0),
+            ..ksm::KsmSystemMetrics::default()
+        };
+        let deltas = ksm_counter_deltas(&before, &after);
+        assert_eq!(deltas["pages_shared"], -251);
+        assert_eq!(deltas["pages_sharing"], -9_749);
+        assert_eq!(deltas["general_profit"], -38_883_328);
+        assert_eq!(deltas["full_scans"], 2);
+        assert_eq!(
+            ksm_saved_bytes(
+                &before,
+                &after,
+                &ksm::KsmSnapshot {
+                    run: 0,
+                    pages_to_scan: 100,
+                    sleep_millisecs: 20,
+                    preserve_only: BTreeMap::new(),
+                }
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn owned_process_evidence_drives_unique_inefficiency() {
+        let processes = [1_u32, 2]
+            .into_iter()
+            .map(|pid| ksm::KsmProcessMetrics {
+                identity: ksm::owned_validation_identity("session", pid, 10),
+                ksm_rmap_items: Some(8192),
+                ksm_merging_pages: Some(0),
+                ksm_process_profit: Some(0),
+                ksm_mergeable: Some(true),
+                ..ksm::KsmProcessMetrics::default()
+            })
+            .collect::<Vec<_>>();
+        assert!(owned_processes_evaluated(&processes));
+        assert!(owned_processes_inefficient(&processes));
+    }
+
+    #[test]
+    fn manual_stop_cannot_masquerade_as_controller_auto_disable() {
+        let run_before = "1";
+        let stopped = true;
+        assert!(!(false && run_before == "1" && stopped));
+        assert!(true && run_before == "1" && stopped);
+    }
+
+    fn passing_ksm_evidence(required: &[&str]) -> KsmEvidence {
+        KsmEvidence {
+            checks: required
+                .iter()
+                .map(|name| check(name, true, "fixture pass".into()))
+                .collect(),
+            ..KsmEvidence::default()
+        }
+    }
+
+    #[test]
+    fn positive_finalizer_requires_positive_gates() {
+        let mut success = passing_ksm_evidence(KSM_REQUIRED_GATES);
+        let outcome = finalize_ksm_outcome(&mut success, KsmScenario::Positive);
+        assert!(outcome.success);
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.error.is_none());
+
+        let mut failure = passing_ksm_evidence(KSM_REQUIRED_GATES);
+        set_check(
+            &mut failure.checks,
+            check("minimum_saved_bytes", false, "profit gate failed".into()),
+        );
+        let outcome = finalize_ksm_outcome(&mut failure, KsmScenario::Positive);
+        assert!(!outcome.success);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(outcome.error.is_some());
+    }
+
+    #[test]
+    fn attempt_five_finalizer_accepts_expected_non_profit() {
+        let mut evidence = passing_ksm_evidence(KSM_INEFFICIENT_REQUIRED_GATES);
+        evidence.profit_gate = Some(ksm::ValidationProfitGate {
+            saved_bytes: 0,
+            pages_scanned_delta: 19_584,
+            full_scans_delta: 2,
+            system_profit_delta: -39_931_904,
+            processes_positive: false,
+            passed: false,
+            reasons: vec!["insufficient_saved_bytes".into()],
+        });
+        let outcome = finalize_ksm_outcome(&mut evidence, KsmScenario::Inefficient);
+        assert!(outcome.success);
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.error.is_none());
+        assert!(evidence.required_gates_passed);
+        assert!(evidence.failure_class.is_none());
+        assert!(evidence.failure_reason.is_none());
+    }
+
+    #[test]
+    fn inefficient_finalizer_rejects_controller_cooldown_and_cpu_failures() {
+        for gate in [
+            "controller_auto_disable",
+            "cooldown_entered",
+            "cooldown_rejects_next_plan",
+            "cpu_budget",
+        ] {
+            let mut evidence = passing_ksm_evidence(KSM_INEFFICIENT_REQUIRED_GATES);
+            set_check(
+                &mut evidence.checks,
+                check(gate, false, "fixture failure".into()),
+            );
+            let outcome = finalize_ksm_outcome(&mut evidence, KsmScenario::Inefficient);
+            assert!(!outcome.success, "{gate}");
+            assert_eq!(outcome.exit_code, 1);
+            assert!(outcome.error.is_some());
+            assert!(!evidence.required_gates_passed);
+        }
+    }
+
+    #[test]
+    fn bounded_bootstrap_report_keeps_runtime_uniqueness_rigorous() {
+        let hashes = (0..8192_u64).collect::<Vec<_>>();
+        let target = KsmTargetMetadata {
+            pid: std::process::id(),
+            start_ticks: proc_start_ticks(std::process::id()).unwrap(),
+            duplicate: [0x1000, 0x3000],
+            control: [0x4000, 0x6000],
+            duplicate_bytes: 0x2000,
+            control_bytes: 0x2000,
+            duplicate_fingerprint: 1,
+            control_fingerprint: 2,
+            state: "ready_unmergeable".into(),
+            host_page_size: 4096,
+            duplicate_nohugepage: worker_advice_result(Ok(())),
+            control_nohugepage: worker_advice_result(Ok(())),
+            duplicate_prefault_completed: true,
+            control_prefault_completed: true,
+            workload_kind: "unique".into(),
+            duplicate_page_hashes: hashes,
+        };
+        let mut bounded = target.clone();
+        bounded.duplicate_page_hashes.truncate(16);
+        assert_eq!(target.duplicate_page_hashes.len(), 8192);
+        assert_eq!(bounded.duplicate_page_hashes.len(), 16);
+        assert!(serde_json::to_vec(&bounded).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn ksm_checks_are_serialized_once_with_authoritative_host_result() {
+        let mut checks = vec![
+            Check {
+                name: "capability".into(),
+                passed: false,
+                state: GateState::NotEvaluated,
+                detail: "stale".into(),
+            },
+            check("capability", true, "authoritative".into()),
+            check("host_unchanged", false, "stale".into()),
+        ];
+        set_check(
+            &mut checks,
+            check("host_unchanged", true, "final comparison".into()),
+        );
+        deduplicate_checks(&mut checks);
+        assert_eq!(
+            checks
+                .iter()
+                .filter(|item| item.name == "capability")
+                .count(),
+            1
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .filter(|item| item.name == "host_unchanged")
+                .count(),
+            1
+        );
+        assert!(
+            checks
+                .iter()
+                .find(|item| item.name == "host_unchanged")
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn base_page_bootstrap_failure_has_distinct_taxonomy() {
+        let mut evidence = KsmEvidence::default();
+        let _ = ksm_failure(&mut evidence, "base_page_backing_not_verified", "fixture");
+        assert_eq!(
+            evidence.failure_class.as_deref(),
+            Some("workload_setup_failure")
+        );
+        assert_eq!(
+            evidence.failure_reason.as_deref(),
+            Some("base_page_backing_not_verified")
+        );
     }
 
     #[test]

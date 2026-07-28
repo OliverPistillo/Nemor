@@ -99,7 +99,21 @@ allow_shrinker = false
 
 [ksm]
 enabled = false
-profiles = ["virtualization", "browser_heavy"]
+live_apply=false # Phase 9 plan-only
+profiles = ["vm", "browser", "electron"]
+min_observation_seconds = 30
+min_mergeable_bytes = 33554432
+max_cpu_overhead_percent = 0.8
+min_process_profit_bytes = 4096
+min_system_profit_bytes = 4096
+max_cow_events_per_second = 64
+inefficiency_windows = 3
+cooldown_seconds = 300
+scanner_pages_to_scan_min = 50
+scanner_pages_to_scan_max = 1000
+scanner_sleep_millisecs_min = 10
+validation_max_seconds = 120
+validation_max_bytes = 268435456
 
 [damon]
 enabled = false

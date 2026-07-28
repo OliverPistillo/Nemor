@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const MIGRATION_VERSION: i64 = 6;
+pub const MIGRATION_VERSION: i64 = 7;
 pub const INITIAL_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0001_initial.sql"
@@ -42,6 +42,10 @@ pub const DAMON_MIGRATION: &str = include_str!(concat!(
 pub const DAMOS_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0006_damos.sql"
+));
+pub const KSM_MIGRATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0007_ksm.sql"
 ));
 
 pub struct Storage {
@@ -246,7 +250,8 @@ impl Storage {
         self.apply_migration(3, CLASSIFIER_MIGRATION, false)?;
         self.apply_migration(4, CGROUP_MIGRATION, false)?;
         self.apply_migration(5, DAMON_MIGRATION, false)?;
-        self.apply_migration(6, DAMOS_MIGRATION, false)
+        self.apply_migration(6, DAMOS_MIGRATION, false)?;
+        self.apply_migration(7, KSM_MIGRATION, false)
     }
 
     pub fn migrate_source(&mut self, source: &str) -> Result<()> {
@@ -1709,6 +1714,9 @@ mod tests {
         "damos_action_results",
         "damos_refault_blacklist",
         "hosts",
+        "ksm_evaluations",
+        "ksm_process_samples",
+        "ksm_system_samples",
         "model_registry",
         "policy_decisions",
         "process_catalog",
@@ -1869,6 +1877,7 @@ mod tests {
                 (4, migration_checksum(CGROUP_MIGRATION)),
                 (5, migration_checksum(DAMON_MIGRATION)),
                 (6, migration_checksum(DAMOS_MIGRATION)),
+                (7, migration_checksum(KSM_MIGRATION)),
             ]
         );
     }
