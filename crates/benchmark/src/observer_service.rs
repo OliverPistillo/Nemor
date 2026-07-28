@@ -1059,6 +1059,27 @@ pub struct ObserverServiceState {
     pub executable_sha256: String,
 }
 
+fn canonicalize_ip_address_deny(entries: &[(i32, Vec<u8>, u32)]) -> Vec<(i32, Vec<u8>, u32)> {
+    let mut canonical = entries.to_vec();
+    canonical.sort();
+    canonical
+}
+
+fn describe_ip_address_deny(entries: &[(i32, Vec<u8>, u32)]) -> String {
+    let canonical = canonicalize_ip_address_deny(entries);
+    let mut description = format!("count={}", canonical.len());
+    for (family, address, prefix) in canonical.iter().take(4) {
+        description.push_str(&format!(
+            " family={family} address_len={} prefix={prefix}",
+            address.len()
+        ));
+    }
+    if canonical.len() > 4 {
+        description.push_str(" truncated=true");
+    }
+    description
+}
+
 impl ObserverServiceState {
     fn verify_startup_contract(
         &self,
@@ -1091,45 +1112,262 @@ impl ObserverServiceState {
     }
 
     pub fn verify_declared(&self, plan: &ObserverServicePlan, expected_sha256: &str) -> Result<()> {
-        if self.unit_name != plan.unit_name
-            || self.load_state != "loaded"
-            || self.active_state != "active"
-            || self.sub_state != "running"
-            || self.main_pid == 0
-            || self.exec_main_pid != self.main_pid
-            || self.exec_main_status != 0
-            || self.result != "success"
-            || !self.dynamic_user
-            || self.umask != 0o077
-            || self.runtime_directories != [plan.runtime_directory.clone()]
-            || self.runtime_directory_mode != 0o700
-            || self.runtime_directory_preserve != "no"
-            || !self.no_new_privileges
-            || self.capability_bounding_set != 0
-            || self.ambient_capabilities != 0
-            || self.protect_system != "strict"
-            || self.protect_home != "yes"
-            || !self.private_tmp
-            || !self.private_devices
-            || !self.protect_kernel_tunables
-            || !self.protect_control_groups
-            || !self.protect_kernel_modules
-            || !self.memory_deny_write_execute
-            || !self.lock_personality
-            || !self.restrict_realtime
-            || !self.restrict_suid_sgid
-            || self.restrict_address_families != (true, vec!["AF_UNIX".into()])
-            || self.system_call_architectures != ["native"]
-            || self.ip_address_deny != [(2, vec![0; 4], 0), (10, vec![0; 16], 0)]
-            || self.effective_uid == 0
-            || self.effective_gid == 0
-            || self.control_group.is_empty()
-            || !self.control_group.starts_with('/')
-            || self.control_group.contains("..")
-            || self.executable_sha256 != expected_sha256
-        {
-            bail!("transient observer service identity contract failed");
+        macro_rules! require_declared {
+            ($condition:expr, $category:literal, $field:literal, $expected:expr, $observed:expr) => {
+                if !$condition {
+                    bail!(
+                        "DECLARED_CONTRACT_MISMATCH category={} field={} expected={:?} observed={:?}",
+                        $category,
+                        $field,
+                        $expected,
+                        $observed
+                    );
+                }
+            };
         }
+
+        require_declared!(
+            self.unit_name == plan.unit_name,
+            "PROCESS_IDENTITY_MISMATCH",
+            "unit_name",
+            plan.unit_name,
+            self.unit_name
+        );
+        require_declared!(
+            self.load_state == "loaded",
+            "SERVICE_RUNTIME_CONTRACT_MISMATCH",
+            "LoadState",
+            "loaded",
+            self.load_state
+        );
+        require_declared!(
+            self.active_state == "active",
+            "SERVICE_RUNTIME_CONTRACT_MISMATCH",
+            "ActiveState",
+            "active",
+            self.active_state
+        );
+        require_declared!(
+            self.sub_state == "running",
+            "SERVICE_RUNTIME_CONTRACT_MISMATCH",
+            "SubState",
+            "running",
+            self.sub_state
+        );
+        require_declared!(
+            self.main_pid > 0,
+            "PROCESS_IDENTITY_MISMATCH",
+            "MainPID",
+            ">0",
+            self.main_pid
+        );
+        require_declared!(
+            self.exec_main_pid == self.main_pid,
+            "PROCESS_IDENTITY_MISMATCH",
+            "ExecMainPID",
+            self.main_pid,
+            self.exec_main_pid
+        );
+        require_declared!(
+            self.exec_main_status == 0,
+            "SERVICE_RUNTIME_CONTRACT_MISMATCH",
+            "ExecMainStatus",
+            0,
+            self.exec_main_status
+        );
+        require_declared!(
+            self.result == "success",
+            "SERVICE_RUNTIME_CONTRACT_MISMATCH",
+            "Result",
+            "success",
+            self.result
+        );
+        require_declared!(
+            self.dynamic_user,
+            "SERVICE_HARDENING_MISMATCH",
+            "DynamicUser",
+            true,
+            self.dynamic_user
+        );
+        require_declared!(
+            self.umask == 0o077,
+            "SERVICE_HARDENING_MISMATCH",
+            "UMask",
+            0o077,
+            self.umask
+        );
+        require_declared!(
+            self.runtime_directories == [plan.runtime_directory.clone()],
+            "SERVICE_RUNTIME_CONTRACT_MISMATCH",
+            "RuntimeDirectory",
+            vec![plan.runtime_directory.clone()],
+            self.runtime_directories
+        );
+        require_declared!(
+            self.runtime_directory_mode == 0o700,
+            "SERVICE_RUNTIME_CONTRACT_MISMATCH",
+            "RuntimeDirectoryMode",
+            0o700,
+            self.runtime_directory_mode
+        );
+        require_declared!(
+            self.runtime_directory_preserve == "no",
+            "SERVICE_RUNTIME_CONTRACT_MISMATCH",
+            "RuntimeDirectoryPreserve",
+            "no",
+            self.runtime_directory_preserve
+        );
+        require_declared!(
+            self.no_new_privileges,
+            "SERVICE_HARDENING_MISMATCH",
+            "NoNewPrivileges",
+            true,
+            self.no_new_privileges
+        );
+        require_declared!(
+            self.capability_bounding_set == 0,
+            "SERVICE_HARDENING_MISMATCH",
+            "CapabilityBoundingSet",
+            0,
+            self.capability_bounding_set
+        );
+        require_declared!(
+            self.ambient_capabilities == 0,
+            "SERVICE_HARDENING_MISMATCH",
+            "AmbientCapabilities",
+            0,
+            self.ambient_capabilities
+        );
+        require_declared!(
+            self.protect_system == "strict",
+            "SERVICE_HARDENING_MISMATCH",
+            "ProtectSystem",
+            "strict",
+            self.protect_system
+        );
+        require_declared!(
+            self.protect_home == "yes",
+            "SERVICE_HARDENING_MISMATCH",
+            "ProtectHome",
+            "yes",
+            self.protect_home
+        );
+        require_declared!(
+            self.private_tmp,
+            "SERVICE_HARDENING_MISMATCH",
+            "PrivateTmp",
+            true,
+            self.private_tmp
+        );
+        require_declared!(
+            self.private_devices,
+            "SERVICE_HARDENING_MISMATCH",
+            "PrivateDevices",
+            true,
+            self.private_devices
+        );
+        require_declared!(
+            self.protect_kernel_tunables,
+            "SERVICE_HARDENING_MISMATCH",
+            "ProtectKernelTunables",
+            true,
+            self.protect_kernel_tunables
+        );
+        require_declared!(
+            self.protect_control_groups,
+            "SERVICE_HARDENING_MISMATCH",
+            "ProtectControlGroups",
+            true,
+            self.protect_control_groups
+        );
+        require_declared!(
+            self.protect_kernel_modules,
+            "SERVICE_HARDENING_MISMATCH",
+            "ProtectKernelModules",
+            true,
+            self.protect_kernel_modules
+        );
+        require_declared!(
+            self.memory_deny_write_execute,
+            "SERVICE_HARDENING_MISMATCH",
+            "MemoryDenyWriteExecute",
+            true,
+            self.memory_deny_write_execute
+        );
+        require_declared!(
+            self.lock_personality,
+            "SERVICE_HARDENING_MISMATCH",
+            "LockPersonality",
+            true,
+            self.lock_personality
+        );
+        require_declared!(
+            self.restrict_realtime,
+            "SERVICE_HARDENING_MISMATCH",
+            "RestrictRealtime",
+            true,
+            self.restrict_realtime
+        );
+        require_declared!(
+            self.restrict_suid_sgid,
+            "SERVICE_HARDENING_MISMATCH",
+            "RestrictSUIDSGID",
+            true,
+            self.restrict_suid_sgid
+        );
+        require_declared!(
+            self.restrict_address_families == (true, vec!["AF_UNIX".into()]),
+            "SERVICE_HARDENING_MISMATCH",
+            "RestrictAddressFamilies",
+            (true, vec!["AF_UNIX"]),
+            self.restrict_address_families
+        );
+        require_declared!(
+            self.system_call_architectures == ["native"],
+            "SERVICE_HARDENING_MISMATCH",
+            "SystemCallArchitectures",
+            ["native"],
+            self.system_call_architectures
+        );
+        let expected_ip_address_deny = vec![(2, vec![0; 4], 0), (10, vec![0; 16], 0)];
+        let observed_ip_address_deny = canonicalize_ip_address_deny(&self.ip_address_deny);
+        require_declared!(
+            observed_ip_address_deny == canonicalize_ip_address_deny(&expected_ip_address_deny),
+            "SERVICE_HARDENING_MISMATCH",
+            "IPAddressDeny",
+            describe_ip_address_deny(&expected_ip_address_deny),
+            describe_ip_address_deny(&self.ip_address_deny)
+        );
+        require_declared!(
+            self.effective_uid != 0,
+            "PROCESS_IDENTITY_MISMATCH",
+            "effective_uid",
+            "non-root",
+            self.effective_uid
+        );
+        require_declared!(
+            self.effective_gid != 0,
+            "PROCESS_IDENTITY_MISMATCH",
+            "effective_gid",
+            "non-root",
+            self.effective_gid
+        );
+        require_declared!(
+            !self.control_group.is_empty()
+                && self.control_group.starts_with('/')
+                && !self.control_group.contains(".."),
+            "PROCESS_IDENTITY_MISMATCH",
+            "ControlGroup",
+            "absolute owned cgroup",
+            self.control_group
+        );
+        require_declared!(
+            self.executable_sha256 == expected_sha256,
+            "PROCESS_IDENTITY_MISMATCH",
+            "executable_sha256",
+            expected_sha256,
+            self.executable_sha256
+        );
         Ok(())
     }
 
@@ -2455,6 +2693,64 @@ mod tests {
         let mut root = first;
         root.effective_uid = 0;
         assert!(root.verify_declared(&plan, "binary").is_err());
+    }
+
+    #[test]
+    fn ip_address_deny_readback_is_order_independent_but_exact() {
+        let plan = plan();
+        let mut reversed = state(&plan);
+        reversed.ip_address_deny = vec![(10, vec![0; 16], 0), (2, vec![0; 4], 0)];
+        reversed.verify_declared(&plan, "binary").unwrap();
+
+        for observed in [
+            vec![(10, vec![0; 16], 0)],
+            vec![(2, vec![0; 4], 0)],
+            vec![(2, vec![0; 4], 0), (10, vec![0; 16], 0), (2, vec![0; 4], 1)],
+            vec![(2, vec![0; 4], 1), (10, vec![0; 16], 0)],
+            vec![(2, vec![1, 0, 0, 0], 0), (10, vec![0; 16], 0)],
+        ] {
+            let mut invalid = state(&plan);
+            invalid.ip_address_deny = observed;
+            let error = invalid.verify_declared(&plan, "binary").unwrap_err();
+            assert!(error.to_string().contains("IPAddressDeny"));
+            assert!(error
+                .to_string()
+                .contains("category=SERVICE_HARDENING_MISMATCH"));
+        }
+    }
+
+    #[test]
+    fn semantic_normalization_does_not_change_exec_start_order() {
+        let plan = plan();
+        let audit = plan.property_audit().unwrap();
+        let exec_start = audit
+            .iter()
+            .find(|entry| entry.property == "ExecStart")
+            .unwrap();
+        assert_eq!(
+            exec_start.request_value,
+            format!(
+                "{} --config {}",
+                plan.service_binary.display(),
+                plan.service_config.display()
+            )
+        );
+        assert_eq!(
+            canonicalize_ip_address_deny(&[(2, vec![0; 4], 0), (10, vec![0; 16], 0),]),
+            canonicalize_ip_address_deny(&[(10, vec![0; 16], 0), (2, vec![0; 4], 0),])
+        );
+    }
+
+    #[test]
+    fn declared_contract_diagnostics_identify_non_ip_fields() {
+        let plan = plan();
+        let mut invalid = state(&plan);
+        invalid.protect_home = "no".into();
+        let error = invalid.verify_declared(&plan, "binary").unwrap_err();
+        assert!(error.to_string().contains("field=ProtectHome"));
+        assert!(error
+            .to_string()
+            .contains("category=SERVICE_HARDENING_MISMATCH"));
     }
 
     #[test]

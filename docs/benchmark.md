@@ -426,6 +426,34 @@ report SHA-256 is
 It counts as ATTEMPT 1; the next live validation is ATTEMPT 2. No live
 ATTEMPT 2 is part of this fix.
 
+Checkpoint 3A-P ATTEMPT 2 was the second real privileged live validation. The
+identity-settling gate passed: the same `MainPID=92007`, `ExecMainPID=92007`
+and `start_ticks=1974847` transitioned from the root-owned
+`/usr/lib/systemd/systemd-executor` (`UID/GID=0/0`) to the staged `nemord`
+with `DynamicUser=true`, effective `UID/GID=64618/64618`, and SHA-256
+`9fe91a0680e273c5abbf229daf20fb1f12897747676714b699d0c8d82e84e1f9`.
+Settling took three polls and 0.08667416 seconds, with the pre-exec root
+state observed. This positively validates the settling implementation.
+
+ATTEMPT 2 then failed closed after settling and before telemetry readiness:
+the effective `Service.IPAddressDeny` readback contained exactly the required
+IPv4-any and IPv6-any deny rules, but systemd returned them in IPv6/IPv4
+order while the request and verifier used IPv4/IPv6 order. This is a
+false-negative collection comparison, not an identity or DynamicUser failure.
+Systemd documents these entries as address matching rules; their order has no
+network-policy meaning. Nemor now compares only this deny collection as an
+exact canonicalized multiset, preserving the raw observed order in evidence.
+Missing, extra, duplicate, wrong-prefix, and wrong-address entries remain
+fail-closed. Other collections retain their semantic ordering rules; in
+particular `ExecStart` argv order is never normalized.
+
+ATTEMPT 2 classification is
+`FAILED_CLOSED_DECLARED_CONTRACT_COLLECTION_ORDER`; identity settling,
+staging, cleanup, and structural restore all passed. The preserved report
+SHA-256 is
+`25ab2144ce7acf74b8da1fa2eacb5378cb42db250509246d426bcf5ddd7ddc66`.
+The next live validation is ATTEMPT 3.
+
 The later matched 3A timeline is fixed: after worker-scope verification,
 observe performs separately-accounted service setup; both variants then
 receive the same five-second hold—idle for baseline and observer-alive warmup

@@ -302,6 +302,24 @@ restore all passed. The classification is
 `FAILED_CLOSED_STARTUP_IDENTITY_TRANSITION`; the next live run is ATTEMPT 2,
 after a clean release, fresh V5 preparation and preflight.
 
+Checkpoint 3A-P ATTEMPT 2 positively validated identity settling before
+failing closed at the declared effective-service contract. MainPID and
+ExecMainPID were both 92007 with start ticks 1974847; the root systemd
+executor transitioned to the staged `nemord` at effective UID/GID
+64618/64618, with `DynamicUser=true` and the expected observer SHA-256
+`9fe91a0680e273c5abbf229daf20fb1f12897747676714b699d0c8d82e84e1f9`.
+Settling passed after three polls in 0.08667416 seconds and recorded the
+intermediate root state. Readiness did not start because `IPAddressDeny`
+read back the exact IPv4-any and IPv6-any rules in the reverse order from the
+request; the old raw-vector comparison rejected that semantically equivalent
+deny set. This is classified
+`FAILED_CLOSED_DECLARED_CONTRACT_COLLECTION_ORDER`, not an identity or
+DynamicUser failure. Cleanup and restore passed. The verifier now
+canonicalizes only this address deny multiset, rejects missing/extra/
+duplicate/wrong-prefix/wrong-address entries, retains raw evidence order,
+and reports bounded field/category diagnostics. ATTEMPT 2 report SHA-256:
+`25ab2144ce7acf74b8da1fa2eacb5378cb42db250509246d426bcf5ddd7ddc66`.
+
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
 worker/unit/cgroup final absence, structural restore and full host restore.
