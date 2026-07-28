@@ -140,7 +140,11 @@ stale release binaries cannot produce eligible performance evidence.
 Checkpoint 3A-P authorizes only one additional validation mutation surface:
 `StartTransientUnit` and `StopUnit` for an exact
 `nemor-benchmark-observer-*.service`, plus exact transaction files under
-`/run`. It never manipulates production `nemord.service`. A foreign `nemord`
+`/run`: a root-staged single-link observer executable, staged config,
+RuntimeDirectory and isolated database. The Cargo release binary remains an
+unprivileged source artifact and is never executed by the transient service;
+its descriptor-read bytes must hash-identically match the staged executable.
+It never manipulates production `nemord.service`. A foreign `nemord`
 is a preflight failure and never grants signal or stop authority. Readiness
 requires a real telemetry sample in the isolated database.
 
@@ -149,3 +153,5 @@ configuration, DAMON tree shape, bounded cgroup topology, and production Nemor
 config/database metadata. The observer service cgroup, RuntimeDirectory files
 and SQLite writes are the only authorized temporary differences. Common
 cleanup requires MainPID, unit, cgroup and runtime-directory absence.
+Only after process absence may exact hash/owner/mode-verified staged inputs be
+removed; either staging residue makes restore fail.

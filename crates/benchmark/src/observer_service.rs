@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +30,9 @@ const VALIDATION_WINDOW: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_PREPARED_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PREPARED_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SOURCE_OBSERVER_BYTES: u64 = 128 * 1024 * 1024;
+const STAGED_BINARY_PREFIX: &str = "nemor-benchmark-observer-bin-";
+const STAGED_CONFIG_PREFIX: &str = "nemor-benchmark-observer-config-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObserverReadbackProperty {
@@ -263,8 +266,17 @@ impl ObserverServicePlan {
         {
             bail!("observer binary and config paths must be absolute");
         }
-        if self.binary.file_name().and_then(|value| value.to_str()) != Some("nemord") {
-            bail!("observer executable must be the exact nemord binary");
+        if self.binary.parent() != Some(Path::new(RUNTIME_BASE))
+            || !self
+                .binary
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| {
+                    name.strip_prefix(STAGED_BINARY_PREFIX)
+                        .is_some_and(is_safe_transaction_suffix)
+                })
+        {
+            bail!("observer bind source must be the fixed staged executable role");
         }
         if self.database == Path::new(PRODUCTION_DATABASE)
             || !self
@@ -458,8 +470,8 @@ impl ObserverServicePlan {
 pub fn observer_property_signatures() -> Result<Vec<(String, String)>> {
     ObserverServicePlan::new(
         "contract",
-        PathBuf::from("/tmp/release/nemord"),
-        PathBuf::from("/tmp/observer.toml"),
+        PathBuf::from("/run/nemor-benchmark-observer-bin-contract"),
+        PathBuf::from("/run/nemor-benchmark-observer-config-contract.toml"),
     )?
     .encoded_property_signatures()
 }
@@ -474,15 +486,44 @@ fn validate_observer_unit_name(name: &str) -> Result<()> {
         .strip_prefix(OBSERVER_PREFIX)
         .and_then(|value| value.strip_suffix(".service"))
         .context("unit is outside the benchmark observer service prefix")?;
-    if suffix.is_empty()
-        || suffix.len() > 32
-        || !suffix
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric())
-    {
+    if !is_safe_transaction_suffix(suffix) {
         bail!("malformed generated observer service name");
     }
     Ok(())
+}
+
+fn is_safe_transaction_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix.len() <= 32
+        && suffix
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+}
+
+fn transaction_suffix(run_id: &str) -> Result<String> {
+    let suffix = run_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(32)
+        .collect::<String>();
+    if !is_safe_transaction_suffix(&suffix) {
+        bail!("run id cannot produce a safe staging suffix");
+    }
+    Ok(suffix)
+}
+
+fn staged_observer_path(run_id: &str) -> Result<PathBuf> {
+    Ok(Path::new(RUNTIME_BASE).join(format!(
+        "{STAGED_BINARY_PREFIX}{}",
+        transaction_suffix(run_id)?
+    )))
+}
+
+fn staged_config_path(run_id: &str) -> Result<PathBuf> {
+    Ok(Path::new(RUNTIME_BASE).join(format!(
+        "{STAGED_CONFIG_PREFIX}{}.toml",
+        transaction_suffix(run_id)?
+    )))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,9 +536,15 @@ pub struct PreparedObserverManifest {
     pub provenance: BuildProvenance,
     pub runner_path: PathBuf,
     pub runner_sha256: String,
-    pub observer_path: PathBuf,
-    pub observer_sha256: String,
+    pub source_observer_path: PathBuf,
+    pub source_observer_sha256: String,
+    pub source_observer_nlink: u64,
     pub observer_embedded_commit: String,
+    pub staged_observer_role: String,
+    pub expected_staged_observer_path: PathBuf,
+    pub expected_staged_observer_sha256: String,
+    pub expected_staged_observer_mode: u32,
+    pub expected_staged_observer_ownership: String,
     pub config_path: PathBuf,
     pub config_sha256: String,
     pub plan: ObserverServicePlan,
@@ -520,6 +567,9 @@ impl IntegrityBoundManifest {
     }
 
     pub fn verify(&self, manifest_path: &Path) -> Result<()> {
+        if self.payload.schema_version != 2 {
+            bail!("unsupported observer preparation manifest schema");
+        }
         if hash_json(&self.payload)? != self.payload_sha256 {
             bail!("observer preparation manifest integrity mismatch");
         }
@@ -538,8 +588,14 @@ impl IntegrityBoundManifest {
         if current != self.payload.runner_path.canonicalize()? {
             bail!("privileged runner path differs from prepared runner");
         }
+        let source = read_verified_source_observer(
+            &self.payload.source_observer_path,
+            self.payload.created_uid,
+            Some(&self.payload.source_observer_sha256),
+        )?;
         if sha256_file(&current)? != self.payload.runner_sha256
-            || sha256_file(&self.payload.observer_path)? != self.payload.observer_sha256
+            || source.sha256 != self.payload.source_observer_sha256
+            || source.metadata.nlink() != self.payload.source_observer_nlink
             || sha256_file(&self.payload.config_path)? != self.payload.config_sha256
         {
             bail!("prepared binary or config changed before privileged execution");
@@ -548,20 +604,94 @@ impl IntegrityBoundManifest {
             .parent()
             .context("runner release directory unavailable")?;
         if release_parent.file_name().and_then(|value| value.to_str()) != Some("release")
-            || self.payload.observer_path.parent() != Some(release_parent)
+            || self.payload.source_observer_path.parent() != Some(release_parent)
         {
             bail!("prepared executables are not sibling release binaries");
         }
-        let observer_bytes = fs::read(&self.payload.observer_path)?;
         if self.payload.observer_embedded_commit != self.payload.provenance.git_head
-            || !observer_bytes
+            || !source
+                .bytes
                 .windows(self.payload.provenance.git_head.len())
                 .any(|window| window == self.payload.provenance.git_head.as_bytes())
         {
             bail!("observer binary embedded commit no longer matches manifest");
         }
+        if self.payload.staged_observer_role != "root_staged_transaction_executable"
+            || self.payload.expected_staged_observer_path != self.payload.plan.binary
+            || self.payload.expected_staged_observer_sha256 != self.payload.source_observer_sha256
+            || self.payload.expected_staged_observer_mode != 0o755
+            || self.payload.expected_staged_observer_ownership != "root:root"
+        {
+            bail!("staged observer executable contract differs from manifest plan");
+        }
         self.payload.plan.validate()
     }
+}
+
+struct VerifiedSourceObserver {
+    bytes: Vec<u8>,
+    metadata: fs::Metadata,
+    sha256: String,
+}
+
+fn read_verified_source_observer(
+    path: &Path,
+    expected_uid: u32,
+    expected_sha256: Option<&str>,
+) -> Result<VerifiedSourceObserver> {
+    if !path.is_absolute() {
+        bail!("source observer path must be absolute");
+    }
+    let before = fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        bail!("source observer must be a regular non-symlink file");
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .context("open source observer with no-follow semantics")?;
+    let opened = file.metadata()?;
+    validate_source_observer_metadata(&opened, expected_uid)?;
+    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+        bail!("source observer changed between lstat and no-follow open");
+    }
+    let capacity = usize::try_from(opened.len()).context("source observer size overflow")?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if opened.dev() != after.dev()
+        || opened.ino() != after.ino()
+        || opened.len() != after.len()
+        || opened.mtime() != after.mtime()
+        || opened.mtime_nsec() != after.mtime_nsec()
+        || opened.ctime() != after.ctime()
+        || opened.ctime_nsec() != after.ctime_nsec()
+        || bytes.len() as u64 != opened.len()
+    {
+        bail!("source observer changed while reading verified file descriptor");
+    }
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    if expected_sha256.is_some_and(|expected| expected != sha256) {
+        bail!("source observer content hash differs from prepared manifest");
+    }
+    Ok(VerifiedSourceObserver {
+        bytes,
+        metadata: opened,
+        sha256,
+    })
+}
+
+fn validate_source_observer_metadata(metadata: &fs::Metadata, expected_uid: u32) -> Result<()> {
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.len() == 0
+        || metadata.len() > MAX_SOURCE_OBSERVER_BYTES
+    {
+        bail!("source observer ownership, mode, type or size is unsafe");
+    }
+    Ok(())
 }
 
 fn verify_prepared_path(path: &Path, uid: u32) -> Result<()> {
@@ -630,42 +760,58 @@ pub fn prepare_observer_manifest(
     verify_prepared_directory(destination_dir, nix::unistd::getuid().as_raw())?;
     let run_id = format!("checkpoint3ap{}", now_ns());
     let runner_path = std::env::current_exe()?.canonicalize()?;
-    let observer_path = observer_binary.canonicalize()?;
-    let observer_metadata = fs::symlink_metadata(observer_binary)?;
-    if observer_metadata.file_type().is_symlink()
-        || !observer_metadata.is_file()
-        || observer_metadata.nlink() != 1
-    {
-        bail!("observer binary must be a regular non-symlink single-link file");
+    let observer_lstat = fs::symlink_metadata(observer_binary)?;
+    if observer_lstat.file_type().is_symlink() {
+        bail!("source observer path must not be a symlink");
     }
+    let observer_path = observer_binary.canonicalize()?;
+    let release_parent = runner_path
+        .parent()
+        .context("runner release directory unavailable")?;
+    if release_parent.file_name().and_then(|value| value.to_str()) != Some("release")
+        || observer_path.parent() != Some(release_parent)
+        || observer_path.file_name().and_then(|value| value.to_str()) != Some("nemord")
+    {
+        bail!("source observer must be the exact sibling release nemord");
+    }
+    let source_observer =
+        read_verified_source_observer(&observer_path, nix::unistd::getuid().as_raw(), None)?;
     let config_path = destination_dir.join(format!("{run_id}.toml"));
+    let staged_observer_path = staged_observer_path(&run_id)?;
+    let staged_config_path = staged_config_path(&run_id)?;
     let provisional =
-        ObserverServicePlan::new(&run_id, observer_path.clone(), config_path.clone())?;
+        ObserverServicePlan::new(&run_id, staged_observer_path.clone(), staged_config_path)?;
     write_inspection_config(config_template, &provisional.database, &config_path)?;
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644))?;
     verify_prepared_path(&config_path, nix::unistd::getuid().as_raw())?;
     let loaded = common::LoadedConfig::load(&config_path)?;
     crate::performance::observer_invariant(&loaded.config).validate()?;
-    let observer_bytes = fs::read(&observer_path)?;
-    if !observer_bytes
+    if !source_observer
+        .bytes
         .windows(provenance.git_head.len())
         .any(|window| window == provenance.git_head.as_bytes())
     {
         bail!("observer binary does not embed prepared Git commit");
     }
     let payload = PreparedObserverManifest {
-        schema_version: 1,
+        schema_version: 2,
         run_id: run_id.clone(),
         created_uid: nix::unistd::getuid().as_raw(),
         prepared_directory: destination_dir.to_path_buf(),
         repository: repository.canonicalize()?,
         provenance,
         runner_sha256: sha256_file(&runner_path)?,
-        observer_sha256: sha256_file(&observer_path)?,
+        source_observer_sha256: source_observer.sha256.clone(),
+        source_observer_nlink: source_observer.metadata.nlink(),
         observer_embedded_commit: BUILD_GIT_HEAD.into(),
+        staged_observer_role: "root_staged_transaction_executable".into(),
+        expected_staged_observer_path: staged_observer_path,
+        expected_staged_observer_sha256: source_observer.sha256,
+        expected_staged_observer_mode: 0o755,
+        expected_staged_observer_ownership: "root:root".into(),
         config_sha256: sha256_file(&config_path)?,
         runner_path,
-        observer_path,
+        source_observer_path: observer_path,
         config_path,
         transient_property_audit: provisional.property_audit()?,
         plan: provisional,
@@ -775,8 +921,12 @@ impl ObserverServiceState {
         {
             bail!("observer MainPID is outside systemd ControlGroup");
         }
-        let exe = fs::read_link(format!("/proc/{}/exe", self.main_pid))?;
-        if sha256_file(&exe)? != expected_sha256 {
+        let proc_exe = PathBuf::from(format!("/proc/{}/exe", self.main_pid));
+        let exe = fs::read_link(&proc_exe)?;
+        if exe != plan.service_binary {
+            bail!("observer /proc/exe path differs from staged service mapping");
+        }
+        if sha256_file(&proc_exe)? != expected_sha256 {
             bail!("observer /proc/exe differs from approved binary identity");
         }
         Ok(())
@@ -893,7 +1043,7 @@ impl SystemdObserverServiceBackend {
             bail!("GetUnit and GetUnitByPID disagree for observer MainPID");
         }
         let (uid, gid) = read_effective_ids(main_pid)?;
-        let exe = fs::read_link(format!("/proc/{main_pid}/exe"))?;
+        let proc_exe = PathBuf::from(format!("/proc/{main_pid}/exe"));
         let control_group: String = service.get_property("ControlGroup")?;
         let members = fs::read_to_string(
             Path::new("/sys/fs/cgroup")
@@ -942,7 +1092,7 @@ impl SystemdObserverServiceBackend {
             start_ticks: read_start_ticks(main_pid).context("observer start_ticks unavailable")?,
             effective_uid: uid,
             effective_gid: gid,
-            executable_sha256: sha256_file(&exe)?,
+            executable_sha256: sha256_file(&proc_exe)?,
         })
     }
 }
@@ -1061,6 +1211,13 @@ pub struct ObserverValidationReport {
     pub unit_absent: bool,
     pub cgroup_absent: bool,
     pub runtime_state_cleaned: bool,
+    pub source_observer_artifact_verified: bool,
+    pub source_observer_hash_verified: bool,
+    pub staged_observer_binary_created: bool,
+    pub staged_observer_binary_hash_verified: bool,
+    pub staged_observer_binary_single_link: bool,
+    pub staged_observer_binary_cleanup: bool,
+    pub staged_config_cleanup: bool,
     pub errors: Vec<String>,
 }
 
@@ -1130,6 +1287,13 @@ impl ObserverValidationReport {
             && self.unit_absent
             && self.cgroup_absent
             && self.runtime_state_cleaned
+            && self.source_observer_artifact_verified
+            && self.source_observer_hash_verified
+            && self.staged_observer_binary_created
+            && self.staged_observer_binary_hash_verified
+            && self.staged_observer_binary_single_link
+            && self.staged_observer_binary_cleanup
+            && self.staged_config_cleanup
             && self.structural_restore_passed
     }
 }
@@ -1140,7 +1304,7 @@ pub fn validate_observer_service_with_backend<B: ObserverServiceBackend>(
 ) -> Result<ObserverValidationReport> {
     backend.preflight()?;
     let plan = &manifest.payload.plan;
-    let foreign = detect_nemord_processes(&manifest.payload.observer_path, None);
+    let foreign = detect_nemord_processes(&manifest.payload.source_observer_path, None);
     reject_foreign_nemord(&foreign, None)?;
     let before = ObserverHostSnapshot::capture();
     let setup_wall = Instant::now();
@@ -1162,12 +1326,20 @@ pub fn validate_observer_service_with_backend<B: ObserverServiceBackend>(
         unit_absent: false,
         cgroup_absent: false,
         runtime_state_cleaned: false,
+        source_observer_artifact_verified: true,
+        source_observer_hash_verified: true,
+        staged_observer_binary_created: true,
+        staged_observer_binary_hash_verified: true,
+        staged_observer_binary_single_link: true,
+        staged_observer_binary_cleanup: false,
+        staged_config_cleanup: false,
         errors: Vec::new(),
     };
     let start_result = backend.start(plan);
     match start_result {
         Ok(state) => {
-            let identity_result = state.verify(plan, &manifest.payload.observer_sha256);
+            let identity_result =
+                state.verify(plan, &manifest.payload.expected_staged_observer_sha256);
             report.state = Some(state);
             if let Err(error) = identity_result {
                 report.errors.push(error.to_string());
@@ -1227,28 +1399,43 @@ pub fn execute_observer_validation(
     }
     let manifest: IntegrityBoundManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
     manifest.verify(manifest_path)?;
-    fs::write(
+    create_durable_audit_report(
         report_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
+        &serde_json::to_vec_pretty(&serde_json::json!({
             "run_id": manifest.payload.run_id,
             "evidence_kind": "harness_validation",
             "performance_claim_eligible": false,
             "audit_complete": true,
             "mutation_started": false,
             "unit_name": manifest.payload.plan.unit_name,
+            "source_observer_path": manifest.payload.source_observer_path,
+            "source_observer_sha256": manifest.payload.source_observer_sha256,
+            "source_observer_nlink": manifest.payload.source_observer_nlink,
+            "staged_observer_path": manifest.payload.expected_staged_observer_path,
             "transient_property_audit": manifest.payload.transient_property_audit,
             "manifest_payload_sha256": manifest.payload_sha256,
         }))?,
     )?;
-    fs::set_permissions(report_path, fs::Permissions::from_mode(0o600))?;
-    let (staged_manifest, staged_config) = stage_root_owned_config(&manifest)?;
-    let mut backend = SystemdObserverServiceBackend::system()?;
-    let result = validate_observer_service_with_backend(&staged_manifest, &mut backend);
-    let cleanup_result = remove_staged_config(&staged_config);
-    let report = result?;
-    cleanup_result?;
-    fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
-    fs::set_permissions(report_path, fs::Permissions::from_mode(0o600))?;
+    let staged = stage_root_owned_inputs(&manifest)?;
+    let result = (|| {
+        let mut backend = SystemdObserverServiceBackend::system()?;
+        validate_observer_service_with_backend(&manifest, &mut backend)
+    })();
+    let (config_cleanup, binary_cleanup) = staged.cleanup(&manifest);
+    let mut report = result?;
+    match config_cleanup {
+        Ok(()) => report.staged_config_cleanup = true,
+        Err(error) => report
+            .errors
+            .push(format!("staged config cleanup failed: {error}")),
+    }
+    match binary_cleanup {
+        Ok(()) => report.staged_observer_binary_cleanup = true,
+        Err(error) => report
+            .errors
+            .push(format!("staged observer cleanup failed: {error}")),
+    }
+    replace_durable_audit_report(report_path, &serde_json::to_vec_pretty(&report)?)?;
     if !report.passed() {
         bail!(
             "observer service validation failed closed; report preserved at {}",
@@ -1258,53 +1445,277 @@ pub fn execute_observer_validation(
     Ok(report)
 }
 
-fn stage_root_owned_config(
-    manifest: &IntegrityBoundManifest,
-) -> Result<(IntegrityBoundManifest, PathBuf)> {
-    let suffix = manifest
-        .payload
-        .run_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(32)
-        .collect::<String>();
-    let staged = Path::new("/run").join(format!("nemor-benchmark-observer-config-{suffix}.toml"));
-    let bytes = fs::read(&manifest.payload.config_path)?;
-    if hex::encode(Sha256::digest(&bytes)) != manifest.payload.config_sha256 {
-        bail!("observer config changed before root-owned staging");
+fn create_durable_audit_report(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut report = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(path)?;
+    report.set_permissions(fs::Permissions::from_mode(0o600))?;
+    report.write_all(bytes)?;
+    report.sync_all()?;
+    verify_staged_metadata(&report.metadata()?, 0, 0o600, bytes.len() as u64)
+        .context("durable observer audit report metadata")?;
+    Ok(())
+}
+
+fn replace_durable_audit_report(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut report = OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)?;
+    let before = report.metadata()?;
+    if before.uid() != 0 || before.permissions().mode() & 0o777 != 0o600 || before.nlink() != 1 {
+        bail!("refusing unsafe observer audit report replacement");
     }
+    report.set_len(0)?;
+    report.write_all(bytes)?;
+    report.sync_all()?;
+    verify_staged_metadata(&report.metadata()?, 0, 0o600, bytes.len() as u64)
+        .context("final observer report metadata")?;
+    Ok(())
+}
+
+struct StagedObserverInputs {
+    binary: PathBuf,
+    config: PathBuf,
+}
+
+impl StagedObserverInputs {
+    fn cleanup(self, manifest: &IntegrityBoundManifest) -> (Result<()>, Result<()>) {
+        let config = remove_staged_input(
+            &self.config,
+            STAGED_CONFIG_PREFIX,
+            0,
+            0o644,
+            &manifest.payload.config_sha256,
+        );
+        let binary = remove_staged_input(
+            &self.binary,
+            STAGED_BINARY_PREFIX,
+            0,
+            0o755,
+            &manifest.payload.expected_staged_observer_sha256,
+        );
+        (config, binary)
+    }
+}
+
+fn stage_root_owned_inputs(manifest: &IntegrityBoundManifest) -> Result<StagedObserverInputs> {
+    let source = read_verified_source_observer(
+        &manifest.payload.source_observer_path,
+        manifest.payload.created_uid,
+        Some(&manifest.payload.source_observer_sha256),
+    )?;
+    if source.metadata.nlink() != manifest.payload.source_observer_nlink {
+        bail!("source observer link count changed after preparation");
+    }
+    let config_bytes = read_verified_prepared_bytes(
+        &manifest.payload.config_path,
+        manifest.payload.created_uid,
+        MAX_PREPARED_CONFIG_BYTES,
+        &manifest.payload.config_sha256,
+    )?;
+    let binary = staged_observer_path(&manifest.payload.run_id)?;
+    let config = staged_config_path(&manifest.payload.run_id)?;
+    if binary != manifest.payload.expected_staged_observer_path
+        || binary != manifest.payload.plan.binary
+        || config != manifest.payload.plan.config
+    {
+        bail!("derived privileged staging paths differ from audited manifest");
+    }
+    stage_verified_bytes(
+        &binary,
+        &source.bytes,
+        0o755,
+        0,
+        &manifest.payload.expected_staged_observer_sha256,
+    )
+    .context("stage root-owned observer executable")?;
+    if let Err(error) = stage_verified_bytes(
+        &config,
+        &config_bytes,
+        0o644,
+        0,
+        &manifest.payload.config_sha256,
+    ) {
+        let cleanup = remove_staged_input(
+            &binary,
+            STAGED_BINARY_PREFIX,
+            0,
+            0o755,
+            &manifest.payload.expected_staged_observer_sha256,
+        );
+        return match cleanup {
+            Ok(()) => Err(error).context("stage root-owned observer config"),
+            Err(cleanup_error) => Err(error).context(format!(
+                "stage root-owned observer config; binary cleanup also failed: {cleanup_error}"
+            )),
+        };
+    }
+    Ok(StagedObserverInputs { binary, config })
+}
+
+fn read_verified_prepared_bytes(
+    path: &Path,
+    expected_uid: u32,
+    maximum: u64,
+    expected_sha256: &str,
+) -> Result<Vec<u8>> {
+    let before = fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        bail!("prepared source must be a regular non-symlink file");
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if opened.uid() != expected_uid
+        || opened.permissions().mode() & 0o022 != 0
+        || opened.nlink() != 1
+        || opened.len() == 0
+        || opened.len() > maximum
+        || before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+    {
+        bail!("prepared source metadata differs from safe staging contract");
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.len())?);
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if opened.dev() != after.dev()
+        || opened.ino() != after.ino()
+        || opened.len() != after.len()
+        || opened.mtime() != after.mtime()
+        || opened.mtime_nsec() != after.mtime_nsec()
+        || bytes.len() as u64 != opened.len()
+        || hex::encode(Sha256::digest(&bytes)) != expected_sha256
+    {
+        bail!("prepared source changed while staging or hash mismatched");
+    }
+    Ok(bytes)
+}
+
+fn stage_verified_bytes(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    expected_uid: u32,
+    expected_sha256: &str,
+) -> Result<()> {
+    stage_verified_bytes_with_fault(
+        path,
+        bytes,
+        mode,
+        expected_uid,
+        expected_sha256,
+        StageFault::None,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum StageFault {
+    None,
+    #[cfg(test)]
+    PartialWrite,
+    #[cfg(test)]
+    SyncFailure,
+}
+
+fn stage_verified_bytes_with_fault(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    expected_uid: u32,
+    expected_sha256: &str,
+    fault: StageFault,
+) -> Result<()> {
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o644)
-        .open(&staged)?;
-    output.write_all(&bytes)?;
-    output.sync_all()?;
-    if sha256_file(&staged)? != manifest.payload.config_sha256 {
-        let _ = fs::remove_file(&staged);
-        bail!("root-owned staged observer config hash mismatch");
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .mode(mode)
+        .open(path)?;
+    let staged_result = (|| {
+        #[cfg(test)]
+        if matches!(fault, StageFault::PartialWrite) {
+            output.write_all(&bytes[..bytes.len() / 2])?;
+            bail!("simulated partial staged write");
+        }
+        output.write_all(bytes)?;
+        output.set_permissions(fs::Permissions::from_mode(mode))?;
+        #[cfg(test)]
+        if matches!(fault, StageFault::SyncFailure) {
+            bail!("simulated staged sync failure");
+        }
+        let _ = fault;
+        output.sync_all()?;
+        let metadata = output.metadata()?;
+        verify_staged_metadata(&metadata, expected_uid, mode, bytes.len() as u64)?;
+        drop(output);
+        if sha256_file(path)? != expected_sha256 {
+            bail!("staged transaction input hash mismatch");
+        }
+        Ok(())
+    })();
+    if staged_result.is_err() {
+        let _ = fs::remove_file(path);
     }
-    let mut payload = manifest.payload.clone();
-    payload.config_path = staged.clone();
-    payload.plan.config = staged.clone();
-    payload.transient_property_audit = payload.plan.property_audit()?;
-    Ok((IntegrityBoundManifest::new(payload)?, staged))
+    staged_result
 }
 
-fn remove_staged_config(path: &Path) -> Result<()> {
-    if path.parent() != Some(Path::new("/run"))
+fn verify_staged_metadata(
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+    expected_mode: u32,
+    expected_size: u64,
+) -> Result<()> {
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o777 != expected_mode
+        || metadata.nlink() != 1
+        || metadata.len() != expected_size
+    {
+        bail!("staged transaction input metadata mismatch");
+    }
+    Ok(())
+}
+
+fn remove_staged_input(
+    path: &Path,
+    prefix: &str,
+    expected_uid: u32,
+    expected_mode: u32,
+    expected_sha256: &str,
+) -> Result<()> {
+    if path.parent() != Some(Path::new(RUNTIME_BASE))
         || !path
             .file_name()
             .and_then(|value| value.to_str())
-            .is_some_and(|name| name.starts_with("nemor-benchmark-observer-config-"))
+            .and_then(|name| name.strip_prefix(prefix))
+            .is_some_and(|suffix| {
+                let suffix = suffix.strip_suffix(".toml").unwrap_or(suffix);
+                is_safe_transaction_suffix(suffix)
+            })
     {
-        bail!("refusing unsafe staged config cleanup target");
+        bail!("refusing unsafe staged input cleanup target");
     }
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.uid() != 0 {
-        bail!("refusing ambiguous staged config cleanup");
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o777 != expected_mode
+        || metadata.nlink() != 1
+        || sha256_file(path)? != expected_sha256
+    {
+        bail!("refusing ambiguous staged input cleanup");
     }
     fs::remove_file(path)?;
+    if path.exists() {
+        bail!("staged transaction input remained after cleanup");
+    }
     Ok(())
 }
 
@@ -1380,8 +1791,8 @@ mod tests {
     fn plan() -> ObserverServicePlan {
         ObserverServicePlan::new(
             "attempt1",
-            PathBuf::from("/tmp/target/release/nemord"),
-            PathBuf::from("/tmp/checkpoint3ap/config.toml"),
+            PathBuf::from("/run/nemor-benchmark-observer-bin-attempt1"),
+            PathBuf::from("/run/nemor-benchmark-observer-config-attempt1.toml"),
         )
         .unwrap()
     }
@@ -1654,10 +2065,194 @@ mod tests {
             .next()
             .unwrap();
         assert!(source.contains("payload_sha256"));
-        assert!(source.contains("sha256_file(&self.payload.observer_path)?"));
+        assert!(source.contains("read_verified_source_observer("));
+        assert!(source.contains("O_NOFOLLOW"));
+        assert!(source.contains("source observer content hash differs from prepared manifest"));
         assert!(source.contains("sha256_file(&self.payload.config_path)?"));
         assert!(source.contains("current != self.payload.runner_path.canonicalize()?"));
         assert!(!source.contains("git config"));
+    }
+
+    #[test]
+    fn source_observer_accepts_one_or_multiple_links_but_rejects_unsafe_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let source = root.path().join("nemord");
+        fs::write(&source, b"approved observer bytes").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let one = read_verified_source_observer(&source, uid, None).unwrap();
+        assert_eq!(one.metadata.nlink(), 1);
+        let alias = root.path().join("cargo-deps-artifact");
+        fs::hard_link(&source, &alias).unwrap();
+        let two = read_verified_source_observer(&source, uid, Some(&one.sha256)).unwrap();
+        assert_eq!(two.metadata.nlink(), 2);
+
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(read_verified_source_observer(&source, uid, None).is_err());
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o757)).unwrap();
+        assert!(read_verified_source_observer(&source, uid, None).is_err());
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(read_verified_source_observer(&source, uid.saturating_add(1), None).is_err());
+
+        let directory = root.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(read_verified_source_observer(&directory, uid, None).is_err());
+        let link = root.path().join("symlink");
+        symlink(&source, &link).unwrap();
+        assert!(read_verified_source_observer(&link, uid, None).is_err());
+    }
+
+    #[test]
+    fn source_observer_is_bounded_and_hash_authoritative_across_hardlink_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let source = root.path().join("nemord");
+        fs::write(&source, b"first").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let approved = read_verified_source_observer(&source, uid, None).unwrap();
+        assert!(read_verified_source_observer(&source, uid, Some("wrong")).is_err());
+
+        let alias = root.path().join("alternate-hard-link");
+        fs::hard_link(&source, &alias).unwrap();
+        fs::write(&alias, b"changed through alias").unwrap();
+        assert!(read_verified_source_observer(&source, uid, Some(&approved.sha256)).is_err());
+
+        let oversized = root.path().join("oversized");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_SOURCE_OBSERVER_BYTES + 1).unwrap();
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(read_verified_source_observer(&oversized, uid, None).is_err());
+    }
+
+    #[test]
+    fn privileged_staging_creates_single_link_hash_identical_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let staged = root.path().join("staged-nemord");
+        let bytes = b"byte-identical approved observer";
+        let hash = hex::encode(Sha256::digest(bytes));
+        stage_verified_bytes(&staged, bytes, 0o755, uid, &hash).unwrap();
+        let metadata = fs::symlink_metadata(&staged).unwrap();
+        verify_staged_metadata(&metadata, uid, 0o755, bytes.len() as u64).unwrap();
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(sha256_file(&staged).unwrap(), hash);
+    }
+
+    #[test]
+    fn privileged_staging_rejects_collision_symlink_and_hash_mismatch() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let bytes = b"approved";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let existing = root.path().join("existing");
+        fs::write(&existing, b"foreign").unwrap();
+        assert!(stage_verified_bytes(&existing, bytes, 0o755, uid, &hash).is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"foreign");
+
+        let target = root.path().join("target");
+        fs::write(&target, b"foreign").unwrap();
+        let link = root.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert!(stage_verified_bytes(&link, bytes, 0o755, uid, &hash).is_err());
+        assert!(link.is_symlink());
+
+        let mismatch = root.path().join("mismatch");
+        assert!(stage_verified_bytes(&mismatch, bytes, 0o755, uid, "wrong").is_err());
+        assert!(!mismatch.exists());
+    }
+
+    #[test]
+    fn privileged_staging_partial_write_and_sync_failures_remove_partial_file() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let bytes = b"approved observer bytes";
+        let hash = hex::encode(Sha256::digest(bytes));
+        for (name, fault) in [
+            ("partial", StageFault::PartialWrite),
+            ("sync", StageFault::SyncFailure),
+        ] {
+            let staged = root.path().join(name);
+            assert!(
+                stage_verified_bytes_with_fault(&staged, bytes, 0o755, uid, &hash, fault).is_err()
+            );
+            assert!(!staged.exists());
+        }
+    }
+
+    #[test]
+    fn source_path_inode_replacement_requires_the_prepared_content_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let source = root.path().join("nemord");
+        fs::write(&source, b"approved").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let approved = read_verified_source_observer(&source, uid, None).unwrap();
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"different").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        assert!(read_verified_source_observer(&source, uid, Some(&approved.sha256)).is_err());
+    }
+
+    #[test]
+    fn staged_metadata_rejects_mode_owner_and_multiple_links() {
+        let root = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let staged = root.path().join("staged");
+        fs::write(&staged, b"binary").unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = fs::metadata(&staged).unwrap();
+        assert!(verify_staged_metadata(&metadata, uid, 0o700, 6).is_err());
+        assert!(verify_staged_metadata(&metadata, uid.saturating_add(1), 0o755, 6).is_err());
+        let alias = root.path().join("alias");
+        fs::hard_link(&staged, alias).unwrap();
+        assert!(verify_staged_metadata(&fs::metadata(&staged).unwrap(), uid, 0o755, 6).is_err());
+    }
+
+    #[test]
+    fn source_hardlinks_never_flow_into_transient_exec_start() {
+        let source = PathBuf::from("/home/user/repository/target/release/nemord");
+        let plan = plan();
+        assert_ne!(plan.binary, source);
+        assert_eq!(plan.binary, staged_observer_path("attempt1").unwrap());
+        let audit = plan.property_audit().unwrap();
+        let binds = audit
+            .iter()
+            .find(|entry| entry.property == "BindReadOnlyPaths")
+            .unwrap();
+        assert!(binds.request_value.contains(STAGED_BINARY_PREFIX));
+        assert!(!binds.request_value.contains("/home/"));
+        let exec = audit
+            .iter()
+            .find(|entry| entry.property == "ExecStart")
+            .unwrap();
+        assert!(exec.request_value.starts_with("/run/"));
+        assert!(!exec.request_value.contains("target/release"));
+    }
+
+    #[test]
+    fn staging_verification_precedes_systemd_connection_and_start() {
+        let source = include_str!("observer_service.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let execute = source
+            .split("pub fn execute_observer_validation")
+            .nth(1)
+            .unwrap();
+        let stage = execute.find("stage_root_owned_inputs(&manifest)").unwrap();
+        let system = execute
+            .find("SystemdObserverServiceBackend::system()")
+            .unwrap();
+        let start = execute
+            .find("validate_observer_service_with_backend")
+            .unwrap();
+        assert!(stage < system && system < start);
     }
 
     #[test]
@@ -1734,7 +2329,7 @@ mod tests {
 
     fn fake_manifest(plan: ObserverServicePlan) -> IntegrityBoundManifest {
         IntegrityBoundManifest::new(PreparedObserverManifest {
-            schema_version: 1,
+            schema_version: 2,
             run_id: "attempt1".into(),
             created_uid: 1000,
             prepared_directory: PathBuf::from("/tmp/prepared"),
@@ -1750,9 +2345,15 @@ mod tests {
             },
             runner_path: PathBuf::from("/tmp/release/nemor-benchmark"),
             runner_sha256: "runner".into(),
-            observer_path: plan.binary.clone(),
-            observer_sha256: "binary".into(),
+            source_observer_path: PathBuf::from("/tmp/target/release/nemord"),
+            source_observer_sha256: "binary".into(),
+            source_observer_nlink: 2,
             observer_embedded_commit: "a".repeat(40),
+            staged_observer_role: "root_staged_transaction_executable".into(),
+            expected_staged_observer_path: plan.binary.clone(),
+            expected_staged_observer_sha256: "binary".into(),
+            expected_staged_observer_mode: 0o755,
+            expected_staged_observer_ownership: "root:root".into(),
             config_path: plan.config.clone(),
             config_sha256: "config".into(),
             transient_property_audit: plan.property_audit().unwrap(),

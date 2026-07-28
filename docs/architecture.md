@@ -177,7 +177,7 @@ transient `.service` because PID 1 must create the release `nemord` with
 
 The service uses fixed typed properties and argv, `mode=fail`, subscribed
 asynchronous job completion, an ephemeral `RuntimeDirectory`, and read-only
-binds of the hash-approved binary and explicit observe-only config. Its
+binds of root-staged, hash-approved executable/config inputs. Its
 database is inside that runtime directory, never the production database.
 `Service.MainPID`, numeric effective UID/GID, start ticks, `/proc/PID/exe`
 hash, `GetUnitByPID`, and the systemd-derived service `ControlGroup` form the
@@ -185,10 +185,12 @@ runtime identity. DynamicUser numeric IDs need not be stable.
 
 Source provenance is prepared unprivileged from a clean release build. The
 privileged validation consumes an integrity-bound manifest, re-hashes its own
-binary, `nemord`, and config, and never calls Git. After verification it copies
-the config to an exact root-owned `/run` staging path, closing the user-owned
-path TOCTOU window. Checkpoint 3A-P remains pending one bounded live
-validation.
+binary, `nemord`, and config, and never calls Git. Cargo's source `nemord` may
+have multiple hard links; it is opened no-follow and read through the verified
+descriptor, then copied byte-identically to an exact root-owned, single-link
+`/run` executable. Config uses the same fixed-role staging boundary. Systemd
+binds only those staged inputs, closing the user-owned path and hard-link
+TOCTOU window. Checkpoint 3A-P remains pending one bounded live validation.
 
 The application-level provenance command is authoritative for cleanliness;
 shell emptiness of `git status` is intentionally not used because bounded

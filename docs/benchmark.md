@@ -305,10 +305,10 @@ networking with IP denied, native syscall architecture, and foreground
 The transient validation preserves the runtime identity, UMask, capability
 removal, foreground behavior and hardening. Deliberate differences are an
 ephemeral `RuntimeDirectory` instead of persistent `StateDirectory`, no
-restart, bounded start/stop/runtime backstops, read-only bind mounts for the
-approved release binary and config, and an isolated working directory and
-SQLite database below `/run`. These differences prevent production-state
-mutation and growing `/var/lib` validation state.
+restart, bounded start/stop/runtime backstops, read-only bind mounts for
+root-staged hash-identical executable/config inputs, and an isolated working
+directory and SQLite database below `/run`. These differences prevent
+production-state mutation and growing `/var/lib` validation state.
 
 This difference is classified
 `INTENTIONALLY_DIFFERENT_FOR_EPHEMERAL_STATE_ISOLATION`. Identity and
@@ -340,10 +340,27 @@ equivalent policy.
 The prepared directory must be absolute, non-symlink, owned by the preparing
 UID and not group/world writable. Manifest and config must be bounded,
 regular, single-link files with matching ownership and safe modes. The
-observer must be the exact regular, single-link sibling release binary.
-Privileged execution repeats these checks, stages exact config bytes with
-`create_new` beneath `/run`, syncs and re-hashes them, and removes only the
-exact generated staging file.
+observer source must be the exact sibling Cargo release binary, owned by the
+preparing UID and not group/world writable. Cargo may legitimately hard-link
+that source inode into `target/release/deps`; its link count is recorded but
+is not treated as final execution authority.
+
+Privileged execution opens the source with no-follow semantics, verifies
+descriptor metadata, reads and hashes those exact bytes against the manifest,
+and creates a root-owned mode `0755`, single-link executable with
+`create_new` beneath `/run`. It applies the same descriptor-bound hash staging
+to the explicit config. The service binds and executes only these
+transaction-owned staged inputs, never the mutable user-owned Cargo inode.
+Both staged files are synced, re-hashed, verified and removed only after the
+service process is absent. This narrowly permits a multi-link build artifact
+because content hash and root staging—not generic hard-link trust—form the
+privileged execution boundary.
+
+The first preparation against commit
+`d0e9aa031a050770d8455464a3fbf407fdd9e164` stopped before manifest creation
+because Cargo produced the normal two-link observer artifact. This was a
+pre-live preparation blocker, not Checkpoint 3A-P ATTEMPT 1; no privileged
+validation occurred.
 
 The later matched 3A timeline is fixed: after worker-scope verification,
 observe performs separately-accounted service setup; both variants then

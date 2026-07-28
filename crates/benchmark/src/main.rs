@@ -359,7 +359,7 @@ fn run() -> Result<i32> {
                 nemor_benchmark::observer_service::SystemdObserverServiceBackend::system()?;
             backend.preflight()?;
             let foreign = nemor_benchmark::performance::detect_nemord_processes(
-                &bounded.payload.observer_path,
+                &bounded.payload.source_observer_path,
                 None,
             );
             let foreign_clear =

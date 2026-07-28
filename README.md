@@ -167,7 +167,10 @@ production performance claims.
 - a Checkpoint 3A-P boundary for one benchmark-owned transient
   `nemor-benchmark-observer-*.service`. PID 1 creates the real release
   `nemord` with `DynamicUser=true`, an ephemeral `RuntimeDirectory`, fixed
-  typed argv, production-equivalent hardening and isolated storage. Its
+  typed argv, production-equivalent hardening and isolated storage. The
+  privileged runner copies descriptor-verified Cargo bytes into a
+  root-owned, single-link `/run` executable, and the service never executes
+  the user-owned Cargo inode directly. Its
   simulated lifecycle is implemented; one bounded privileged validation is
   still required before Checkpoint 3A may run.
 
