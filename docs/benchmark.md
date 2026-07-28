@@ -282,15 +282,15 @@ and the comparison. Percent changes use the baseline arithmetic mean as
 denominator and positive means observe is higher; no significance is claimed
 from three repetitions.
 
-Checkpoint 3A is implemented but not yet live validated. Capacity, maximum
-sustainable load, `capacity_gain_percent`, gaming, OOM avoidance,
-incompressible regression and overall Phase 10 acceptance remain
-`not_evaluated`.
+Checkpoint 3A-P is validated. Checkpoint 3A remains pending its real baseline
+versus observe A/B performance experiment. Capacity, maximum sustainable
+load, `capacity_gain_percent`, gaming, OOM avoidance, incompressible
+regression and overall Phase 10 acceptance remain `not_evaluated`.
 
 ### Checkpoint 3A-P DynamicUser observer boundary
 
-Checkpoint 3A remains blocked until one bounded `harness_validation` proves
-the observer boundary. The worker continues to use the validated transient
+Checkpoint 3A-P now proves the observer boundary through one bounded
+`harness_validation`. The worker continues to use the validated transient
 `.scope`; the observer uses an exact benchmark-owned transient `.service`
 created by PID 1 through the direct system D-Bus manager.
 
@@ -423,8 +423,8 @@ completion was sampled before final exec/credential identity settled. It is
 not a DynamicUser failure and not a cleanup failure. The preserved canonical
 report SHA-256 is
 `069c2c05018ea3b090749ad53688e9892a50de24efedbffa5a4f48dd4ae7eff0`.
-It counts as ATTEMPT 1; the next live validation is ATTEMPT 2. No live
-ATTEMPT 2 is part of this fix.
+It counts as ATTEMPT 1; the next live validation was ATTEMPT 2. No additional
+ATTEMPT 1 run is permitted.
 
 Checkpoint 3A-P ATTEMPT 2 was the second real privileged live validation. The
 identity-settling gate passed: the same `MainPID=92007`, `ExecMainPID=92007`
@@ -452,7 +452,23 @@ ATTEMPT 2 classification is
 staging, cleanup, and structural restore all passed. The preserved report
 SHA-256 is
 `25ab2144ce7acf74b8da1fa2eacb5378cb42db250509246d426bcf5ddd7ddc66`.
-The next live validation is ATTEMPT 3.
+The next live validation was ATTEMPT 3.
+
+Checkpoint 3A-P ATTEMPT 3 was the third real privileged live validation and
+passed on CachyOS. Run `checkpoint3ap1785249727703055971` returned exit code
+0. The same `MainPID=100352`, `ExecMainPID=100352` and `start_ticks=2167042`
+settled from the root-owned systemd executor (`UID/GID=0/0`, SHA-256
+`b5199b96a1bfc9e6d843e6b075521f1909492327893f592a9abfc045ae451fae`) to
+`DynamicUser=true`, effective `UID/GID=63871/63871`, and staged observer
+SHA-256 `ce4d8270905211480b1a454abeeafed1277569aac2e3d45cbb6115c82859dafa`.
+Settling passed after three polls in 0.088228478 seconds. The declared
+service contract, real telemetry readiness, and bounded observer-alive/
+zero-mutation window passed. Cleanup and structural restore passed with no
+errors. The canonical and preserved report SHA-256 is
+`aaa4a44e80b55e84a302a1109b68208b6a55270b106f2f6eb4a68930794d580a`.
+The report is `harness_validation` and
+`performance_claim_eligible=false`; this closes 3A-P but does not produce
+performance evidence.
 
 The later matched 3A timeline is fixed: after worker-scope verification,
 observe performs separately-accounted service setup; both variants then

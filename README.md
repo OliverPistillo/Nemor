@@ -34,10 +34,11 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 433 / 433 |
-| Passed / failed / ignored | 433 / 0 / 0 |
-| Phase 10 validation | framework + privileged worker harness validated; observer service and real A/B pending |
-| Checkpoint 3A | blocked pending Checkpoint 3A-P transient DynamicUser observer validation |
+| Tests defined / executed | 491 / 491 |
+| Passed / failed / ignored | 491 / 0 / 0 |
+| Phase 10 validation | framework + privileged worker harness + 3A-P observer pipeline validated; real A/B pending |
+| Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
+| Checkpoint 3A | ready for real baseline-versus-observe A/B; performance evidence pending |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -162,8 +163,8 @@ production performance claims.
   `cachyos_baseline`/`nemor_observe` pipeline with clean release-binary
   provenance, deterministic six-run ordering, isolated exact-owned production
   observer lifecycle, run-relative counters, per-run restore and
-  observer-overhead comparison. It is implemented but has not yet produced
-  live performance evidence.
+  observer-overhead comparison. It is ready for real A/B execution but has
+  not yet produced live performance evidence.
 - a Checkpoint 3A-P boundary for one benchmark-owned transient
   `nemor-benchmark-observer-*.service`. PID 1 creates the real release
   `nemord` with `DynamicUser=true`, an ephemeral `RuntimeDirectory`, fixed
@@ -171,8 +172,9 @@ production performance claims.
   privileged runner copies descriptor-verified Cargo bytes into a
   root-owned, single-link `/run` executable, and the service never executes
   the user-owned Cargo inode directly. Its
-  simulated lifecycle is implemented; one bounded privileged validation is
-  still required before Checkpoint 3A may run.
+  privileged pipeline validation passed on CachyOS in Checkpoint 3A-P ATTEMPT
+  3. The three-attempt history is retained, and this harness evidence makes
+  no performance claim; Checkpoint 3A real A/B remains next.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process
@@ -306,8 +308,9 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
   validation of Phases 3, 5, 6, 7 and 8.
 - Phase 9 validated both profitable selective KSM and real ineffective-workload
   auto-disable/cooldown on cooperative owned targets.
-- Phase 10 remains in development: the benchmark framework and privileged
-  owned-cgroup harness are validated; real A/B evidence is pending.
+- Phase 10 remains in development: the benchmark framework, privileged
+  owned-cgroup harness, and privileged observer service pipeline are
+  validated; real A/B evidence is pending.
 - Phase 11 is not started.
 
 ## Documentation
@@ -341,4 +344,4 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 | 7 | 213 | CachyOS real `vaddr`, 9 windows, zero DAMOS, host unchanged | current Phase 7 commit |
 | 8 | 268 | CachyOS controlled synthetic DAMOS pageout; 8 MiB COLD-only reclaim, refault/recovery, host unchanged | current Phase 8 commit |
 | 9 | 316 | CachyOS selective KSM: profitable path plus ineffective auto-disable/cooldown; host unchanged | current Phase 9 commit |
-| 10 checkpoint 2 | 433 | Framework and privileged systemd transient-scope harness validated; real A/B pending | current checkpoint |
+| 10 checkpoint 3A-P | 491 | Framework, privileged worker harness, and observer service pipeline validated on CachyOS; real A/B pending | `2bf9cce` |

@@ -299,7 +299,7 @@ with SHA-256
 which exactly matches the host's `/usr/lib/systemd/systemd-executor`.
 Readiness never started. Process/unit/cgroup/runtime cleanup and structural
 restore all passed. The classification is
-`FAILED_CLOSED_STARTUP_IDENTITY_TRANSITION`; the next live run is ATTEMPT 2,
+`FAILED_CLOSED_STARTUP_IDENTITY_TRANSITION`; the next live run was ATTEMPT 2,
 after a clean release, fresh V5 preparation and preflight.
 
 Checkpoint 3A-P ATTEMPT 2 positively validated identity settling before
@@ -319,6 +319,24 @@ canonicalizes only this address deny multiset, rejects missing/extra/
 duplicate/wrong-prefix/wrong-address entries, retains raw evidence order,
 and reports bounded field/category diagnostics. ATTEMPT 2 report SHA-256:
 `25ab2144ce7acf74b8da1fa2eacb5378cb42db250509246d426bcf5ddd7ddc66`.
+
+Checkpoint 3A-P ATTEMPT 3 completed successfully on real CachyOS. Run
+`checkpoint3ap1785249727703055971` returned `validation_exit_code=0`; the
+report is `harness_validation` and is ineligible for performance claims. The
+same PID 100352, ExecMainPID 100352 and start ticks 2167042 settled from
+systemd-executor UID/GID 0/0 to DynamicUser UID/GID 63871/63871 after three
+polls in 0.088228478 seconds. The final staged observer SHA-256 was
+`ce4d8270905211480b1a454abeeafed1277569aac2e3d45cbb6115c82859dafa`.
+The declared service contract, real telemetry readiness, bounded
+observer-alive/zero-mutation validation, cleanup and structural restore all
+passed with `errors=[]`. The canonical and preserved report SHA-256 is
+`aaa4a44e80b55e84a302a1109b68208b6a55270b106f2f6eb4a68930794d580a`.
+
+This closes the privileged Checkpoint 3A-P observer pipeline. ATTEMPT 1 and
+ATTEMPT 2 remain permanent negative history; no ATTEMPT 4 is planned. Real
+Checkpoint 3A baseline-versus-observe A/B performance validation is the next
+checkpoint. Phase 10 remains in development, and Phase 6 zswap+NVMe boot
+validation remains pending on dedicated hardware.
 
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
