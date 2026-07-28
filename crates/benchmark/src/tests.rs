@@ -2446,6 +2446,91 @@ fn checkpoint3a_execution_requires_prepared_manifest_and_service_backend() {
 }
 
 #[test]
+fn checkpoint3a_observer_transaction_ids_front_load_unique_fields() {
+    let experiment = "checkpoint3a1785257503817348284".to_string() + &"x".repeat(128);
+    let ids = [2usize, 4, 5]
+        .into_iter()
+        .map(|order| {
+            crate::performance::checkpoint3a_observer_run_id(
+                &experiment,
+                order,
+                match order {
+                    2 => 0,
+                    4 => 1,
+                    _ => 2,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        3
+    );
+    let plans = ids
+        .iter()
+        .map(|id| {
+            let (binary, config) = crate::observer_service::staged_observer_paths(id).unwrap();
+            crate::observer_service::ObserverServicePlan::new_with_runtime(
+                id,
+                binary,
+                config,
+                crate::performance::performance_runtime_max_usec(
+                    &crate::performance::PerformanceProfile::checkpoint3a(
+                        crate::performance::CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.unit_name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3
+    );
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.database.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3
+    );
+    assert_eq!(
+        crate::performance::checkpoint3a_observer_run_id(&experiment, 2, 0),
+        crate::performance::checkpoint3a_observer_run_id(&experiment, 2, 0)
+    );
+    assert_ne!(
+        crate::performance::checkpoint3a_observer_run_id(&experiment, 2, 0),
+        crate::performance::checkpoint3a_observer_run_id(&experiment, 2, 1)
+    );
+}
+
+#[test]
+fn checkpoint3a_observer_transaction_duplicate_is_rejected() {
+    let id = crate::performance::checkpoint3a_observer_run_id("exp", 2, 0);
+    let (binary, config) = crate::observer_service::staged_observer_paths(&id).unwrap();
+    let plan = crate::observer_service::ObserverServicePlan::new_with_runtime(
+        &id, binary, config, 55_000_000,
+    )
+    .unwrap();
+    let run = crate::performance::PreparedObserveRun {
+        order_index: 2,
+        repetition_index: 0,
+        run_id: id,
+        service_plan: plan,
+        prepared_config_path: "/tmp/observe.toml".into(),
+        prepared_config_sha256: "hash".into(),
+    };
+    let duplicate = run.clone();
+    assert!(crate::performance::validate_observer_run_uniqueness(&[run, duplicate]).is_err());
+}
+
+#[test]
 fn checkpoint3a_runtime_bound_exceeds_measurement_and_is_finite() {
     let profile = crate::performance::PerformanceProfile::checkpoint3a(
         crate::performance::CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES,

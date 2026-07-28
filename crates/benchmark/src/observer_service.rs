@@ -695,6 +695,12 @@ fn staged_config_path(run_id: &str) -> Result<PathBuf> {
     )))
 }
 
+/// Returns the exact transaction-owned staging roles for a frozen observer run.
+/// The transaction suffix remains authoritative in `ObserverServicePlan::validate`.
+pub fn staged_observer_paths(run_id: &str) -> Result<(PathBuf, PathBuf)> {
+    Ok((staged_observer_path(run_id)?, staged_config_path(run_id)?))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedObserverManifest {
     pub schema_version: u32,

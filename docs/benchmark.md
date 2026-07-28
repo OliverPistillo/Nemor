@@ -305,6 +305,13 @@ property contract and output destinations. Privileged execution uses only
 `execute-experiment --manifest`; the legacy `experiment --execute` path is
 retired. No Git or shell inspection is performed during privileged execution.
 
+Checkpoint 3A Experiment 1 Preparation V1 is retained as negative preparation
+history: it was rejected before host preflight because bounded transaction
+suffix sanitization discarded the order-specific identity and collided all
+three observe transactions. No host preflight, sudo, A/B execution, or
+performance evidence occurred. Preparation V2 will use fresh paths after the
+transaction-ID fix.
+
 ### Checkpoint 3A-P DynamicUser observer boundary
 
 Checkpoint 3A-P now proves the observer boundary through one bounded

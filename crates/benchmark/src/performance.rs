@@ -219,6 +219,39 @@ pub struct PreparedObserveRun {
     pub prepared_config_sha256: String,
 }
 
+pub(crate) fn checkpoint3a_observer_run_id(
+    experiment_id: &str,
+    order_index: usize,
+    repetition_index: usize,
+) -> String {
+    format!("c3a-o{order_index}-r{repetition_index}-{experiment_id}")
+}
+
+pub(crate) fn validate_observer_run_uniqueness(runs: &[PreparedObserveRun]) -> Result<()> {
+    let mut run_ids = BTreeSet::new();
+    let mut units = BTreeSet::new();
+    let mut runtimes = BTreeSet::new();
+    let mut binaries = BTreeSet::new();
+    let mut configs = BTreeSet::new();
+    let mut service_binaries = BTreeSet::new();
+    let mut service_configs = BTreeSet::new();
+    let mut databases = BTreeSet::new();
+    for run in runs {
+        if !run_ids.insert(run.run_id.clone())
+            || !units.insert(run.service_plan.unit_name.clone())
+            || !runtimes.insert(run.service_plan.runtime_directory.clone())
+            || !binaries.insert(run.service_plan.binary.clone())
+            || !configs.insert(run.service_plan.config.clone())
+            || !service_binaries.insert(run.service_plan.service_binary.clone())
+            || !service_configs.insert(run.service_plan.service_config.clone())
+            || !databases.insert(run.service_plan.database.clone())
+        {
+            bail!("duplicate frozen observer transaction identity")
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedExperimentManifest {
     pub payload: PreparedExperimentPayload,
@@ -399,9 +432,10 @@ impl PreparedExperimentManifest {
             if planned.variant != BenchmarkVariant::NemorObserve
                 || planned.repetition_index != run.repetition_index
                 || run.run_id
-                    != format!(
-                        "{}-run-{}",
-                        self.payload.plan.experiment_id, run.order_index
+                    != checkpoint3a_observer_run_id(
+                        &self.payload.plan.experiment_id,
+                        run.order_index,
+                        run.repetition_index,
                     )
             {
                 bail!("frozen observer run mapping differs from deterministic plan")
@@ -436,6 +470,7 @@ impl PreparedExperimentManifest {
                 bail!("prepared observer config database differs from frozen service plan")
             }
         }
+        validate_observer_run_uniqueness(&self.payload.observer_runs)?;
         if self
             .payload
             .output_root
@@ -540,18 +575,16 @@ pub fn prepare_experiment_manifest(
         .iter()
         .filter(|run| run.variant == BenchmarkVariant::NemorObserve)
         .map(|run| {
-            let run_id = format!("{}-run-{}", plan.experiment_id, run.order_index);
-            let suffix: String = run_id
-                .chars()
-                .filter(char::is_ascii_alphanumeric)
-                .take(32)
-                .collect();
+            let run_id = checkpoint3a_observer_run_id(
+                &plan.experiment_id,
+                run.order_index,
+                run.repetition_index,
+            );
+            let (binary, config_path) = crate::observer_service::staged_observer_paths(&run_id)?;
             let service_plan = crate::observer_service::ObserverServicePlan::new_with_runtime(
                 &run_id,
-                PathBuf::from(format!("/run/nemor-benchmark-observer-bin-{suffix}")),
-                PathBuf::from(format!(
-                    "/run/nemor-benchmark-observer-config-{suffix}.toml"
-                )),
+                binary,
+                config_path,
                 performance_runtime_max_usec(&plan.profile),
             )?;
             let prepared_config_path =
@@ -570,6 +603,7 @@ pub fn prepare_experiment_manifest(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    validate_observer_run_uniqueness(&observer_runs)?;
     let payload = PreparedExperimentPayload {
         schema_version: PREPARED_EXPERIMENT_SCHEMA_VERSION,
         experiment_id: plan.experiment_id.clone(),
