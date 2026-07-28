@@ -1961,6 +1961,12 @@ fn checkpoint3a_run(plan: &ExperimentPlan, planned: PlannedRun) -> RunEvidence {
         pss_peak_bytes: Some(1024),
         outside_worker_scope: true,
         isolated_storage_closed: true,
+        service_unit: None,
+        control_group: None,
+        effective_uid: None,
+        effective_gid: None,
+        settling: None,
+        readiness_duration_seconds: None,
     });
     RunEvidence {
         run_id: format!("run-{}", planned.order_index),
@@ -2202,6 +2208,26 @@ fn environment_or_worker_manifest_mismatch_blocks_comparison() {
 }
 
 #[test]
+fn observer_comparison_requires_paired_repetition_seeds() {
+    let plan = checkpoint3a_fixture_plan();
+    let runs = plan
+        .randomized_order
+        .iter()
+        .cloned()
+        .map(|planned| checkpoint3a_run(&plan, planned))
+        .collect::<Vec<_>>();
+    assert!(compare_observer_overhead(&runs, &BTreeMap::new()).is_ok());
+    let mut mismatched = runs;
+    if let Some(run) = mismatched
+        .iter_mut()
+        .find(|run| run.planned.variant == BenchmarkVariant::NemorObserve)
+    {
+        run.planned.run_seed = run.planned.run_seed.wrapping_add(1);
+    }
+    assert!(compare_observer_overhead(&mismatched, &BTreeMap::new()).is_err());
+}
+
+#[test]
 fn thermal_and_optional_energy_are_never_fabricated() {
     let plan = checkpoint3a_fixture_plan();
     assert_eq!(
@@ -2409,6 +2435,7 @@ fn checkpoint3a_execution_requires_prepared_manifest_and_service_backend() {
     let harness = include_str!("harness.rs");
     assert!(cli.contains("PrepareExperiment"));
     assert!(cli.contains("ExecuteExperiment"));
+    assert!(cli.contains("ExperimentPreflight"));
     assert!(source.contains("PreparedExperimentManifest"));
     assert!(source.contains("execute_prepared_experiment"));
     assert!(source.contains("unsupported validated observer service contract version"));

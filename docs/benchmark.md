@@ -286,7 +286,12 @@ Checkpoint 3A-P is validated and the 3A execution bridge reuses its transient
 observer-service lifecycle. Checkpoint 3A remains pending its real baseline
 versus observe A/B performance experiment. Preparation is unprivileged and
 freezes an integrity-bound manifest; privileged execution consumes only that
-manifest. Capacity, maximum sustainable
+manifest. The bridge now freezes one prepared observer config and service plan
+per observe repetition; each config points at that plan's isolated
+RuntimeDirectory database. A read-only `experiment-preflight --manifest`
+command verifies manifest ownership, hashes, environment, systemd/cgroup
+capability, foreign-process absence and output freshness before authorization.
+Capacity, maximum sustainable
 load, `capacity_gain_percent`, gaming, OOM avoidance, incompressible
 regression and overall Phase 10 acceptance remain `not_evaluated`.
 

@@ -127,9 +127,7 @@ enum Command {
         #[arg(long)]
         prepared_dir: PathBuf,
         #[arg(long)]
-        database: PathBuf,
-        #[arg(long)]
-        report_dir: PathBuf,
+        output_dir: PathBuf,
         #[arg(long, default_value_t = 1)]
         seed: u64,
         #[arg(long, default_value_t = 128 * 1024 * 1024)]
@@ -138,6 +136,12 @@ enum Command {
     ExecuteExperiment {
         #[arg(long)]
         manifest: PathBuf,
+    },
+    ExperimentPreflight {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     #[command(hide = true)]
     WorkerHold {
@@ -481,8 +485,7 @@ fn run() -> Result<i32> {
             config,
             observer_binary,
             prepared_dir,
-            database,
-            report_dir,
+            output_dir,
             seed,
             payload_bytes,
         } => {
@@ -491,8 +494,7 @@ fn run() -> Result<i32> {
                 &config,
                 &observer_binary,
                 &prepared_dir,
-                &database,
-                &report_dir,
+                &output_dir,
                 seed,
                 payload_bytes,
             )?;
@@ -507,6 +509,14 @@ fn run() -> Result<i32> {
                 outcome.comparison.is_some()
             );
             return Ok(if outcome.comparison.is_some() { 0 } else { 1 });
+        }
+        Command::ExperimentPreflight { manifest, json } => {
+            let output = nemor_benchmark::performance::preflight_prepared_experiment(&manifest)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("{}", serde_json::to_string(&output)?);
+            }
         }
         Command::WorkerHold {
             bytes,

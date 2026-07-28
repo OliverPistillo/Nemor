@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 Framework + privileged harness + 3A execution bridge validated / real A/B pending |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 Framework + privileged harness + hardened 3A execution bridge validated / real A/B pending |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -38,7 +38,7 @@ development; ⚪ planned.
 | Passed / failed / ignored | 491 / 0 / 0 |
 | Phase 10 validation | framework + privileged worker harness + 3A-P observer pipeline validated; real A/B pending |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
-| Checkpoint 3A | execution bridge ready; clean-release preparation and real baseline-versus-observe A/B pending |
+| Checkpoint 3A | hardened execution bridge ready; manifest host preflight and real baseline-versus-observe A/B pending |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |

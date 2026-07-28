@@ -339,7 +339,8 @@ the raw child observer path is not reachable for performance evidence.
 Unprivileged preparation freezes an integrity-bound manifest and privileged
 execution consumes only that manifest. Real Checkpoint 3A baseline-versus-
 observe A/B performance validation is the next checkpoint. Phase 10 remains
-in development, and Phase 6 zswap+NVMe boot
+in development. The bridge hardening also requires a read-only manifest host
+preflight before authorization. Phase 6 zswap+NVMe boot
 validation remains pending on dedicated hardware.
 
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required

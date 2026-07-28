@@ -1444,12 +1444,11 @@ pub struct PerformanceObserverHandle {
 }
 
 pub fn start_performance_observer(
-    run_id: &str,
+    plan: &ObserverServicePlan,
     source_observer: &Path,
-    config: &Path,
     expected_source_sha256: &str,
+    prepared_config: &Path,
     expected_config_sha256: &str,
-    runtime_max_usec: u64,
 ) -> Result<PerformanceObserverHandle> {
     if !nix::unistd::geteuid().is_root() {
         bail!("performance observer service requires privileged execution");
@@ -1457,14 +1456,20 @@ pub fn start_performance_observer(
     let source_uid = fs::symlink_metadata(source_observer)?.uid();
     let source =
         read_verified_source_observer(source_observer, source_uid, Some(expected_source_sha256))?;
+    plan.validate()?;
+    if plan.runtime_max_usec <= SERVICE_RUNTIME_MAX_USEC
+        || plan.runtime_max_usec > PERFORMANCE_SERVICE_RUNTIME_MAX_USEC
+    {
+        bail!("performance observer RuntimeMax is outside the performance contract");
+    }
     let config_bytes = read_verified_prepared_bytes(
-        config,
-        fs::symlink_metadata(config)?.uid(),
+        prepared_config,
+        fs::symlink_metadata(prepared_config)?.uid(),
         MAX_PREPARED_CONFIG_BYTES,
         expected_config_sha256,
     )?;
-    let staged_binary_path = staged_observer_path(run_id)?;
-    let staged_config_path = staged_config_path(run_id)?;
+    let staged_binary_path = plan.binary.clone();
+    let staged_config_path = plan.config.clone();
     let staged = {
         stage_verified_bytes(
             &staged_binary_path,
@@ -1494,37 +1499,39 @@ pub fn start_performance_observer(
             config: staged_config_path,
         }
     };
-    let plan = ObserverServicePlan::new_with_runtime(
-        run_id,
-        staged.binary.clone(),
-        staged.config.clone(),
-        runtime_max_usec,
-    )?;
     let mut backend = SystemdObserverServiceBackend::system()?;
     backend.preflight()?;
     let setup = Instant::now();
-    let started = match backend.start(&plan, expected_source_sha256) {
+    let started = match backend.start(plan, expected_source_sha256) {
         Ok(started) => started,
         Err(error) => {
-            let _ = staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
+            let _ = backend.stop(plan);
+            if backend.wait_absent(plan).is_ok() {
+                let (binary, config) =
+                    staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
+                binary.context("performance observer binary cleanup after start failure")?;
+                config.context("performance observer config cleanup after start failure")?;
+            } else {
+                bail!("observer start failed and owned service absence could not be proven: {error:#}");
+            }
             return Err(error);
         }
     };
-    if let Err(error) = started.state.verify_declared(&plan, expected_source_sha256) {
-        let _ = backend.stop(&plan);
-        let _ = backend.wait_absent(&plan);
+    if let Err(error) = started.state.verify_declared(plan, expected_source_sha256) {
+        let _ = backend.stop(plan);
+        let _ = backend.wait_absent(plan);
         let _ = staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
         return Err(error);
     }
-    if let Err(error) = wait_ready(&plan.database, &backend, &plan, &started.state) {
-        let _ = backend.stop(&plan);
-        let _ = backend.wait_absent(&plan);
+    if let Err(error) = wait_ready(&plan.database, &backend, plan, &started.state) {
+        let _ = backend.stop(plan);
+        let _ = backend.wait_absent(plan);
         let _ = staged.cleanup_paths(expected_source_sha256, expected_config_sha256);
         return Err(error);
     }
     Ok(PerformanceObserverHandle {
         backend,
-        plan,
+        plan: plan.clone(),
         state: started.state,
         settling: started.settling,
         staged,
@@ -1540,8 +1547,10 @@ impl PerformanceObserverHandle {
     }
 
     pub fn stop_and_cleanup(mut self) -> Result<()> {
-        self.backend.stop(&self.plan)?;
-        self.backend.wait_absent(&self.plan)?;
+        let stop_result = self.backend.stop(&self.plan);
+        let absence_result = self.backend.wait_absent(&self.plan);
+        stop_result.context("observer StopUnit cleanup")?;
+        absence_result.context("observer service absence cleanup")?;
         let (binary, config) = self
             .staged
             .cleanup_paths(&self.source_sha256, &self.config_sha256);
@@ -1549,6 +1558,11 @@ impl PerformanceObserverHandle {
         config?;
         Ok(())
     }
+}
+
+pub fn performance_observer_unit_exists(unit_name: &str) -> Result<bool> {
+    let backend = SystemdObserverServiceBackend::system()?;
+    backend.unit_exists(unit_name)
 }
 
 pub trait ObserverServiceBackend {

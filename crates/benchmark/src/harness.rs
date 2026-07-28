@@ -530,6 +530,8 @@ pub struct HarnessValidationReport {
     pub runner_measurement_cpu_seconds: Option<f64>,
     pub worker_cpu_seconds: Option<f64>,
     pub observer: Option<crate::performance::ObserverEvidence>,
+    #[serde(default)]
+    pub observer_cleanup_error: Option<String>,
     pub clk_tck: Option<u64>,
     pub watchdog: WatchdogEvidence,
     pub worker_result: Option<WorkerResult>,
@@ -610,6 +612,7 @@ pub struct ObserverLaunch {
     pub warmup_ms: u64,
     pub run_id: String,
     pub runtime_max_usec: u64,
+    pub service_plan: crate::observer_service::ObserverServicePlan,
 }
 
 struct ObserverRuntime {
@@ -766,13 +769,14 @@ pub fn run_live_with_provenance(
         options.observer.as_ref(),
         &mut observer_runtime,
     );
-    let observer_evidence = stop_observer(
+    let (observer_evidence, observer_cleanup_error) = match stop_observer(
         &mut observer_runtime,
         clk_tck,
         options.performance_profile.as_ref(),
-    )
-    .ok()
-    .flatten();
+    ) {
+        Ok(evidence) => (evidence, None),
+        Err(error) => (None, Some(format!("observer_cleanup_failed: {error:#}"))),
+    };
     if cleanup_live(&mut backend, &mut child, &control_dir, &plan, &mut gates).is_err() {
         for name in ["worker_cleanup", "scope_cleanup"] {
             if gates
@@ -960,6 +964,7 @@ pub fn run_live_with_provenance(
             .and_then(|(before, after)| after.checked_sub(*before))
             .map(|delta| delta as f64 / 1_000_000.0),
         observer: observer_evidence,
+        observer_cleanup_error,
         clk_tck,
         samples,
         watchdog,
@@ -1628,12 +1633,11 @@ fn start_observer(
     }
     let started_monotonic_ns = now_ns();
     let service = crate::observer_service::start_performance_observer(
-        &launch.run_id,
+        &launch.service_plan,
         &launch.binary,
-        &launch.config,
         &launch.binary_sha256,
+        &launch.config,
         &launch.config_hash,
-        launch.runtime_max_usec,
     )?;
     let pid = service.state.main_pid;
     let start_ticks = service.state.start_ticks;
@@ -1670,11 +1674,25 @@ fn stop_observer(
     let Some(runtime) = runtime.take() else {
         return Ok(None);
     };
-    if read_start_ticks(runtime.identity.pid) != Some(runtime.identity.start_ticks) {
-        bail!("owned observer identity changed before cleanup");
+    let identity_error = (read_start_ticks(runtime.identity.pid)
+        != Some(runtime.identity.start_ticks))
+    .then(|| anyhow::anyhow!("owned observer identity changed before cleanup"));
+    let service_unit = runtime.service.plan.unit_name.clone();
+    let control_group = runtime.service.state.control_group.clone();
+    let effective_uid = runtime.service.state.effective_uid;
+    let effective_gid = runtime.service.state.effective_gid;
+    let settling = runtime.service.settling.clone();
+    let readiness_duration_seconds = runtime.service.setup_wall_seconds;
+    let active_error = runtime.service.verify_active().err();
+    let cleanup_error = runtime.service.stop_and_cleanup().err();
+    if let Some(error) = cleanup_error {
+        return Err(anyhow::anyhow!(
+            "observer cleanup failed after lifecycle error: {error:#}"
+        ));
     }
-    runtime.service.verify_active()?;
-    runtime.service.stop_and_cleanup()?;
+    if let Some(error) = identity_error.or(active_error) {
+        return Err(error);
+    }
     let stopped_monotonic_ns = now_ns();
     let ticks_per_second = clk_tck.context("CLK_TCK unavailable for observer accounting")? as f64;
     let setup_cpu_seconds = runtime
@@ -1714,6 +1732,12 @@ fn stop_observer(
         pss_peak_bytes: runtime.pss_samples.iter().copied().max(),
         outside_worker_scope: runtime.outside_worker_scope,
         isolated_storage_closed: true,
+        service_unit: Some(service_unit),
+        control_group: Some(control_group),
+        effective_uid: Some(effective_uid),
+        effective_gid: Some(effective_gid),
+        settling: Some(settling),
+        readiness_duration_seconds: Some(readiness_duration_seconds),
     }))
 }
 
