@@ -2162,6 +2162,7 @@ fn invalid_runs_are_retained_and_safety_failure_marks_remaining_unexecuted() {
         aborted_after_order: None,
         comparison: None,
         capacity_gain_percent: EvaluationState::NotEvaluated,
+        execution_error: None,
     };
     let mut failed = checkpoint3a_run(&plan, plan.randomized_order[1].clone());
     failed.valid = false;
@@ -2263,6 +2264,7 @@ fn checkpoint3a_persistence_keeps_six_manifests_and_comparison() {
         aborted_after_order: None,
         comparison: Some(comparison),
         capacity_gain_percent: EvaluationState::NotEvaluated,
+        execution_error: None,
     };
     persist_experiment(
         &database,

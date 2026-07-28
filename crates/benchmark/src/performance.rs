@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -566,14 +567,16 @@ pub fn execute_prepared_experiment(manifest_path: &Path) -> Result<ExperimentOut
         "aborted_after_order": outcome.aborted_after_order,
         "comparison": &outcome.comparison,
         "capacity_gain_percent": "not_evaluated",
-        "performance_claim_eligible": false
+        "performance_claim_eligible": payload.performance_claim_eligible,
+        "execution_error": outcome.execution_error
     }))?;
-    let report_file = fs::OpenOptions::new()
+    let mut report_file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&payload.report_path)?;
+    report_file.write_all(&report_bytes)?;
+    report_file.sync_all()?;
     drop(report_file);
-    fs::write(&payload.report_path, report_bytes)?;
     fs::set_permissions(&payload.report_path, fs::Permissions::from_mode(0o644))?;
     Ok(outcome)
 }
@@ -996,6 +999,8 @@ pub struct ExperimentOutcome {
     pub aborted_after_order: Option<usize>,
     pub comparison: Option<ObserverOverheadComparison>,
     pub capacity_gain_percent: EvaluationState,
+    #[serde(default)]
+    pub execution_error: Option<String>,
 }
 
 pub trait ExperimentRunBackend {
@@ -1020,11 +1025,39 @@ pub fn execute_planned_experiment(
         aborted_after_order: None,
         comparison: None,
         capacity_gain_percent: EvaluationState::NotEvaluated,
+        execution_error: None,
     };
     let planned_order = outcome.plan.randomized_order.clone();
     for planned in planned_order {
-        backend.preflight_run(&outcome.plan, &planned)?;
-        let mut run = backend.execute_run(&outcome.plan, &planned)?;
+        if let Err(error) = backend.preflight_run(&outcome.plan, &planned) {
+            outcome.execution_error = Some(error.to_string());
+            outcome.aborted_after_order = Some(planned.order_index);
+            for pending in outcome
+                .plan
+                .randomized_order
+                .iter_mut()
+                .filter(|pending| pending.order_index >= planned.order_index)
+            {
+                pending.state = PlannedRunState::NotExecutedAfterAbort;
+            }
+            break;
+        }
+        let mut run = match backend.execute_run(&outcome.plan, &planned) {
+            Ok(run) => run,
+            Err(error) => {
+                outcome.execution_error = Some(error.to_string());
+                outcome.aborted_after_order = Some(planned.order_index);
+                for pending in outcome
+                    .plan
+                    .randomized_order
+                    .iter_mut()
+                    .filter(|pending| pending.order_index >= planned.order_index)
+                {
+                    pending.state = PlannedRunState::NotExecutedAfterAbort;
+                }
+                break;
+            }
+        };
         if let Err(error) = run.validate(&outcome.plan) {
             run.valid = false;
             run.invalid_reason = Some(error.to_string());
