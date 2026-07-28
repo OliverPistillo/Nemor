@@ -138,3 +138,11 @@ binary hashes, development/performance eligibility, requested/resolved
 variant state, effective-state hash, variant difference, owned-cgroup evidence
 and restore evidence. Harness-validation rows are isolated from performance
 aggregates.
+
+`0009_benchmark_performance.sql` adds Checkpoint 3A experiment purpose and
+manifest/validity fields, per-run seed and independent benchmark/observer
+binary hashes, config provenance and comparison purpose. The baseline/observe
+pipeline retains all six planned manifests, including invalid or unexecuted
+post-abort entries, bounded raw samples, per-run summaries and the explicit
+observer-overhead comparison. Fixed-load acceptance persists
+`capacity_gain_percent=not_evaluated`.

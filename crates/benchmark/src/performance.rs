@@ -1,0 +1,1291 @@
+use crate::harness::{HarnessOptions, ObserverLaunch};
+use crate::{
+    deterministic_order, run_relative_counter_deltas, summarize, BenchmarkVariant, BuildProvenance,
+    EnvironmentFingerprint, EvaluationState, EvidenceKind, StructuralSnapshot, SummaryStatistics,
+    BENCHMARK_SCHEMA_VERSION, MIN_REPETITIONS,
+};
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const CHECKPOINT3A_SCENARIO: &str = "synthetic_compressible";
+pub const CHECKPOINT3A_MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
+pub const CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
+pub const CHECKPOINT3A_MIN_MEASUREMENT_MS: u64 = 20_000;
+pub const CHECKPOINT3A_SAMPLE_INTERVAL_MS: u64 = 1_000;
+pub const CHECKPOINT3A_STABILIZATION_MS: u64 = 2_000;
+pub const CHECKPOINT3A_OBSERVER_WARMUP_MS: u64 = 5_000;
+pub const CHECKPOINT3A_COOLDOWN_MS: u64 = 2_000;
+pub const CHECKPOINT3A_WORKER_MARGIN_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonPurpose {
+    ObserverOverhead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PerformanceProfile {
+    pub logical_payload_bytes: u64,
+    pub worker_memory_max_bytes: u64,
+    pub pre_measurement_hold_ms: u64,
+    pub observer_warmup_ms: u64,
+    pub stabilization_ms: u64,
+    pub measurement_ms: u64,
+    pub sample_interval_ms: u64,
+    pub cooldown_ms: u64,
+    pub request_oom: bool,
+    pub pressure_mode: bool,
+}
+
+impl PerformanceProfile {
+    pub fn checkpoint3a(payload_bytes: u64) -> Result<Self> {
+        if payload_bytes == 0 || payload_bytes > CHECKPOINT3A_MAX_PAYLOAD_BYTES {
+            bail!(
+                "Checkpoint 3A payload must be within 1..={CHECKPOINT3A_MAX_PAYLOAD_BYTES} bytes"
+            );
+        }
+        let profile = Self {
+            logical_payload_bytes: payload_bytes,
+            worker_memory_max_bytes: payload_bytes
+                .checked_add(CHECKPOINT3A_WORKER_MARGIN_BYTES)
+                .context("worker cgroup envelope overflow")?,
+            pre_measurement_hold_ms: CHECKPOINT3A_OBSERVER_WARMUP_MS,
+            observer_warmup_ms: CHECKPOINT3A_OBSERVER_WARMUP_MS,
+            stabilization_ms: CHECKPOINT3A_STABILIZATION_MS,
+            measurement_ms: CHECKPOINT3A_MIN_MEASUREMENT_MS,
+            sample_interval_ms: CHECKPOINT3A_SAMPLE_INTERVAL_MS,
+            cooldown_ms: CHECKPOINT3A_COOLDOWN_MS,
+            request_oom: false,
+            pressure_mode: false,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.logical_payload_bytes > CHECKPOINT3A_MAX_PAYLOAD_BYTES
+            || self.worker_memory_max_bytes
+                < self.logical_payload_bytes + CHECKPOINT3A_WORKER_MARGIN_BYTES
+            || self.measurement_ms < CHECKPOINT3A_MIN_MEASUREMENT_MS
+            || self.stabilization_ms < CHECKPOINT3A_STABILIZATION_MS
+            || self.pre_measurement_hold_ms != CHECKPOINT3A_OBSERVER_WARMUP_MS
+            || self.observer_warmup_ms != self.pre_measurement_hold_ms
+            || self.sample_interval_ms < 250
+            || self.sample_interval_ms > 5_000
+            || self.request_oom
+            || self.pressure_mode
+        {
+            bail!("unsafe Checkpoint 3A performance profile");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BinaryIdentity {
+    pub path_role: String,
+    pub sha256: String,
+    pub build_profile: String,
+    pub source_state_id: String,
+    pub embedded_git_head: String,
+}
+
+impl BinaryIdentity {
+    pub fn capture(
+        path_role: &str,
+        path: &Path,
+        source_state_id: &str,
+        expected_git_head: &str,
+    ) -> Result<Self> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("cannot hash {path_role} binary {}", path.display()))?;
+        let marker = expected_git_head.as_bytes();
+        if !bytes.windows(marker.len()).any(|window| window == marker) {
+            bail!("{path_role} binary does not embed expected Git commit");
+        }
+        Ok(Self {
+            path_role: path_role.into(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            build_profile: if path
+                .components()
+                .any(|component| component.as_os_str() == "release")
+            {
+                "release"
+            } else {
+                "unknown_or_nonrelease"
+            }
+            .into(),
+            source_state_id: source_state_id.into(),
+            embedded_git_head: expected_git_head.into(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentPlan {
+    pub schema_version: u32,
+    pub experiment_id: String,
+    pub scenario: String,
+    pub scenario_version: u32,
+    pub evidence_kind: EvidenceKind,
+    pub comparison_purpose: ComparisonPurpose,
+    pub variants: Vec<BenchmarkVariant>,
+    pub repetitions: usize,
+    pub experiment_seed: u64,
+    pub randomized_order: Vec<PlannedRun>,
+    pub profile: PerformanceProfile,
+    pub provenance: BuildProvenance,
+    pub benchmark_binary: BinaryIdentity,
+    pub observer_binary: BinaryIdentity,
+    pub config_hash: String,
+    pub environment: EnvironmentFingerprint,
+    pub environment_hash: String,
+    pub thermal_state_unverified: bool,
+    pub performance_claim_eligible: bool,
+    pub capacity_gain_percent: EvaluationState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlannedRun {
+    pub order_index: usize,
+    pub variant: BenchmarkVariant,
+    pub repetition_index: usize,
+    pub run_seed: u64,
+    pub state: PlannedRunState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedRunState {
+    Planned,
+    Completed,
+    Invalid,
+    SafetyAbort,
+    NotExecutedAfterAbort,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExperimentInputs<'a> {
+    pub scenario: &'a str,
+    pub variants: &'a [BenchmarkVariant],
+    pub repetitions: usize,
+    pub seed: u64,
+    pub payload_bytes: u64,
+    pub config_hash: &'a str,
+    pub benchmark_binary_path: &'a Path,
+    pub observer_binary_path: &'a Path,
+}
+
+pub fn plan_experiment(inputs: &ExperimentInputs<'_>) -> Result<ExperimentPlan> {
+    if inputs.scenario != CHECKPOINT3A_SCENARIO {
+        bail!("Checkpoint 3A supports only synthetic_compressible");
+    }
+    if inputs.variants
+        != [
+            BenchmarkVariant::CachyosBaseline,
+            BenchmarkVariant::NemorObserve,
+        ]
+    {
+        bail!("Checkpoint 3A requires exactly cachyos_baseline,nemor_observe");
+    }
+    if inputs.repetitions < MIN_REPETITIONS {
+        bail!("at least {MIN_REPETITIONS} repetitions per variant are required");
+    }
+    let provenance = BuildProvenance::capture()?;
+    let benchmark_binary = BinaryIdentity::capture(
+        "nemor_benchmark",
+        inputs.benchmark_binary_path,
+        &provenance.source_state_id,
+        &provenance.git_head,
+    )?;
+    if benchmark_binary.sha256 != provenance.binary_sha256 {
+        bail!("benchmark binary hash does not match running executable");
+    }
+    let observer_binary = BinaryIdentity::capture(
+        "nemord",
+        inputs.observer_binary_path,
+        &provenance.source_state_id,
+        &provenance.git_head,
+    )?;
+    let environment = EnvironmentFingerprint::capture(inputs.config_hash)?;
+    let environment_hash = environment.hash()?;
+    let randomized_order = deterministic_order(inputs.variants, inputs.repetitions, inputs.seed)
+        .into_iter()
+        .enumerate()
+        .map(|(order_index, (variant, repetition_index))| PlannedRun {
+            order_index,
+            variant,
+            repetition_index,
+            run_seed: derive_run_seed(inputs.seed, variant, repetition_index),
+            state: PlannedRunState::Planned,
+        })
+        .collect();
+    let performance_claim_eligible = EvidenceKind::PerformanceBenchmark
+        .performance_claim_eligible(&provenance)
+        && provenance.build_profile == "release"
+        && benchmark_binary.build_profile == "release"
+        && observer_binary.build_profile == "release";
+    Ok(ExperimentPlan {
+        schema_version: BENCHMARK_SCHEMA_VERSION,
+        experiment_id: format!("checkpoint3a-{}", now_ns()),
+        scenario: inputs.scenario.into(),
+        scenario_version: 1,
+        evidence_kind: EvidenceKind::PerformanceBenchmark,
+        comparison_purpose: ComparisonPurpose::ObserverOverhead,
+        variants: inputs.variants.to_vec(),
+        repetitions: inputs.repetitions,
+        experiment_seed: inputs.seed,
+        randomized_order,
+        profile: PerformanceProfile::checkpoint3a(inputs.payload_bytes)?,
+        provenance,
+        benchmark_binary,
+        observer_binary,
+        config_hash: inputs.config_hash.into(),
+        thermal_state_unverified: environment.thermal_state_unverified,
+        environment,
+        environment_hash,
+        performance_claim_eligible,
+        capacity_gain_percent: EvaluationState::NotEvaluated,
+    })
+}
+
+pub fn require_live_eligibility(plan: &ExperimentPlan) -> Result<()> {
+    if !plan.performance_claim_eligible
+        || plan.provenance.git_dirty
+        || plan.provenance.build_profile != "release"
+        || plan.benchmark_binary.build_profile != "release"
+        || plan.observer_binary.build_profile != "release"
+        || plan.benchmark_binary.source_state_id != plan.provenance.source_state_id
+        || plan.observer_binary.source_state_id != plan.provenance.source_state_id
+        || plan.benchmark_binary.embedded_git_head != plan.provenance.git_head
+        || plan.observer_binary.embedded_git_head != plan.provenance.git_head
+    {
+        bail!("performance execution requires exact clean release source and binaries");
+    }
+    Ok(())
+}
+
+pub fn require_validated_observer_service_boundary() -> Result<()> {
+    bail!(
+        "Checkpoint 3A execution remains blocked until the transient DynamicUser observer service boundary is live validated"
+    )
+}
+
+fn derive_run_seed(seed: u64, _variant: BenchmarkVariant, repetition: usize) -> u64 {
+    seed.rotate_left(17) ^ repetition as u64
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_ticks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetectedNemorProcess {
+    pub identity: ProcessIdentity,
+    pub executable_matches_expected: bool,
+    pub owned_by_transaction: bool,
+}
+
+pub fn reject_foreign_nemord(
+    detected: &[DetectedNemorProcess],
+    owned: Option<&ProcessIdentity>,
+) -> Result<()> {
+    if detected.iter().any(|process| {
+        !process.owned_by_transaction
+            || owned.is_none()
+            || owned != Some(&process.identity)
+            || !process.executable_matches_expected
+    }) {
+        bail!("foreign or ambiguous nemord process contaminates performance run");
+    }
+    if owned.is_none() && !detected.is_empty() {
+        bail!("baseline requires no nemord observer");
+    }
+    if owned.is_some() && detected.len() != 1 {
+        bail!("observe requires exactly one owned nemord observer");
+    }
+    Ok(())
+}
+
+pub fn observer_cleanup_allowed(expected: &ProcessIdentity, observed: &ProcessIdentity) -> bool {
+    expected == observed
+}
+
+pub fn detect_nemord_processes(
+    expected_binary: &Path,
+    owned: Option<&ProcessIdentity>,
+) -> Vec<DetectedNemorProcess> {
+    let expected = fs::canonicalize(expected_binary).ok();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let comm = fs::read_to_string(entry.path().join("comm")).ok()?;
+            if comm.trim() != "nemord" {
+                return None;
+            }
+            let start_ticks = read_start_ticks(pid)?;
+            let executable = fs::canonicalize(entry.path().join("exe")).ok();
+            let identity = ProcessIdentity { pid, start_ticks };
+            Some(DetectedNemorProcess {
+                executable_matches_expected: executable == expected,
+                owned_by_transaction: owned == Some(&identity),
+                identity,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverInvariant {
+    pub mode_observe: bool,
+    pub automatic_actions_disabled: bool,
+    pub cgroup_moves_disabled: bool,
+    pub zram_mutation_disabled: bool,
+    pub zswap_mutation_disabled: bool,
+    pub ksm_live_apply_disabled: bool,
+    pub damon_monitor_only: bool,
+    pub damos_live_apply_disabled: bool,
+}
+
+impl ObserverInvariant {
+    pub fn validate(&self) -> Result<()> {
+        if !self.mode_observe
+            || !self.automatic_actions_disabled
+            || !self.cgroup_moves_disabled
+            || !self.zram_mutation_disabled
+            || !self.zswap_mutation_disabled
+            || !self.ksm_live_apply_disabled
+            || !self.damon_monitor_only
+            || !self.damos_live_apply_disabled
+        {
+            bail!("observer configuration permits a memory-management mutation");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObserverEvidence {
+    pub identity: ProcessIdentity,
+    pub binary_sha256: String,
+    pub config_hash: String,
+    pub started_monotonic_ns: u64,
+    pub measurement_started_monotonic_ns: u64,
+    pub measurement_ended_monotonic_ns: u64,
+    pub stopped_monotonic_ns: u64,
+    pub exit_status: Option<i32>,
+    pub setup_wall_seconds: f64,
+    pub setup_cpu_seconds: f64,
+    pub measurement_cpu_seconds: f64,
+    pub measurement_cpu_percent: f64,
+    pub rss_mean_bytes: Option<f64>,
+    pub rss_peak_bytes: Option<u64>,
+    pub pss_mean_bytes: Option<f64>,
+    pub pss_peak_bytes: Option<u64>,
+    pub outside_worker_scope: bool,
+    pub isolated_storage_closed: bool,
+}
+
+impl ObserverEvidence {
+    pub fn validate(&self, measurement_ms: u64) -> Result<()> {
+        if self.measurement_started_monotonic_ns < self.started_monotonic_ns
+            || self.measurement_ended_monotonic_ns <= self.measurement_started_monotonic_ns
+            || self.stopped_monotonic_ns < self.measurement_ended_monotonic_ns
+            || !self.outside_worker_scope
+            || !self.isolated_storage_closed
+            || measurement_ms < CHECKPOINT3A_MIN_MEASUREMENT_MS
+        {
+            bail!("invalid owned observer lifecycle evidence");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CounterSnapshot {
+    pub vmstat: BTreeMap<String, u64>,
+    pub psi_totals_usec: BTreeMap<String, u64>,
+    pub cpu: BTreeMap<String, u64>,
+    pub io: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CounterDeltas {
+    pub vmstat: BTreeMap<String, u64>,
+    pub psi_totals_usec: BTreeMap<String, u64>,
+    pub cpu: BTreeMap<String, u64>,
+    pub io: BTreeMap<String, u64>,
+}
+
+pub fn derive_performance_deltas(
+    before: &CounterSnapshot,
+    after: &CounterSnapshot,
+) -> Result<CounterDeltas> {
+    Ok(CounterDeltas {
+        vmstat: run_relative_counter_deltas(&before.vmstat, &after.vmstat)?,
+        psi_totals_usec: run_relative_counter_deltas(
+            &before.psi_totals_usec,
+            &after.psi_totals_usec,
+        )?,
+        cpu: run_relative_counter_deltas(&before.cpu, &after.cpu)?,
+        io: run_relative_counter_deltas(&before.io, &after.io)?,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunEvidence {
+    pub run_id: String,
+    pub experiment_id: String,
+    pub planned: PlannedRun,
+    pub valid: bool,
+    pub invalid_reason: Option<String>,
+    pub safety_failure: bool,
+    pub environment_hash: String,
+    pub benchmark_binary_sha256: String,
+    pub observer_binary_sha256: Option<String>,
+    pub worker_manifest_hash: String,
+    pub worker_cgroup_memory_max: u64,
+    pub logical_payload_bytes: u64,
+    pub measurement_ms: u64,
+    pub sample_interval_ms: u64,
+    pub sample_count: usize,
+    pub raw_samples: Vec<crate::harness::CgroupSample>,
+    pub worker_cpu_seconds: Option<f64>,
+    pub worker_memory_mean_bytes: Option<f64>,
+    pub worker_memory_peak_bytes: Option<u64>,
+    pub runner_cpu_seconds: Option<f64>,
+    pub observer: Option<ObserverEvidence>,
+    pub deltas: Option<CounterDeltas>,
+    pub watchdog_triggered: bool,
+    pub oom: u64,
+    pub oom_kill: u64,
+    pub worker_integrity_valid: bool,
+    pub restore_passed: bool,
+    pub structural_before: StructuralSnapshot,
+    pub structural_after: StructuralSnapshot,
+}
+
+impl RunEvidence {
+    pub fn validate(&self, plan: &ExperimentPlan) -> Result<()> {
+        if self.environment_hash != plan.environment_hash
+            || self.benchmark_binary_sha256 != plan.benchmark_binary.sha256
+            || self.worker_cgroup_memory_max != plan.profile.worker_memory_max_bytes
+            || self.logical_payload_bytes != plan.profile.logical_payload_bytes
+            || self.measurement_ms < CHECKPOINT3A_MIN_MEASUREMENT_MS
+            || self.sample_count
+                < usize::try_from(self.measurement_ms / self.sample_interval_ms)
+                    .unwrap_or(usize::MAX)
+            || self.watchdog_triggered
+            || self.oom != 0
+            || self.oom_kill != 0
+            || !self.worker_integrity_valid
+            || !self.restore_passed
+            || !self.structural_before.matches(&self.structural_after)
+        {
+            bail!("run evidence violates Checkpoint 3A validity requirements");
+        }
+        match self.planned.variant {
+            BenchmarkVariant::CachyosBaseline if self.observer.is_some() => {
+                bail!("baseline run cannot own an observer")
+            }
+            BenchmarkVariant::NemorObserve => {
+                let observer = self
+                    .observer
+                    .as_ref()
+                    .context("observe run requires exact owned observer evidence")?;
+                if self.observer_binary_sha256.as_deref()
+                    != Some(plan.observer_binary.sha256.as_str())
+                {
+                    bail!("observer binary hash mismatch");
+                }
+                observer.validate(self.measurement_ms)?;
+            }
+            BenchmarkVariant::CachyosBaseline => {}
+            _ => bail!("pending variant cannot execute in Checkpoint 3A"),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentOutcome {
+    pub plan: ExperimentPlan,
+    pub runs: Vec<RunEvidence>,
+    pub aborted_after_order: Option<usize>,
+    pub comparison: Option<ObserverOverheadComparison>,
+    pub capacity_gain_percent: EvaluationState,
+}
+
+pub trait ExperimentRunBackend {
+    fn preflight_run(&mut self, plan: &ExperimentPlan, planned: &PlannedRun) -> Result<()>;
+    fn execute_run(&mut self, plan: &ExperimentPlan, planned: &PlannedRun) -> Result<RunEvidence>;
+    fn verify_between_run_restore(
+        &mut self,
+        plan: &ExperimentPlan,
+        run: &RunEvidence,
+    ) -> Result<()>;
+    fn cooldown(&mut self, milliseconds: u64) -> Result<()>;
+}
+
+pub fn execute_planned_experiment(
+    plan: ExperimentPlan,
+    backend: &mut impl ExperimentRunBackend,
+) -> Result<ExperimentOutcome> {
+    require_live_eligibility(&plan)?;
+    let mut outcome = ExperimentOutcome {
+        plan,
+        runs: Vec::new(),
+        aborted_after_order: None,
+        comparison: None,
+        capacity_gain_percent: EvaluationState::NotEvaluated,
+    };
+    let planned_order = outcome.plan.randomized_order.clone();
+    for planned in planned_order {
+        backend.preflight_run(&outcome.plan, &planned)?;
+        let mut run = backend.execute_run(&outcome.plan, &planned)?;
+        if let Err(error) = run.validate(&outcome.plan) {
+            run.valid = false;
+            run.invalid_reason = Some(error.to_string());
+        }
+        if let Err(error) = backend.verify_between_run_restore(&outcome.plan, &run) {
+            run.valid = false;
+            run.safety_failure = true;
+            run.restore_passed = false;
+            run.invalid_reason = Some(format!("between_run_restore_failed: {error}"));
+        }
+        let state = if run.safety_failure {
+            PlannedRunState::SafetyAbort
+        } else if run.valid {
+            PlannedRunState::Completed
+        } else {
+            PlannedRunState::Invalid
+        };
+        run.planned.state = state;
+        if let Some(stored) = outcome
+            .plan
+            .randomized_order
+            .get_mut(run.planned.order_index)
+        {
+            stored.state = state;
+        }
+        let safety_failure = run.safety_failure;
+        outcome.record_run(run);
+        if safety_failure {
+            break;
+        }
+        backend.cooldown(outcome.plan.profile.cooldown_ms)?;
+    }
+    Ok(outcome)
+}
+
+pub struct LiveCheckpoint3aBackend {
+    pub config: PathBuf,
+    pub report_dir: PathBuf,
+    pub observer_binary: PathBuf,
+}
+
+pub fn write_inspection_config(
+    base_config: &Path,
+    database: &Path,
+    destination: &Path,
+) -> Result<String> {
+    let source = fs::read_to_string(base_config)?;
+    let loaded = common::LoadedConfig::load(base_config)?;
+    let original = format!(
+        "database_path = \"{}\"",
+        loaded.config.general.database_path.display()
+    );
+    let replacement = format!("database_path = \"{}\"", database.display());
+    if source.matches(&original).count() != 1 {
+        bail!("inspection config database path replacement is ambiguous");
+    }
+    fs::write(destination, source.replacen(&original, &replacement, 1))?;
+    Ok(common::LoadedConfig::load(destination)?.sha256)
+}
+
+impl LiveCheckpoint3aBackend {
+    fn observer_config(
+        &self,
+        plan: &ExperimentPlan,
+        planned: &PlannedRun,
+    ) -> Result<(PathBuf, String)> {
+        let isolated_database = self.report_dir.join(format!(
+            "{}-observer-{}.sqlite",
+            plan.experiment_id, planned.order_index
+        ));
+        let path = self.report_dir.join(format!(
+            "{}-observer-{}.toml",
+            plan.experiment_id, planned.order_index
+        ));
+        let config_hash = write_inspection_config(&self.config, &isolated_database, &path)?;
+        let checked = common::LoadedConfig::load(&path)?;
+        observer_invariant(&checked.config).validate()?;
+        Ok((path, config_hash))
+    }
+}
+
+impl ExperimentRunBackend for LiveCheckpoint3aBackend {
+    fn preflight_run(&mut self, plan: &ExperimentPlan, _planned: &PlannedRun) -> Result<()> {
+        let environment = EnvironmentFingerprint::capture(&plan.config_hash)?;
+        if environment.hash()? != plan.environment_hash {
+            bail!("material environment changed before repetition");
+        }
+        let detected = detect_nemord_processes(&self.observer_binary, None);
+        reject_foreign_nemord(&detected, None)
+    }
+
+    fn execute_run(&mut self, plan: &ExperimentPlan, planned: &PlannedRun) -> Result<RunEvidence> {
+        fs::create_dir_all(&self.report_dir)?;
+        let run_dir = self.report_dir.join(format!(
+            "{}-run-{}",
+            plan.experiment_id, planned.order_index
+        ));
+        fs::create_dir(&run_dir)?;
+        let observer = if planned.variant == BenchmarkVariant::NemorObserve {
+            let (config, config_hash) = self.observer_config(plan, planned)?;
+            Some(ObserverLaunch {
+                binary: self.observer_binary.clone(),
+                config,
+                binary_sha256: plan.observer_binary.sha256.clone(),
+                config_hash,
+                warmup_ms: plan.profile.observer_warmup_ms,
+            })
+        } else {
+            None
+        };
+        let harness_database = run_dir.join("owned-harness.sqlite");
+        let options = HarnessOptions {
+            config: self.config.clone(),
+            database: harness_database,
+            report_dir: run_dir,
+            worker_bytes: plan.profile.logical_payload_bytes,
+            performance_profile: Some(plan.profile.clone()),
+            observer,
+            worker_seed: planned.run_seed,
+        };
+        let (report, _) = crate::harness::run_live(&options)?;
+        let deltas = report
+            .samples
+            .first()
+            .zip(report.samples.last())
+            .map(|(before, after)| derive_harness_sample_deltas(before, after))
+            .transpose()?;
+        let memory = report
+            .samples
+            .iter()
+            .filter_map(|sample| sample.memory_current)
+            .collect::<Vec<_>>();
+        let worker_manifest_hash =
+            hex::encode(Sha256::digest(serde_json::to_vec(&serde_json::json!({
+                "scenario": plan.scenario,
+                "scenario_version": plan.scenario_version,
+                "payload": plan.profile.logical_payload_bytes,
+                "memory_max": plan.profile.worker_memory_max_bytes,
+                "pre_measurement_hold_ms": plan.profile.pre_measurement_hold_ms,
+                "measurement_ms": plan.profile.measurement_ms,
+                "sample_interval_ms": plan.profile.sample_interval_ms,
+                "seed": planned.run_seed
+            }))?));
+        let oom = report
+            .samples
+            .last()
+            .and_then(|sample| sample.memory_events.get("oom"))
+            .copied()
+            .unwrap_or(0);
+        let oom_kill = report
+            .samples
+            .last()
+            .and_then(|sample| sample.memory_events.get("oom_kill"))
+            .copied()
+            .unwrap_or(0);
+        let observer = report.observer;
+        let observer_cleanup_failed =
+            planned.variant == BenchmarkVariant::NemorObserve && observer.is_none();
+        Ok(RunEvidence {
+            run_id: report.run_id,
+            experiment_id: plan.experiment_id.clone(),
+            planned: planned.clone(),
+            valid: report.outcome.required_gates_passed,
+            invalid_reason: report.outcome.failure_reason,
+            safety_failure: observer_cleanup_failed
+                || report
+                    .outcome
+                    .failure_class
+                    .as_deref()
+                    .is_some_and(|class| class == "safety_failure" || class == "cleanup_failure"),
+            environment_hash: plan.environment_hash.clone(),
+            benchmark_binary_sha256: plan.benchmark_binary.sha256.clone(),
+            observer_binary_sha256: observer
+                .as_ref()
+                .map(|evidence| evidence.binary_sha256.clone()),
+            worker_manifest_hash,
+            worker_cgroup_memory_max: report.plan.memory_max_bytes,
+            logical_payload_bytes: report.plan.worker_bytes,
+            measurement_ms: report.plan.measurement_ms,
+            sample_interval_ms: CHECKPOINT3A_SAMPLE_INTERVAL_MS,
+            sample_count: report.sample_count,
+            raw_samples: report.samples.clone(),
+            worker_cpu_seconds: report.worker_cpu_seconds,
+            worker_memory_mean_bytes: mean_u64(&memory),
+            worker_memory_peak_bytes: memory.iter().copied().max(),
+            runner_cpu_seconds: report.runner_measurement_cpu_seconds,
+            observer,
+            deltas,
+            watchdog_triggered: report.watchdog.triggered,
+            oom,
+            oom_kill,
+            worker_integrity_valid: report.worker_result.as_ref().is_some_and(|result| {
+                result.fingerprint_valid && result.full_rewrite_passes_during_measurement == 0
+            }),
+            restore_passed: !observer_cleanup_failed
+                && report.structural_restore_passed
+                && report.outcome.required_gates_passed,
+            structural_before: report.baseline,
+            structural_after: report.final_snapshot,
+        })
+    }
+
+    fn verify_between_run_restore(
+        &mut self,
+        _plan: &ExperimentPlan,
+        run: &RunEvidence,
+    ) -> Result<()> {
+        if !run.restore_passed || !run.structural_before.matches(&run.structural_after) {
+            bail!("structural restore failed");
+        }
+        if !detect_nemord_processes(&self.observer_binary, None).is_empty() {
+            bail!("owned observer remains after repetition");
+        }
+        Ok(())
+    }
+
+    fn cooldown(&mut self, milliseconds: u64) -> Result<()> {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+        Ok(())
+    }
+}
+
+pub(crate) fn observer_invariant(config: &common::Config) -> ObserverInvariant {
+    ObserverInvariant {
+        mode_observe: config.general.mode == "observe",
+        automatic_actions_disabled: !config.general.allow_automatic_actions,
+        cgroup_moves_disabled: !config.cgroups.enabled
+            && config.cgroups.dry_run
+            && !config.cgroups.allow_move,
+        zram_mutation_disabled: config.compression.dry_run
+            && !config.compression.allow_runtime_reconfigure
+            && !config.compression.allow_persistent_reconfigure,
+        zswap_mutation_disabled: config.tiering.dry_run
+            && !config.tiering.allow_runtime_reconfigure
+            && !config.tiering.allow_persistent_reconfigure
+            && !config.tiering.allow_swapfile_create,
+        ksm_live_apply_disabled: !config.ksm.live_apply,
+        damon_monitor_only: config.damon.mode == "monitor_only",
+        damos_live_apply_disabled: !config.damos.live_apply,
+    }
+}
+
+fn derive_harness_sample_deltas(
+    before: &crate::harness::CgroupSample,
+    after: &crate::harness::CgroupSample,
+) -> Result<CounterDeltas> {
+    let host_counter = |sample: &crate::harness::CgroupSample, names: &[&str]| {
+        sample
+            .host_metrics
+            .iter()
+            .filter(|metric| names.contains(&metric.name.as_str()))
+            .filter_map(|metric| {
+                metric
+                    .value
+                    .and_then(|value| (value >= 0.0).then_some((metric.name.clone(), value as u64)))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let psi = |sample: &crate::harness::CgroupSample| {
+        let mut values = BTreeMap::new();
+        if let Some(pressure) = &sample.memory_pressure {
+            values.insert("worker_memory_some".into(), pressure.some.total_us);
+            if let Some(full) = &pressure.full {
+                values.insert("worker_memory_full".into(), full.total_us);
+            }
+        }
+        if let Some(pressure) = &sample.host_memory_pressure {
+            values.insert("host_memory_some".into(), pressure.some.total_us);
+            if let Some(full) = &pressure.full {
+                values.insert("host_memory_full".into(), full.total_us);
+            }
+        }
+        values
+    };
+    let before_snapshot = CounterSnapshot {
+        vmstat: host_counter(before, &["major_faults", "swap_in_pages", "swap_out_pages"]),
+        psi_totals_usec: psi(before),
+        cpu: before.cpu_stat.clone(),
+        io: before.io_stat.clone().unwrap_or_default(),
+    };
+    let after_snapshot = CounterSnapshot {
+        vmstat: host_counter(after, &["major_faults", "swap_in_pages", "swap_out_pages"]),
+        psi_totals_usec: psi(after),
+        cpu: after.cpu_stat.clone(),
+        io: after.io_stat.clone().unwrap_or_default(),
+    };
+    derive_performance_deltas(&before_snapshot, &after_snapshot)
+}
+
+fn read_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    stat[end + 2..].split_whitespace().nth(19)?.parse().ok()
+}
+
+fn mean_u64(values: &[u64]) -> Option<f64> {
+    (!values.is_empty())
+        .then(|| values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64)
+}
+
+impl ExperimentOutcome {
+    pub fn record_run(&mut self, run: RunEvidence) {
+        if run.safety_failure {
+            self.aborted_after_order = Some(run.planned.order_index);
+            for planned in self
+                .plan
+                .randomized_order
+                .iter_mut()
+                .skip(run.planned.order_index + 1)
+            {
+                planned.state = PlannedRunState::NotExecutedAfterAbort;
+            }
+        }
+        self.runs.push(run);
+    }
+
+    pub fn may_continue(&self) -> bool {
+        self.aborted_after_order.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserverOverheadComparison {
+    pub purpose: ComparisonPurpose,
+    pub baseline_valid_repetitions: usize,
+    pub observe_valid_repetitions: usize,
+    pub comparable: bool,
+    pub invalid_reason: Option<String>,
+    pub metrics: BTreeMap<String, VariantMetricComparison>,
+    pub observer_metrics: BTreeMap<String, SummaryStatistics>,
+    pub significance_claimed: bool,
+    pub capacity_gain_percent: EvaluationState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariantMetricComparison {
+    pub baseline: SummaryStatistics,
+    pub observe: SummaryStatistics,
+    pub percent_change_observe_vs_baseline: Option<f64>,
+    pub denominator: String,
+    pub direction: String,
+}
+
+pub fn compare_observer_overhead(
+    runs: &[RunEvidence],
+    metrics: &BTreeMap<String, Vec<(String, BenchmarkVariant, f64)>>,
+) -> Result<ObserverOverheadComparison> {
+    let valid = runs.iter().filter(|run| run.valid).collect::<Vec<_>>();
+    let baseline_valid_repetitions = valid
+        .iter()
+        .filter(|run| run.planned.variant == BenchmarkVariant::CachyosBaseline)
+        .count();
+    let observe_valid_repetitions = valid
+        .iter()
+        .filter(|run| run.planned.variant == BenchmarkVariant::NemorObserve)
+        .count();
+    if baseline_valid_repetitions < MIN_REPETITIONS || observe_valid_repetitions < MIN_REPETITIONS {
+        bail!("observer-overhead comparison requires three valid runs per variant");
+    }
+    let environment_hashes = valid
+        .iter()
+        .map(|run| run.environment_hash.as_str())
+        .collect::<BTreeSet<_>>();
+    let worker_manifests = valid
+        .iter()
+        .map(|run| run.worker_manifest_hash.as_str())
+        .collect::<BTreeSet<_>>();
+    if environment_hashes.len() != 1 || worker_manifests.len() != 1 {
+        bail!("material environment or worker manifest mismatch");
+    }
+    let mut comparisons = BTreeMap::new();
+    let mut observer_metrics = BTreeMap::new();
+    for (name, values) in metrics {
+        let baseline = values
+            .iter()
+            .filter(|(_, variant, _)| *variant == BenchmarkVariant::CachyosBaseline)
+            .map(|(_, _, value)| *value)
+            .collect::<Vec<_>>();
+        let observe = values
+            .iter()
+            .filter(|(_, variant, _)| *variant == BenchmarkVariant::NemorObserve)
+            .map(|(_, _, value)| *value)
+            .collect::<Vec<_>>();
+        if baseline.is_empty() && observe.len() >= MIN_REPETITIONS {
+            observer_metrics.insert(name.clone(), summarize(&observe)?);
+            continue;
+        }
+        if baseline.len() < MIN_REPETITIONS || observe.len() < MIN_REPETITIONS {
+            continue;
+        }
+        let baseline_summary = summarize(&baseline)?;
+        let observe_summary = summarize(&observe)?;
+        let percent_change = (baseline_summary.mean != 0.0).then(|| {
+            (observe_summary.mean - baseline_summary.mean) / baseline_summary.mean * 100.0
+        });
+        comparisons.insert(
+            name.clone(),
+            VariantMetricComparison {
+                baseline: baseline_summary,
+                observe: observe_summary,
+                percent_change_observe_vs_baseline: percent_change,
+                denominator: "baseline arithmetic mean".into(),
+                direction: "positive means observe is higher".into(),
+            },
+        );
+    }
+    Ok(ObserverOverheadComparison {
+        purpose: ComparisonPurpose::ObserverOverhead,
+        baseline_valid_repetitions,
+        observe_valid_repetitions,
+        comparable: true,
+        invalid_reason: None,
+        metrics: comparisons,
+        observer_metrics,
+        significance_claimed: false,
+        capacity_gain_percent: EvaluationState::NotEvaluated,
+    })
+}
+
+pub fn comparison_metric_inputs(
+    runs: &[RunEvidence],
+) -> BTreeMap<String, Vec<(String, BenchmarkVariant, f64)>> {
+    let mut metrics: BTreeMap<String, Vec<(String, BenchmarkVariant, f64)>> = BTreeMap::new();
+    for run in runs.iter().filter(|run| run.valid) {
+        for (name, value) in [
+            ("worker_cpu_seconds", run.worker_cpu_seconds),
+            ("worker_memory_mean_bytes", run.worker_memory_mean_bytes),
+            (
+                "worker_memory_peak_bytes",
+                run.worker_memory_peak_bytes.map(|value| value as f64),
+            ),
+            ("benchmark_runner_cpu_seconds", run.runner_cpu_seconds),
+            (
+                "observer_cpu_seconds",
+                run.observer
+                    .as_ref()
+                    .map(|observer| observer.measurement_cpu_seconds),
+            ),
+            (
+                "observer_rss_mean_bytes",
+                run.observer
+                    .as_ref()
+                    .and_then(|observer| observer.rss_mean_bytes),
+            ),
+            (
+                "observer_pss_mean_bytes",
+                run.observer
+                    .as_ref()
+                    .and_then(|observer| observer.pss_mean_bytes),
+            ),
+        ] {
+            if let Some(value) = value {
+                metrics.entry(name.into()).or_default().push((
+                    run.run_id.clone(),
+                    run.planned.variant,
+                    value,
+                ));
+            }
+        }
+    }
+    metrics
+}
+
+pub fn persist_experiment(
+    database: &Path,
+    migration_0008: &str,
+    migration_0009: &str,
+    outcome: &ExperimentOutcome,
+) -> Result<()> {
+    let mut connection = Connection::open(database)?;
+    connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+    let benchmark_schema_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='benchmark_experiments')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !benchmark_schema_exists {
+        connection.execute_batch(migration_0008)?;
+    }
+    let performance_schema_exists = connection
+        .prepare("PRAGMA table_info(benchmark_experiments)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|row| row.ok())
+        .any(|name| name == "comparison_purpose");
+    if !performance_schema_exists {
+        connection.execute_batch(migration_0009)?;
+    }
+    let tx = connection.transaction()?;
+    tx.execute(
+        "INSERT INTO benchmark_experiments(id,scenario_id,scenario_version,seed,repetition_count,host_fingerprint_hash,nemor_commit,config_hash,evidence_kind,source_state_id,binary_sha256,development_build,performance_claim_eligible,created_at_ns,status,comparison_purpose,manifest_json,ended_at_ns,valid)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'performance_benchmark',?9,?10,?11,?12,?13,?14,'observer_overhead',?15,?16,?17)",
+        params![
+            outcome.plan.experiment_id,
+            outcome.plan.scenario,
+            outcome.plan.scenario_version,
+            outcome.plan.experiment_seed as i64,
+            outcome.plan.repetitions as i64,
+            outcome.plan.environment_hash,
+            outcome.plan.provenance.git_head,
+            outcome.plan.config_hash,
+            outcome.plan.provenance.source_state_id,
+            outcome.plan.benchmark_binary.sha256,
+            outcome.plan.provenance.development_build,
+            outcome.plan.performance_claim_eligible,
+            now_ns() as i64,
+            if outcome.aborted_after_order.is_some() { "safety_aborted" } else { "completed" },
+            serde_json::to_string(&outcome.plan)?,
+            now_ns() as i64,
+            outcome.comparison.as_ref().is_some_and(|comparison| comparison.comparable),
+        ],
+    )?;
+    for planned in &outcome.plan.randomized_order {
+        let actual = outcome
+            .runs
+            .iter()
+            .find(|run| run.planned.order_index == planned.order_index);
+        let run_id = actual.map(|run| run.run_id.clone()).unwrap_or_else(|| {
+            format!(
+                "{}-planned-{}",
+                outcome.plan.experiment_id, planned.order_index
+            )
+        });
+        let manifest = actual
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or_else(|| serde_json::to_value(planned).expect("serializable planned run"));
+        tx.execute(
+            "INSERT INTO benchmark_run_manifests(id,experiment_id,variant,repetition,run_order,status,valid,invalid_reason,logical_workload_bytes,physical_memory_bytes,requested_variant,resolved_variant_state,effective_state_hash,variant_diff_summary,cgroup_ownership_json,restore_evidence_json,started_monotonic_ns,ended_monotonic_ns,manifest_json,run_seed,benchmark_binary_sha256,observer_binary_sha256,config_hash)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?3,'executable',?10,?11,?12,?13,NULL,NULL,?14,?15,?16,?17,?18)",
+            params![
+                run_id,
+                outcome.plan.experiment_id,
+                format!("{:?}", planned.variant).to_lowercase(),
+                planned.repetition_index as i64,
+                planned.order_index as i64,
+                format!("{:?}", planned.state).to_lowercase(),
+                actual.is_some_and(|run| run.valid),
+                actual.and_then(|run| run.invalid_reason.clone()),
+                outcome.plan.profile.logical_payload_bytes as i64,
+                outcome.plan.environment_hash,
+                if planned.variant == BenchmarkVariant::NemorObserve {
+                    "owned observe telemetry process only"
+                } else {
+                    "observed CachyOS host baseline; no observer"
+                },
+                actual.map(|run| serde_json::to_string(&run.worker_cgroup_memory_max)).transpose()?,
+                actual.map(|run| serde_json::to_string(&run.restore_passed)).transpose()?,
+                serde_json::to_string(&manifest)?,
+                planned.run_seed as i64,
+                outcome.plan.benchmark_binary.sha256,
+                (planned.variant == BenchmarkVariant::NemorObserve)
+                    .then_some(outcome.plan.observer_binary.sha256.as_str()),
+                outcome.plan.config_hash,
+            ],
+        )?;
+        if let Some(run) = actual {
+            for (sequence, sample) in run.raw_samples.iter().enumerate().take(4_096) {
+                let mut values = Vec::new();
+                values.push((
+                    "worker_memory_current",
+                    sample.memory_current.map(|value| value as f64),
+                    "bytes",
+                    "cgroup",
+                    "memory.current",
+                ));
+                values.push((
+                    "worker_memory_peak",
+                    sample.memory_peak.map(|value| value as f64),
+                    "bytes",
+                    "cgroup",
+                    "memory.peak",
+                ));
+                if let Some(pressure) = &sample.memory_pressure {
+                    values.push((
+                        "worker_memory_psi_some_avg10",
+                        Some(pressure.some.avg10),
+                        "percent",
+                        "cgroup",
+                        "memory.pressure",
+                    ));
+                    values.push((
+                        "worker_memory_psi_some_total",
+                        Some(pressure.some.total_us as f64),
+                        "microseconds",
+                        "cgroup",
+                        "memory.pressure",
+                    ));
+                }
+                if let Some(pressure) = &sample.host_memory_pressure {
+                    values.push((
+                        "host_memory_psi_some_avg10",
+                        Some(pressure.some.avg10),
+                        "percent",
+                        "host",
+                        "/proc/pressure/memory",
+                    ));
+                    values.push((
+                        "host_memory_psi_some_total",
+                        Some(pressure.some.total_us as f64),
+                        "microseconds",
+                        "host",
+                        "/proc/pressure/memory",
+                    ));
+                }
+                for (metric, value, unit, scope, source) in values {
+                    tx.execute(
+                        "INSERT INTO benchmark_samples(run_id,sequence,timestamp_monotonic_ns,phase,metric,value,unit,scope,source,available,unavailable_reason)
+                         VALUES (?1,?2,?3,'measuring',?4,?5,?6,?7,?8,?9,?10)",
+                        params![
+                            run_id,
+                            sequence as i64,
+                            sample.timestamp_ns as i64,
+                            metric,
+                            value,
+                            unit,
+                            scope,
+                            source,
+                            value.is_some(),
+                            value.is_none().then_some("provider unavailable"),
+                        ],
+                    )?;
+                }
+                for metric in &sample.host_metrics {
+                    tx.execute(
+                        "INSERT INTO benchmark_samples(run_id,sequence,timestamp_monotonic_ns,phase,metric,value,unit,scope,source,available,unavailable_reason)
+                         VALUES (?1,?2,?3,'measuring',?4,?5,?6,'host',?7,?8,?9)",
+                        params![
+                            run_id,
+                            sequence as i64,
+                            sample.timestamp_ns as i64,
+                            metric.name,
+                            metric.value,
+                            metric.unit,
+                            metric.source,
+                            metric.available,
+                            metric.reason,
+                        ],
+                    )?;
+                }
+                for (prefix, source, counters) in [
+                    ("worker_cpu", "cpu.stat", Some(&sample.cpu_stat)),
+                    ("worker_io", "io.stat", sample.io_stat.as_ref()),
+                ] {
+                    for (name, value) in counters.into_iter().flatten() {
+                        tx.execute(
+                            "INSERT INTO benchmark_samples(run_id,sequence,timestamp_monotonic_ns,phase,metric,value,unit,scope,source,available,unavailable_reason)
+                             VALUES (?1,?2,?3,'measuring',?4,?5,'kernel_native','cgroup',?6,1,NULL)",
+                            params![
+                                run_id,
+                                sequence as i64,
+                                sample.timestamp_ns as i64,
+                                format!("{prefix}_{name}"),
+                                *value as f64,
+                                source,
+                            ],
+                        )?;
+                    }
+                }
+            }
+            for (metric, value, unit, scope) in [
+                (
+                    "worker_cpu_seconds",
+                    run.worker_cpu_seconds,
+                    "seconds",
+                    "cgroup",
+                ),
+                (
+                    "worker_memory_mean_bytes",
+                    run.worker_memory_mean_bytes,
+                    "bytes",
+                    "cgroup",
+                ),
+                (
+                    "runner_cpu_seconds",
+                    run.runner_cpu_seconds,
+                    "seconds",
+                    "process",
+                ),
+                (
+                    "observer_cpu_seconds",
+                    run.observer
+                        .as_ref()
+                        .map(|observer| observer.measurement_cpu_seconds),
+                    "seconds",
+                    "nemor",
+                ),
+            ] {
+                tx.execute(
+                    "INSERT INTO benchmark_summaries(run_id,metric,unit,scope,summary_json)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        run_id,
+                        metric,
+                        unit,
+                        scope,
+                        serde_json::to_string(&serde_json::json!({
+                            "value": value,
+                            "available": value.is_some()
+                        }))?,
+                    ],
+                )?;
+            }
+        }
+    }
+    if let Some(comparison) = &outcome.comparison {
+        tx.execute(
+            "INSERT INTO benchmark_comparisons(id,experiment_id,baseline_variant,candidate_variant,comparable,invalid_reason,comparison_json,acceptance_json,created_at_ns,comparison_purpose)
+             VALUES (?1,?2,'cachyos_baseline','nemor_observe',?3,?4,?5,?6,?7,'observer_overhead')",
+            params![
+                format!("{}-observer-overhead", outcome.plan.experiment_id),
+                outcome.plan.experiment_id,
+                comparison.comparable,
+                comparison.invalid_reason,
+                serde_json::to_string(comparison)?,
+                serde_json::to_string(&serde_json::json!({
+                    "capacity_gain_percent": "not_evaluated",
+                    "gaming": "not_evaluated",
+                    "oom_avoided": "not_evaluated",
+                    "overall_phase10": "not_evaluated"
+                }))?,
+                now_ns() as i64,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn now_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}

@@ -129,3 +129,23 @@ PID/start-ticks remain authoritative through cleanup. Every spawned-worker
 path evaluates worker cleanup; every post-mutation path evaluates scope
 cleanup. Only the exact owned worker, unit and transaction may be affected,
 and `host_unchanged` requires all three resources to be absent.
+
+Checkpoint 3A adds no pressure or optimizer mutation. It hard-caps touched
+payload at 256 MiB, uses dynamic host reserve, rejects any foreign `nemord`,
+and never stops or adopts it. Every repetition must remove its worker, scope,
+observer and isolated storage handles and reproduce the structural snapshot.
+A safety or restore failure aborts the remaining randomized plan. Dirty or
+stale release binaries cannot produce eligible performance evidence.
+
+Checkpoint 3A-P authorizes only one additional validation mutation surface:
+`StartTransientUnit` and `StopUnit` for an exact
+`nemor-benchmark-observer-*.service`, plus exact transaction files under
+`/run`. It never manipulates production `nemord.service`. A foreign `nemord`
+is a preflight failure and never grants signal or stop authority. Readiness
+requires a real telemetry sample in the isolated database.
+
+Validation compares swap topology, zram configuration, zswap state, KSM
+configuration, DAMON tree shape, bounded cgroup topology, and production Nemor
+config/database metadata. The observer service cgroup, RuntimeDirectory files
+and SQLite writes are the only authorized temporary differences. Common
+cleanup requires MainPID, unit, cgroup and runtime-directory absence.

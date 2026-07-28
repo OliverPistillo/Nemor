@@ -6,6 +6,7 @@ use crate::harness::{
     OwnedProcessIdentity, SimulatedRecoveryState, WatchdogInputs, WorkerProtocolState,
     CHECKPOINT2_REQUIRED_GATES,
 };
+use crate::performance::*;
 use crate::systemd::{
     interface_contract_matches, require_successful_job, transient_aux_signature,
     validate_unit_name, RecoveryOwnership, ScopeState, SimulatedSystemdBackend, SystemdJobOutcome,
@@ -1718,6 +1719,538 @@ fn zram_runtime_change_is_not_structural_but_configuration_is() {
         .zram_configuration
         .insert("zram0.disksize".into(), "different".into());
     assert!(!baseline.matches(&configuration));
+}
+
+#[test]
+fn checkpoint3a_profile_is_fixed_load_non_pressure_and_bounded() {
+    let profile = PerformanceProfile::checkpoint3a(CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES).unwrap();
+    assert_eq!(profile.logical_payload_bytes, 128 * 1024 * 1024);
+    assert_eq!(profile.worker_memory_max_bytes, 256 * 1024 * 1024);
+    assert!(profile.measurement_ms >= 20_000);
+    assert!(profile.stabilization_ms >= 2_000);
+    assert!(!profile.request_oom);
+    assert!(!profile.pressure_mode);
+    assert!(PerformanceProfile::checkpoint3a(CHECKPOINT3A_MAX_PAYLOAD_BYTES + 1).is_err());
+}
+
+#[test]
+fn validation_artifact_policy_is_narrow_and_content_bounded() {
+    assert!(recognized_validation_artifact_name(
+        "ksm-attempt5-report.json"
+    ));
+    assert!(recognized_validation_artifact_name(
+        "phase10-checkpoint2-attempt5-report.json"
+    ));
+    assert!(recognized_validation_artifact_name(
+        "phase10-checkpoint2-report.json"
+    ));
+    assert!(!recognized_validation_artifact_name(
+        "arbitrary-report.json"
+    ));
+    assert!(!recognized_validation_artifact_name(
+        "phase10-checkpoint3-report.json"
+    ));
+    assert!(validation_artifact_content_is_bounded_json(
+        br#"{"run_id":"bounded"}"#
+    ));
+    assert!(!validation_artifact_content_is_bounded_json(b"not-json"));
+
+    let root = tempfile::tempdir().unwrap();
+    let valid = root.path().join("ksm-attempt5-report.json");
+    std::fs::write(&valid, br#"{"run_id":"bounded"}"#).unwrap();
+    assert!(is_known_validation_artifact_at(
+        root.path(),
+        Path::new("ksm-attempt5-report.json")
+    ));
+    assert!(!status_entry_is_relevant(
+        root.path(),
+        "?? ksm-attempt5-report.json"
+    ));
+
+    std::fs::write(&valid, b"not-json").unwrap();
+    assert!(!is_known_validation_artifact_at(
+        root.path(),
+        Path::new("ksm-attempt5-report.json")
+    ));
+    assert!(status_entry_is_relevant(
+        root.path(),
+        "?? ksm-attempt5-report.json"
+    ));
+
+    let oversized = vec![b' '; 16 * 1024 * 1024 + 1];
+    std::fs::write(&valid, oversized).unwrap();
+    assert!(!is_known_validation_artifact_at(
+        root.path(),
+        Path::new("ksm-attempt5-report.json")
+    ));
+
+    std::fs::write(root.path().join("unknown.json"), b"{}").unwrap();
+    assert!(status_entry_is_relevant(root.path(), "?? unknown.json"));
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    std::fs::write(root.path().join("nested/ksm-attempt5-report.json"), b"{}").unwrap();
+    assert!(status_entry_is_relevant(
+        root.path(),
+        "?? nested/ksm-attempt5-report.json"
+    ));
+    assert!(status_entry_is_relevant(root.path(), "?? untracked.rs"));
+    assert!(status_entry_is_relevant(root.path(), "?? untracked.toml"));
+    assert!(status_entry_is_relevant(root.path(), " M README.md"));
+}
+
+#[test]
+fn relevant_untracked_source_changes_source_state_and_artifacts_do_not() {
+    let clean = calculate_source_state_id("head", b"", &[]);
+    let source = calculate_source_state_id(
+        "head",
+        b"",
+        &[("crates/new/src/lib.rs".into(), "digest".into())],
+    );
+    assert_ne!(clean, source);
+    assert_eq!(clean, calculate_source_state_id("head", b"", &[]));
+}
+
+#[test]
+fn baseline_and_observe_reject_foreign_nemord() {
+    let foreign = DetectedNemorProcess {
+        identity: ProcessIdentity {
+            pid: 10,
+            start_ticks: 20,
+        },
+        executable_matches_expected: true,
+        owned_by_transaction: false,
+    };
+    assert!(reject_foreign_nemord(std::slice::from_ref(&foreign), None).is_err());
+    assert!(reject_foreign_nemord(
+        &[foreign],
+        Some(&ProcessIdentity {
+            pid: 11,
+            start_ticks: 21
+        })
+    )
+    .is_err());
+}
+
+#[test]
+fn exact_owned_observer_identity_is_accepted_and_never_adopted() {
+    let identity = ProcessIdentity {
+        pid: 10,
+        start_ticks: 20,
+    };
+    let owned = DetectedNemorProcess {
+        identity: identity.clone(),
+        executable_matches_expected: true,
+        owned_by_transaction: true,
+    };
+    assert!(reject_foreign_nemord(&[owned], Some(&identity)).is_ok());
+    assert!(reject_foreign_nemord(&[], Some(&identity)).is_err());
+    assert!(observer_cleanup_allowed(&identity, &identity));
+    assert!(!observer_cleanup_allowed(
+        &identity,
+        &ProcessIdentity {
+            pid: identity.pid,
+            start_ticks: identity.start_ticks + 1
+        }
+    ));
+}
+
+#[test]
+fn observe_configuration_has_zero_mutation_invariant() {
+    let safe = ObserverInvariant {
+        mode_observe: true,
+        automatic_actions_disabled: true,
+        cgroup_moves_disabled: true,
+        zram_mutation_disabled: true,
+        zswap_mutation_disabled: true,
+        ksm_live_apply_disabled: true,
+        damon_monitor_only: true,
+        damos_live_apply_disabled: true,
+    };
+    safe.validate().unwrap();
+    let mut unsafe_config = safe;
+    unsafe_config.ksm_live_apply_disabled = false;
+    assert!(unsafe_config.validate().is_err());
+}
+
+fn checkpoint3a_fixture_plan() -> ExperimentPlan {
+    let environment = fixture_environment();
+    ExperimentPlan {
+        schema_version: BENCHMARK_SCHEMA_VERSION,
+        experiment_id: "checkpoint3a-test".into(),
+        scenario: CHECKPOINT3A_SCENARIO.into(),
+        scenario_version: 1,
+        evidence_kind: EvidenceKind::PerformanceBenchmark,
+        comparison_purpose: ComparisonPurpose::ObserverOverhead,
+        variants: vec![
+            BenchmarkVariant::CachyosBaseline,
+            BenchmarkVariant::NemorObserve,
+        ],
+        repetitions: 3,
+        experiment_seed: 42,
+        randomized_order: deterministic_order(
+            &[
+                BenchmarkVariant::CachyosBaseline,
+                BenchmarkVariant::NemorObserve,
+            ],
+            3,
+            42,
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(order_index, (variant, repetition_index))| PlannedRun {
+            order_index,
+            variant,
+            repetition_index,
+            run_seed: 42u64.rotate_left(17) ^ repetition_index as u64,
+            state: PlannedRunState::Planned,
+        })
+        .collect(),
+        profile: PerformanceProfile::checkpoint3a(CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES).unwrap(),
+        provenance: BuildProvenance {
+            git_head: "head".into(),
+            git_dirty: false,
+            source_state_id: "source".into(),
+            binary_sha256: "benchmark".into(),
+            build_profile: "release".into(),
+            benchmark_schema_version: BENCHMARK_SCHEMA_VERSION,
+            development_build: false,
+        },
+        benchmark_binary: BinaryIdentity {
+            path_role: "nemor_benchmark".into(),
+            sha256: "benchmark".into(),
+            build_profile: "release".into(),
+            source_state_id: "source".into(),
+            embedded_git_head: "head".into(),
+        },
+        observer_binary: BinaryIdentity {
+            path_role: "nemord".into(),
+            sha256: "observer".into(),
+            build_profile: "release".into(),
+            source_state_id: "source".into(),
+            embedded_git_head: "head".into(),
+        },
+        config_hash: "config".into(),
+        environment_hash: environment.hash().unwrap(),
+        thermal_state_unverified: environment.thermal_state_unverified,
+        environment,
+        performance_claim_eligible: true,
+        capacity_gain_percent: EvaluationState::NotEvaluated,
+    }
+}
+
+fn checkpoint3a_run(plan: &ExperimentPlan, planned: PlannedRun) -> RunEvidence {
+    let snapshot = swap_snapshot(1, 100, 100);
+    let observer = (planned.variant == BenchmarkVariant::NemorObserve).then(|| ObserverEvidence {
+        identity: ProcessIdentity {
+            pid: 50,
+            start_ticks: 60,
+        },
+        binary_sha256: plan.observer_binary.sha256.clone(),
+        config_hash: plan.config_hash.clone(),
+        started_monotonic_ns: 1,
+        measurement_started_monotonic_ns: 2,
+        measurement_ended_monotonic_ns: 22_000_000_002,
+        stopped_monotonic_ns: 22_000_000_003,
+        exit_status: Some(0),
+        setup_wall_seconds: 1.0,
+        setup_cpu_seconds: 0.1,
+        measurement_cpu_seconds: 0.2,
+        measurement_cpu_percent: 1.0,
+        rss_mean_bytes: Some(1024.0),
+        rss_peak_bytes: Some(2048),
+        pss_mean_bytes: Some(768.0),
+        pss_peak_bytes: Some(1024),
+        outside_worker_scope: true,
+        isolated_storage_closed: true,
+    });
+    RunEvidence {
+        run_id: format!("run-{}", planned.order_index),
+        experiment_id: plan.experiment_id.clone(),
+        planned,
+        valid: true,
+        invalid_reason: None,
+        safety_failure: false,
+        environment_hash: plan.environment_hash.clone(),
+        benchmark_binary_sha256: plan.benchmark_binary.sha256.clone(),
+        observer_binary_sha256: observer
+            .as_ref()
+            .map(|_| plan.observer_binary.sha256.clone()),
+        worker_manifest_hash: "same-worker".into(),
+        worker_cgroup_memory_max: plan.profile.worker_memory_max_bytes,
+        logical_payload_bytes: plan.profile.logical_payload_bytes,
+        measurement_ms: plan.profile.measurement_ms,
+        sample_interval_ms: plan.profile.sample_interval_ms,
+        sample_count: 20,
+        raw_samples: vec![],
+        worker_cpu_seconds: Some(0.1),
+        worker_memory_mean_bytes: Some(plan.profile.logical_payload_bytes as f64),
+        worker_memory_peak_bytes: Some(plan.profile.logical_payload_bytes),
+        runner_cpu_seconds: Some(0.1),
+        observer,
+        deltas: None,
+        watchdog_triggered: false,
+        oom: 0,
+        oom_kill: 0,
+        worker_integrity_valid: true,
+        restore_passed: true,
+        structural_before: snapshot.clone(),
+        structural_after: snapshot,
+    }
+}
+
+#[test]
+fn baseline_and_observe_share_worker_manifest_seed_load_and_envelope() {
+    let plan = checkpoint3a_fixture_plan();
+    let baseline = checkpoint3a_run(
+        &plan,
+        PlannedRun {
+            order_index: 0,
+            variant: BenchmarkVariant::CachyosBaseline,
+            repetition_index: 0,
+            run_seed: 7,
+            state: PlannedRunState::Planned,
+        },
+    );
+    let observe = checkpoint3a_run(
+        &plan,
+        PlannedRun {
+            variant: BenchmarkVariant::NemorObserve,
+            ..baseline.planned.clone()
+        },
+    );
+    assert_eq!(baseline.worker_manifest_hash, observe.worker_manifest_hash);
+    assert_eq!(baseline.planned.run_seed, observe.planned.run_seed);
+    assert_eq!(
+        baseline.logical_payload_bytes,
+        observe.logical_payload_bytes
+    );
+    assert_eq!(
+        baseline.worker_cgroup_memory_max,
+        observe.worker_cgroup_memory_max
+    );
+    assert!(baseline.observer.is_none());
+    assert!(observe.observer.as_ref().unwrap().outside_worker_scope);
+}
+
+#[test]
+fn observer_setup_cpu_is_separate_from_measurement_cpu_and_memory_is_captured() {
+    let plan = checkpoint3a_fixture_plan();
+    let run = checkpoint3a_run(
+        &plan,
+        PlannedRun {
+            order_index: 0,
+            variant: BenchmarkVariant::NemorObserve,
+            repetition_index: 0,
+            run_seed: 7,
+            state: PlannedRunState::Planned,
+        },
+    );
+    let observer = run.observer.unwrap();
+    assert_ne!(observer.setup_cpu_seconds, observer.measurement_cpu_seconds);
+    assert!(observer.rss_mean_bytes.is_some());
+    assert!(observer.rss_peak_bytes.is_some());
+    assert!(observer.pss_mean_bytes.is_some());
+    assert!(observer.pss_peak_bytes.is_some());
+}
+
+#[test]
+fn all_performance_cumulative_sources_use_run_relative_deltas() {
+    let before = CounterSnapshot {
+        vmstat: BTreeMap::from([
+            ("pgmajfault".into(), 10),
+            ("pswpin".into(), 20),
+            ("pswpout".into(), 30),
+        ]),
+        psi_totals_usec: BTreeMap::from([("host_some".into(), 40), ("worker_full".into(), 50)]),
+        cpu: BTreeMap::from([
+            ("runner_ticks".into(), 60),
+            ("worker_usage_usec".into(), 70),
+        ]),
+        io: BTreeMap::from([("rbytes".into(), 80), ("wbytes".into(), 90)]),
+    };
+    let mut after = before.clone();
+    for values in [
+        &mut after.vmstat,
+        &mut after.psi_totals_usec,
+        &mut after.cpu,
+        &mut after.io,
+    ] {
+        for value in values.values_mut() {
+            *value += 1;
+        }
+    }
+    let deltas = derive_performance_deltas(&before, &after).unwrap();
+    assert!(deltas
+        .vmstat
+        .values()
+        .chain(deltas.psi_totals_usec.values())
+        .chain(deltas.cpu.values())
+        .chain(deltas.io.values())
+        .all(|value| *value == 1));
+}
+
+#[test]
+fn fixed_load_never_calculates_capacity_acceptance() {
+    let plan = checkpoint3a_fixture_plan();
+    assert_eq!(plan.capacity_gain_percent, EvaluationState::NotEvaluated);
+    let comparison = compare_observer_overhead(
+        &plan
+            .randomized_order
+            .iter()
+            .cloned()
+            .map(|planned| checkpoint3a_run(&plan, planned))
+            .collect::<Vec<_>>(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        comparison.capacity_gain_percent,
+        EvaluationState::NotEvaluated
+    );
+    assert!(!comparison.significance_claimed);
+}
+
+#[test]
+fn checkpoint3a_order_is_deterministic_interleaved_and_has_six_runs() {
+    let plan = checkpoint3a_fixture_plan();
+    assert_eq!(plan.randomized_order.len(), 6);
+    assert_eq!(
+        plan.randomized_order,
+        checkpoint3a_fixture_plan().randomized_order
+    );
+    assert!(plan
+        .randomized_order
+        .windows(2)
+        .any(|pair| pair[0].variant != pair[1].variant));
+    for repetition in 0..3 {
+        let seeds = plan
+            .randomized_order
+            .iter()
+            .filter(|run| run.repetition_index == repetition)
+            .map(|run| run.run_seed)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(seeds.len(), 1);
+    }
+}
+
+#[test]
+fn observer_comparison_requires_three_valid_runs_per_variant() {
+    let plan = checkpoint3a_fixture_plan();
+    let mut runs = plan
+        .randomized_order
+        .iter()
+        .cloned()
+        .map(|planned| checkpoint3a_run(&plan, planned))
+        .collect::<Vec<_>>();
+    runs.retain(|run| {
+        run.planned.variant != BenchmarkVariant::NemorObserve || run.planned.repetition_index != 2
+    });
+    assert!(compare_observer_overhead(&runs, &BTreeMap::new()).is_err());
+}
+
+#[test]
+fn invalid_runs_are_retained_and_safety_failure_marks_remaining_unexecuted() {
+    let plan = checkpoint3a_fixture_plan();
+    let mut outcome = ExperimentOutcome {
+        plan: plan.clone(),
+        runs: vec![],
+        aborted_after_order: None,
+        comparison: None,
+        capacity_gain_percent: EvaluationState::NotEvaluated,
+    };
+    let mut failed = checkpoint3a_run(&plan, plan.randomized_order[1].clone());
+    failed.valid = false;
+    failed.safety_failure = true;
+    failed.invalid_reason = Some("watchdog".into());
+    outcome.record_run(failed);
+    assert_eq!(outcome.runs.len(), 1);
+    assert!(!outcome.may_continue());
+    assert!(outcome
+        .plan
+        .randomized_order
+        .iter()
+        .skip(2)
+        .all(|run| run.state == PlannedRunState::NotExecutedAfterAbort));
+}
+
+#[test]
+fn dirty_or_binary_source_mismatch_is_ineligible() {
+    let mut plan = checkpoint3a_fixture_plan();
+    plan.provenance.git_dirty = true;
+    assert!(require_live_eligibility(&plan).is_err());
+    plan.provenance.git_dirty = false;
+    plan.observer_binary.source_state_id = "other".into();
+    assert!(require_live_eligibility(&plan).is_err());
+    plan.observer_binary.source_state_id = "source".into();
+    plan.observer_binary.embedded_git_head = "other".into();
+    assert!(require_live_eligibility(&plan).is_err());
+}
+
+#[test]
+fn environment_or_worker_manifest_mismatch_blocks_comparison() {
+    let plan = checkpoint3a_fixture_plan();
+    let mut runs = plan
+        .randomized_order
+        .iter()
+        .cloned()
+        .map(|planned| checkpoint3a_run(&plan, planned))
+        .collect::<Vec<_>>();
+    runs[0].environment_hash = "different".into();
+    assert!(compare_observer_overhead(&runs, &BTreeMap::new()).is_err());
+    runs[0].environment_hash = plan.environment_hash.clone();
+    runs[0].worker_manifest_hash = "different".into();
+    assert!(compare_observer_overhead(&runs, &BTreeMap::new()).is_err());
+}
+
+#[test]
+fn thermal_and_optional_energy_are_never_fabricated() {
+    let plan = checkpoint3a_fixture_plan();
+    assert_eq!(
+        plan.thermal_state_unverified,
+        plan.environment.thermal_state_unverified
+    );
+    assert!(MetricValue::unavailable(
+        "energy",
+        "joules",
+        MetricScope::Host,
+        "powercap",
+        "unavailable"
+    )
+    .value
+    .is_none());
+}
+
+#[test]
+fn checkpoint3a_persistence_keeps_six_manifests_and_comparison() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("performance.sqlite");
+    let plan = checkpoint3a_fixture_plan();
+    let runs = plan
+        .randomized_order
+        .iter()
+        .cloned()
+        .map(|planned| checkpoint3a_run(&plan, planned))
+        .collect::<Vec<_>>();
+    let comparison = compare_observer_overhead(&runs, &comparison_metric_inputs(&runs)).unwrap();
+    let outcome = ExperimentOutcome {
+        plan: plan.clone(),
+        runs,
+        aborted_after_order: None,
+        comparison: Some(comparison),
+        capacity_gain_percent: EvaluationState::NotEvaluated,
+    };
+    persist_experiment(
+        &database,
+        include_str!("../../../migrations/0008_benchmark.sql"),
+        include_str!("../../../migrations/0009_benchmark_performance.sql"),
+        &outcome,
+    )
+    .unwrap();
+    let store = BenchmarkStore::open_read_only(&database).unwrap();
+    assert_eq!(store.experiment_runs(&plan.experiment_id).unwrap().len(), 6);
+    assert_eq!(
+        store.comparison(&plan.experiment_id).unwrap()["purpose"],
+        "observer_overhead"
+    );
 }
 
 #[test]

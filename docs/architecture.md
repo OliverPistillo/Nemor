@@ -167,3 +167,29 @@ Systemd is the cgroup writer. Nemor does not write controller, limit or
 membership files; create/remove systemd cgroups; restructure `user.slice`; or
 migrate foreign processes. ATTEMPT 5 validated this architecture and its
 common exact-owned cleanup path on CachyOS.
+
+Checkpoint 3A reuses that worker boundary identically for baseline and observe,
+but does not run the observer as a child of the privileged runner. Checkpoint
+3A-P adds a second system-manager role: the synthetic worker remains the
+validated transient `.scope`, while the observer is an exact benchmark-owned
+transient `.service` because PID 1 must create the release `nemord` with
+`DynamicUser=true`.
+
+The service uses fixed typed properties and argv, `mode=fail`, subscribed
+asynchronous job completion, an ephemeral `RuntimeDirectory`, and read-only
+binds of the hash-approved binary and explicit observe-only config. Its
+database is inside that runtime directory, never the production database.
+`Service.MainPID`, numeric effective UID/GID, start ticks, `/proc/PID/exe`
+hash, `GetUnitByPID`, and the systemd-derived service `ControlGroup` form the
+runtime identity. DynamicUser numeric IDs need not be stable.
+
+Source provenance is prepared unprivileged from a clean release build. The
+privileged validation consumes an integrity-bound manifest, re-hashes its own
+binary, `nemord`, and config, and never calls Git. After verification it copies
+the config to an exact root-owned `/run` staging path, closing the user-owned
+path TOCTOU window. Checkpoint 3A-P remains pending one bounded live
+validation.
+
+The application-level provenance command is authoritative for cleanliness;
+shell emptiness of `git status` is intentionally not used because bounded
+validation reports remain preserved as untracked non-source evidence.

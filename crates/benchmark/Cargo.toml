@@ -10,10 +10,12 @@ clap.workspace = true
 common = { package = "nemor-common", path = "../common" }
 futures-lite.workspace = true
 hex.workspace = true
+nix.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+storage = { package = "nemor-storage", path = "../storage" }
 thiserror.workspace = true
 tokio.workspace = true
 zbus.workspace = true

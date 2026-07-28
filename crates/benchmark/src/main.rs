@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use nemor_benchmark::{
-    required_scenarios, safe_smoke, BuildProvenance, EnvironmentFingerprint, ScenarioId,
+    required_scenarios, safe_smoke, BenchmarkVariant, BuildProvenance, EnvironmentFingerprint,
+    ScenarioId,
 };
 use std::path::PathBuf;
 
@@ -22,6 +23,8 @@ enum Command {
     Provenance {
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        require_clean_release: bool,
     },
     Preflight {
         #[arg(long)]
@@ -62,10 +65,64 @@ enum Command {
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         worker_bytes: u64,
     },
+    PerformancePreflight {
+        #[arg(long, default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        observer_binary: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    PrepareObserverService {
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        #[arg(long, default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        observer_binary: PathBuf,
+        #[arg(long)]
+        prepared_dir: PathBuf,
+    },
+    ObserverServicePreflight {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    ValidateObserverService {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+    },
+    Experiment {
+        #[arg(long)]
+        scenario: String,
+        #[arg(long)]
+        variants: String,
+        #[arg(long, default_value_t = 3)]
+        repetitions: usize,
+        #[arg(long)]
+        seed: u64,
+        #[arg(long, default_value_t = 128 * 1024 * 1024)]
+        payload_bytes: u64,
+        #[arg(long, default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        report_dir: PathBuf,
+        #[arg(long)]
+        observer_binary: Option<PathBuf>,
+        #[arg(long)]
+        execute: bool,
+    },
     #[command(hide = true)]
     WorkerHold {
         #[arg(long)]
         bytes: u64,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
         #[arg(long)]
         control_dir: PathBuf,
     },
@@ -83,19 +140,39 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<i32> {
     match Cli::parse().command {
-        Command::Provenance { json } => {
+        Command::Provenance {
+            json,
+            require_clean_release,
+        } => {
             let provenance = BuildProvenance::capture()?;
+            let performance_source_eligible = provenance.clean_release_eligible();
             if json {
-                println!("{}", serde_json::to_string_pretty(&provenance)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "git_head": provenance.git_head,
+                        "git_dirty": provenance.git_dirty,
+                        "source_state_id": provenance.source_state_id,
+                        "binary_sha256": provenance.binary_sha256,
+                        "build_profile": provenance.build_profile,
+                        "benchmark_schema_version": provenance.benchmark_schema_version,
+                        "development_build": provenance.development_build,
+                        "performance_source_eligible": performance_source_eligible,
+                    }))?
+                );
             } else {
                 println!(
-                    "git_head={} git_dirty={} source_state_id={} binary_sha256={} build_profile={}",
+                    "git_head={} git_dirty={} source_state_id={} binary_sha256={} build_profile={} performance_source_eligible={}",
                     provenance.git_head,
                     provenance.git_dirty,
                     provenance.source_state_id,
                     provenance.binary_sha256,
-                    provenance.build_profile
+                    provenance.build_profile,
+                    performance_source_eligible
                 );
+            }
+            if require_clean_release && !performance_source_eligible {
+                bail!("authoritative provenance rejected dirty or non-release source");
             }
         }
         Command::Preflight { json } => {
@@ -200,6 +277,9 @@ fn run() -> Result<i32> {
                 database,
                 report_dir,
                 worker_bytes,
+                performance_profile: None,
+                observer: None,
+                worker_seed: 0,
             };
             let (report, path) = nemor_benchmark::harness::run_live(&options)?;
             println!(
@@ -210,8 +290,197 @@ fn run() -> Result<i32> {
             );
             return Ok(report.outcome.exit_code);
         }
-        Command::WorkerHold { bytes, control_dir } => {
-            nemor_benchmark::harness::run_worker(bytes, &control_dir)?;
+        Command::PerformancePreflight {
+            config,
+            observer_binary,
+            json,
+        } => {
+            let loaded = common::LoadedConfig::load(&config)?;
+            let executable = std::env::current_exe()?;
+            let observer_binary =
+                observer_binary.unwrap_or_else(|| executable.with_file_name("nemord"));
+            let inputs = nemor_benchmark::performance::ExperimentInputs {
+                scenario: nemor_benchmark::performance::CHECKPOINT3A_SCENARIO,
+                variants: &[
+                    BenchmarkVariant::CachyosBaseline,
+                    BenchmarkVariant::NemorObserve,
+                ],
+                repetitions: 3,
+                seed: 1,
+                payload_bytes: nemor_benchmark::performance::CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES,
+                config_hash: &loaded.sha256,
+                benchmark_binary_path: &executable,
+                observer_binary_path: &observer_binary,
+            };
+            let plan = nemor_benchmark::performance::plan_experiment(&inputs)?;
+            let foreign =
+                nemor_benchmark::performance::detect_nemord_processes(&observer_binary, None);
+            let contamination_clear =
+                nemor_benchmark::performance::reject_foreign_nemord(&foreign, None).is_ok();
+            let output = serde_json::json!({
+                "scenario": plan.scenario,
+                "comparison_purpose": plan.comparison_purpose,
+                "performance_claim_eligible": plan.performance_claim_eligible,
+                "provenance": plan.provenance,
+                "benchmark_binary": plan.benchmark_binary,
+                "observer_binary": plan.observer_binary,
+                "foreign_nemord_clear": contamination_clear,
+                "execute_allowed": plan.performance_claim_eligible && contamination_clear,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!(
+                    "performance_claim_eligible={} foreign_nemord_clear={} scenario=synthetic_compressible purpose=observer_overhead",
+                    plan.performance_claim_eligible, contamination_clear
+                );
+            }
+        }
+        Command::PrepareObserverService {
+            repository,
+            config,
+            observer_binary,
+            prepared_dir,
+        } => {
+            let path = nemor_benchmark::observer_service::prepare_observer_manifest(
+                &repository,
+                &config,
+                &observer_binary,
+                &prepared_dir,
+            )?;
+            println!("manifest={}", path.display());
+        }
+        Command::ObserverServicePreflight { manifest, json } => {
+            use nemor_benchmark::observer_service::ObserverServiceBackend;
+            let bounded: nemor_benchmark::observer_service::IntegrityBoundManifest =
+                serde_json::from_slice(&std::fs::read(&manifest)?)?;
+            bounded.verify(&manifest)?;
+            let backend =
+                nemor_benchmark::observer_service::SystemdObserverServiceBackend::system()?;
+            backend.preflight()?;
+            let foreign = nemor_benchmark::performance::detect_nemord_processes(
+                &bounded.payload.observer_path,
+                None,
+            );
+            let foreign_clear =
+                nemor_benchmark::performance::reject_foreign_nemord(&foreign, None).is_ok();
+            let privileged = nix::unistd::geteuid().is_root();
+            let output = serde_json::json!({
+                "systemd_api_capable": true,
+                "manager": "system",
+                "required_authorization": "privileged_root",
+                "requires_privileged_execution": true,
+                "current_identity_authorized": privileged,
+                "foreign_nemord_clear": foreign_clear,
+                "source_provenance_verified": true,
+                "release_binary_provenance_verified": true,
+                "preflight_mutated": false,
+                "performance_execution_ready": privileged && foreign_clear,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!(
+                    "systemd_api_capable=true requires_privileged_execution=true current_identity_authorized={} foreign_nemord_clear={} preflight_mutated=false",
+                    privileged, foreign_clear
+                );
+            }
+        }
+        Command::ValidateObserverService { manifest, report } => {
+            let result =
+                nemor_benchmark::observer_service::execute_observer_validation(&manifest, &report)?;
+            println!(
+                "run_id={} evidence_kind=harness_validation performance_claim_eligible=false restore={} report={}",
+                result.run_id,
+                result.structural_restore_passed,
+                report.display()
+            );
+        }
+        Command::Experiment {
+            scenario,
+            variants,
+            repetitions,
+            seed,
+            payload_bytes,
+            config,
+            database,
+            report_dir,
+            observer_binary,
+            execute,
+        } => {
+            if variants != "cachyos_baseline,nemor_observe" {
+                bail!("Checkpoint 3A variants must be cachyos_baseline,nemor_observe");
+            }
+            let loaded = common::LoadedConfig::load(&config)?;
+            let executable = std::env::current_exe()?;
+            let observer_binary =
+                observer_binary.unwrap_or_else(|| executable.with_file_name("nemord"));
+            let variant_set = [
+                BenchmarkVariant::CachyosBaseline,
+                BenchmarkVariant::NemorObserve,
+            ];
+            let inputs = nemor_benchmark::performance::ExperimentInputs {
+                scenario: &scenario,
+                variants: &variant_set,
+                repetitions,
+                seed,
+                payload_bytes,
+                config_hash: &loaded.sha256,
+                benchmark_binary_path: &executable,
+                observer_binary_path: &observer_binary,
+            };
+            let plan = nemor_benchmark::performance::plan_experiment(&inputs)?;
+            if !execute {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                nemor_benchmark::performance::require_live_eligibility(&plan)?;
+                nemor_benchmark::performance::require_validated_observer_service_boundary()?;
+                let mut backend = nemor_benchmark::performance::LiveCheckpoint3aBackend {
+                    config,
+                    report_dir: report_dir.clone(),
+                    observer_binary,
+                };
+                let mut outcome =
+                    nemor_benchmark::performance::execute_planned_experiment(plan, &mut backend)?;
+                let metrics = nemor_benchmark::performance::comparison_metric_inputs(&outcome.runs);
+                outcome.comparison = nemor_benchmark::performance::compare_observer_overhead(
+                    &outcome.runs,
+                    &metrics,
+                )
+                .ok();
+                nemor_benchmark::performance::persist_experiment(
+                    &database,
+                    include_str!("../../../migrations/0008_benchmark.sql"),
+                    include_str!("../../../migrations/0009_benchmark_performance.sql"),
+                    &outcome,
+                )?;
+                std::fs::create_dir_all(&report_dir)?;
+                let report = report_dir.join(format!("{}.json", outcome.plan.experiment_id));
+                std::fs::write(&report, serde_json::to_vec_pretty(&outcome)?)?;
+                let inspection_config =
+                    report_dir.join(format!("{}-inspection.toml", outcome.plan.experiment_id));
+                nemor_benchmark::performance::write_inspection_config(
+                    &backend.config,
+                    &database,
+                    &inspection_config,
+                )?;
+                println!(
+                    "experiment_id={} runs={} comparison={} capacity_gain_percent=not_evaluated report={} inspection_config={}",
+                    outcome.plan.experiment_id,
+                    outcome.runs.len(),
+                    outcome.comparison.is_some(),
+                    report.display(),
+                    inspection_config.display()
+                );
+                return Ok(if outcome.comparison.is_some() { 0 } else { 1 });
+            }
+        }
+        Command::WorkerHold {
+            bytes,
+            seed,
+            control_dir,
+        } => {
+            nemor_benchmark::harness::run_worker(bytes, seed, &control_dir)?;
         }
     }
     Ok(0)

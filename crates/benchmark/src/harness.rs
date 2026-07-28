@@ -234,7 +234,7 @@ impl CgroupHarnessPlan {
         if self.oom_requested {
             bail!("Checkpoint 2 cannot request OOM");
         }
-        if self.worker_bytes > HARNESS_MAX_WORKER_BYTES
+        if self.worker_bytes > crate::performance::CHECKPOINT3A_MAX_PAYLOAD_BYTES
             || self.memory_max_bytes <= self.worker_bytes
             || self.memory_max_bytes > self.worker_bytes.saturating_mul(3)
             || self.measurement_ms == 0
@@ -244,6 +244,62 @@ impl CgroupHarnessPlan {
             bail!("unsafe Checkpoint 2 cgroup plan");
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn checkpoint3a(
+        worker_bytes: u64,
+        memory_max_bytes: u64,
+        mem_available_bytes: u64,
+        total_ram_bytes: u64,
+        parent: PathBuf,
+        run_id: &str,
+        measurement_ms: u64,
+        stabilization_ms: u64,
+    ) -> Result<Self> {
+        if worker_bytes == 0 || worker_bytes > crate::performance::CHECKPOINT3A_MAX_PAYLOAD_BYTES {
+            bail!("Checkpoint 3A worker payload is out of bounds");
+        }
+        let rollback_reserve_bytes = worker_bytes
+            .checked_add(crate::performance::CHECKPOINT3A_WORKER_MARGIN_BYTES)
+            .context("rollback reserve overflow")?;
+        let minimum_host_reserve_bytes = (total_ram_bytes / 10).max(1024 * 1024 * 1024);
+        let required = worker_bytes
+            .checked_add(rollback_reserve_bytes)
+            .and_then(|value| value.checked_add(minimum_host_reserve_bytes))
+            .context("headroom calculation overflow")?;
+        if mem_available_bytes <= required
+            || memory_max_bytes
+                < worker_bytes + crate::performance::CHECKPOINT3A_WORKER_MARGIN_BYTES
+            || memory_max_bytes > 512 * 1024 * 1024
+            || measurement_ms < crate::performance::CHECKPOINT3A_MIN_MEASUREMENT_MS
+            || stabilization_ms < crate::performance::CHECKPOINT3A_STABILIZATION_MS
+        {
+            bail!("unsafe Checkpoint 3A worker envelope or host headroom");
+        }
+        let suffix: String = run_id
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(32)
+            .collect();
+        let group_name = format!("{UNIT_PREFIX}{suffix}.scope");
+        crate::systemd::validate_unit_name(&group_name)?;
+        Ok(Self {
+            worker_bytes,
+            memory_max_bytes,
+            mem_available_bytes,
+            rollback_reserve_bytes,
+            minimum_host_reserve_bytes,
+            parent,
+            group_name,
+            measurement_ms,
+            stabilization_ms,
+            timeout_ms: measurement_ms
+                .checked_add(stabilization_ms)
+                .and_then(|value| value.checked_add(30_000))
+                .context("performance timeout overflow")?,
+            oom_requested: false,
+        })
     }
 }
 
@@ -271,6 +327,7 @@ pub struct CgroupSample {
     pub cpu_stat: BTreeMap<String, u64>,
     pub io_stat: Option<BTreeMap<String, u64>>,
     pub memory_pressure: Option<crate::PsiSnapshot>,
+    pub host_memory_pressure: Option<crate::PsiSnapshot>,
     pub worker_rss_bytes: Option<u64>,
     pub worker_pss_bytes: Option<u64>,
     pub worker_major_faults: Option<u64>,
@@ -470,7 +527,9 @@ pub struct HarnessValidationReport {
     pub sample_count: usize,
     pub wall_seconds: f64,
     pub runner_cpu_seconds: Option<f64>,
+    pub runner_measurement_cpu_seconds: Option<f64>,
     pub worker_cpu_seconds: Option<f64>,
+    pub observer: Option<crate::performance::ObserverEvidence>,
     pub clk_tck: Option<u64>,
     pub watchdog: WatchdogEvidence,
     pub worker_result: Option<WorkerResult>,
@@ -537,6 +596,34 @@ pub struct HarnessOptions {
     pub database: PathBuf,
     pub report_dir: PathBuf,
     pub worker_bytes: u64,
+    pub performance_profile: Option<crate::performance::PerformanceProfile>,
+    pub observer: Option<ObserverLaunch>,
+    pub worker_seed: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObserverLaunch {
+    pub binary: PathBuf,
+    pub config: PathBuf,
+    pub binary_sha256: String,
+    pub config_hash: String,
+    pub warmup_ms: u64,
+}
+
+struct ObserverRuntime {
+    child: Child,
+    identity: crate::performance::ProcessIdentity,
+    binary_sha256: String,
+    config_hash: String,
+    started_monotonic_ns: u64,
+    setup_cpu_start_ticks: u64,
+    measurement_cpu_start_ticks: u64,
+    measurement_started_monotonic_ns: u64,
+    measurement_ended_monotonic_ns: u64,
+    measurement_cpu_end_ticks: u64,
+    rss_samples: Vec<u64>,
+    pss_samples: Vec<u64>,
+    outside_worker_scope: bool,
 }
 
 impl Default for HarnessOptions {
@@ -546,6 +633,9 @@ impl Default for HarnessOptions {
             database: PathBuf::from("/tmp/nemor-phase10-checkpoint2.sqlite"),
             report_dir: PathBuf::from("/tmp/nemor-phase10-checkpoint2-reports"),
             worker_bytes: HARNESS_DEFAULT_WORKER_BYTES,
+            performance_profile: None,
+            observer: None,
+            worker_seed: 0,
         }
     }
 }
@@ -581,15 +671,30 @@ pub fn run_live(options: &HarnessOptions) -> Result<(HarnessValidationReport, Pa
         .copied()
         .unwrap_or(0)
         .saturating_mul(1024);
-    let plan = CgroupHarnessPlan::derive(
-        options.worker_bytes,
-        available,
-        total,
-        cgroup_mount.clone(),
-        &run_id,
-    )?;
+    let plan = if let Some(profile) = &options.performance_profile {
+        profile.validate()?;
+        CgroupHarnessPlan::checkpoint3a(
+            options.worker_bytes,
+            profile.worker_memory_max_bytes,
+            available,
+            total,
+            cgroup_mount.clone(),
+            &run_id,
+            profile.measurement_ms,
+            profile.stabilization_ms,
+        )?
+    } else {
+        CgroupHarnessPlan::derive(
+            options.worker_bytes,
+            available,
+            total,
+            cgroup_mount.clone(),
+            &run_id,
+        )?
+    };
     plan.validate()?;
-    if options.worker_bytes != HARNESS_DEFAULT_WORKER_BYTES {
+    if options.performance_profile.is_none() && options.worker_bytes != HARNESS_DEFAULT_WORKER_BYTES
+    {
         bail!("Checkpoint 2 live validation requires exactly 64 MiB");
     }
     let controllers = fs::read_to_string(cgroup_mount.join("cgroup.controllers"))
@@ -627,7 +732,8 @@ pub fn run_live(options: &HarnessOptions) -> Result<(HarnessValidationReport, Pa
         GateState::Pass,
         "dynamic reserve and rollback headroom satisfied",
     );
-    let mut child = spawn_worker(options.worker_bytes, &control_dir)?;
+    let mut child = spawn_worker(options.worker_bytes, options.worker_seed, &control_dir)?;
+    let mut observer_runtime = None;
     set_gate(
         &mut gates,
         "worker_spawned",
@@ -645,7 +751,16 @@ pub fn run_live(options: &HarnessOptions) -> Result<(HarnessValidationReport, Pa
         &run_id,
         &mut gates,
         loaded.config.pressure.emergency_psi_full_avg10_threshold,
+        options.observer.as_ref(),
+        &mut observer_runtime,
     );
+    let observer_evidence = stop_observer(
+        &mut observer_runtime,
+        clk_tck,
+        options.performance_profile.as_ref(),
+    )
+    .ok()
+    .flatten();
     if cleanup_live(&mut backend, &mut child, &control_dir, &plan, &mut gates).is_err() {
         for name in ["worker_cleanup", "scope_cleanup"] {
             if gates
@@ -817,6 +932,11 @@ pub fn run_live(options: &HarnessOptions) -> Result<(HarnessValidationReport, Pa
                     .checked_sub(before)
                     .map(|delta| delta as f64 / ticks_per_second as f64)
             }),
+        runner_measurement_cpu_seconds: read_json::<Option<f64>>(
+            &control_dir.join("runner_measurement_cpu.json"),
+        )
+        .ok()
+        .flatten(),
         worker_cpu_seconds: samples
             .first()
             .and_then(|first| first.cpu_stat.get("usage_usec"))
@@ -827,6 +947,7 @@ pub fn run_live(options: &HarnessOptions) -> Result<(HarnessValidationReport, Pa
             )
             .and_then(|(before, after)| after.checked_sub(*before))
             .map(|delta| delta as f64 / 1_000_000.0),
+        observer: observer_evidence,
         clk_tck,
         samples,
         watchdog,
@@ -861,6 +982,8 @@ fn run_mutating_sequence(
     run_id: &str,
     gates: &mut [HarnessGate],
     psi_threshold: f64,
+    observer_launch: Option<&ObserverLaunch>,
+    observer_runtime: &mut Option<ObserverRuntime>,
 ) -> Result<()> {
     wait_for_file(
         &control_dir.join("ready_outside.json"),
@@ -882,7 +1005,17 @@ fn run_mutating_sequence(
         GateState::Pass,
         "exact PID/start_ticks READY outside transient scope",
     );
-    let scope_plan = TransientScopePlan::new(run_id, identity.clone())?;
+    let scope_plan = TransientScopePlan::with_limits(
+        run_id,
+        identity.clone(),
+        plan.memory_max_bytes,
+        plan.timeout_ms.saturating_mul(1_000),
+        if plan.measurement_ms >= crate::performance::CHECKPOINT3A_MIN_MEASUREMENT_MS {
+            "Nemor Phase 10 Checkpoint 3A fixed-load performance worker"
+        } else {
+            "Nemor Phase 10 owned cgroup harness validation"
+        },
+    )?;
     let audit = HarnessAudit {
         benchmark_run_id: run_id.into(),
         audit_id: format!("audit-{run_id}"),
@@ -1188,6 +1321,23 @@ fn run_mutating_sequence(
             "start_ticks": identity.start_ticks,
         }),
     )?;
+    if let Some(launch) = observer_launch {
+        *observer_runtime = Some(start_observer(launch, &scope.control_group, plan)?);
+    }
+    if plan.measurement_ms >= crate::performance::CHECKPOINT3A_MIN_MEASUREMENT_MS {
+        let hold_ms = observer_launch
+            .map(|launch| launch.warmup_ms)
+            .unwrap_or(crate::performance::CHECKPOINT3A_OBSERVER_WARMUP_MS);
+        if hold_ms != crate::performance::CHECKPOINT3A_OBSERVER_WARMUP_MS {
+            bail!("baseline/observe pre-measurement hold mismatch");
+        }
+        thread::sleep(Duration::from_millis(hold_ms));
+        if let Some(runtime) = observer_runtime.as_mut() {
+            if read_start_ticks(runtime.identity.pid) != Some(runtime.identity.start_ticks) {
+                bail!("owned observer exited during matched warmup hold");
+            }
+        }
+    }
     fs::write(control_dir.join("allocate"), b"allocate")?;
     wait_for_file(
         &control_dir.join("ready_memory.json"),
@@ -1197,15 +1347,30 @@ fn run_mutating_sequence(
         gates,
         "worker_payload_allocated",
         GateState::Pass,
-        "64 MiB allocation occurred only after scope and limit verification",
+        &format!(
+            "{} byte allocation occurred only after scope and limit verification",
+            plan.worker_bytes
+        ),
     );
     set_gate(
         gates,
         "worker_ready",
         GateState::Pass,
-        "64 MiB prefaulted worker reached READY",
+        &format!("{} byte prefaulted worker reached READY", plan.worker_bytes),
     );
     thread::sleep(Duration::from_millis(plan.stabilization_ms));
+    if let Some(runtime) = observer_runtime.as_mut() {
+        if read_start_ticks(runtime.identity.pid) != Some(runtime.identity.start_ticks) {
+            bail!("owned observer identity changed before measurement");
+        }
+        runtime.measurement_cpu_start_ticks =
+            process_cpu_ticks(runtime.identity.pid).context("observer CPU unavailable")?;
+        runtime.measurement_started_monotonic_ns = now_ns();
+        let (rss, pss) = process_memory(runtime.identity.pid);
+        runtime.rss_samples = rss;
+        runtime.pss_samples = pss;
+    }
+    let runner_measurement_ticks_start = process_cpu_ticks(std::process::id());
     let (samples, watchdog) = monitor(
         backend,
         &scope_plan,
@@ -1215,6 +1380,18 @@ fn run_mutating_sequence(
         control_dir,
         plan,
         psi_threshold,
+        observer_runtime.as_mut(),
+    )?;
+    let runner_measurement_cpu_seconds = detect_clk_tck()
+        .zip(runner_measurement_ticks_start.zip(process_cpu_ticks(std::process::id())))
+        .and_then(|(ticks_per_second, (before, after))| {
+            after
+                .checked_sub(before)
+                .map(|delta| delta as f64 / ticks_per_second as f64)
+        });
+    write_json(
+        &control_dir.join("runner_measurement_cpu.json"),
+        &runner_measurement_cpu_seconds,
     )?;
     fs::write(
         control_dir.join("samples.json"),
@@ -1287,7 +1464,7 @@ fn cleanup_live(
     backend: &mut impl TransientScopeBackend,
     child: &mut Child,
     control_dir: &Path,
-    _plan: &CgroupHarnessPlan,
+    plan: &CgroupHarnessPlan,
     gates: &mut [HarnessGate],
 ) -> Result<()> {
     let audit = read_json::<HarnessAudit>(&control_dir.join("audit.json")).ok();
@@ -1295,7 +1472,17 @@ fn cleanup_live(
         .clone()
         .map(|audit| {
             let run_id = audit.target_identity.run_id.clone();
-            TransientScopePlan::new(&run_id, audit.target_identity)
+            TransientScopePlan::with_limits(
+                &run_id,
+                audit.target_identity,
+                plan.memory_max_bytes,
+                plan.timeout_ms.saturating_mul(1_000),
+                if plan.measurement_ms >= crate::performance::CHECKPOINT3A_MIN_MEASUREMENT_MS {
+                    "Nemor Phase 10 Checkpoint 3A fixed-load performance worker"
+                } else {
+                    "Nemor Phase 10 owned cgroup harness validation"
+                },
+            )
         })
         .transpose()?;
     let start_evidence = backend
@@ -1403,12 +1590,14 @@ fn cleanup_live(
     Ok(())
 }
 
-fn spawn_worker(bytes: u64, control_dir: &Path) -> Result<Child> {
+fn spawn_worker(bytes: u64, seed: u64, control_dir: &Path) -> Result<Child> {
     let executable = std::env::current_exe()?;
     Ok(Command::new(executable)
         .arg("worker-hold")
         .arg("--bytes")
         .arg(bytes.to_string())
+        .arg("--seed")
+        .arg(seed.to_string())
         .arg("--control-dir")
         .arg(control_dir)
         .stdin(Stdio::null())
@@ -1417,15 +1606,169 @@ fn spawn_worker(bytes: u64, control_dir: &Path) -> Result<Child> {
         .spawn()?)
 }
 
+fn start_observer(
+    launch: &ObserverLaunch,
+    worker_control_group: &str,
+    plan: &CgroupHarnessPlan,
+) -> Result<ObserverRuntime> {
+    if plan.measurement_ms < crate::performance::CHECKPOINT3A_MIN_MEASUREMENT_MS {
+        bail!("owned observer is available only for Checkpoint 3A performance runs");
+    }
+    let mut child = Command::new(&launch.binary)
+        .arg("--config")
+        .arg(&launch.config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("cannot spawn exact owned nemord observer")?;
+    let pid = child.id();
+    let started_monotonic_ns = now_ns();
+    let start_ticks = wait_process_identity(pid, Duration::from_secs(2))?;
+    let setup_cpu_start_ticks = process_cpu_ticks(pid).unwrap_or(0);
+    if let Some(status) = child.try_wait()? {
+        bail!("owned nemord exited during setup with {status}");
+    }
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    let outside_worker_scope = !cgroup.contains(worker_control_group);
+    if !outside_worker_scope {
+        bail!("owned observer entered worker cgroup");
+    }
+    let measurement_cpu_start_ticks = process_cpu_ticks(pid).context("observer CPU unavailable")?;
+    let (rss_samples, pss_samples) = process_memory(pid);
+    Ok(ObserverRuntime {
+        child,
+        identity: crate::performance::ProcessIdentity { pid, start_ticks },
+        binary_sha256: launch.binary_sha256.clone(),
+        config_hash: launch.config_hash.clone(),
+        started_monotonic_ns,
+        setup_cpu_start_ticks,
+        measurement_cpu_start_ticks,
+        measurement_started_monotonic_ns: now_ns(),
+        measurement_ended_monotonic_ns: 0,
+        measurement_cpu_end_ticks: measurement_cpu_start_ticks,
+        rss_samples,
+        pss_samples,
+        outside_worker_scope,
+    })
+}
+
+fn stop_observer(
+    runtime: &mut Option<ObserverRuntime>,
+    clk_tck: Option<u64>,
+    profile: Option<&crate::performance::PerformanceProfile>,
+) -> Result<Option<crate::performance::ObserverEvidence>> {
+    let Some(mut runtime) = runtime.take() else {
+        return Ok(None);
+    };
+    if read_start_ticks(runtime.identity.pid) != Some(runtime.identity.start_ticks) {
+        bail!("owned observer identity changed before cleanup");
+    }
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(runtime.identity.pid)?),
+        nix::sys::signal::Signal::SIGTERM,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut status = None;
+    while Instant::now() < deadline {
+        if let Some(found) = runtime.child.try_wait()? {
+            status = Some(found);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if status.is_none()
+        && read_start_ticks(runtime.identity.pid) == Some(runtime.identity.start_ticks)
+    {
+        runtime.child.kill()?;
+        status = Some(runtime.child.wait()?);
+    }
+    let stopped_monotonic_ns = now_ns();
+    let ticks_per_second = clk_tck.context("CLK_TCK unavailable for observer accounting")? as f64;
+    let setup_cpu_seconds = runtime
+        .measurement_cpu_start_ticks
+        .checked_sub(runtime.setup_cpu_start_ticks)
+        .context("observer setup CPU counter decreased")? as f64
+        / ticks_per_second;
+    let measurement_cpu_seconds = runtime
+        .measurement_cpu_end_ticks
+        .checked_sub(runtime.measurement_cpu_start_ticks)
+        .context("observer measurement CPU counter decreased")?
+        as f64
+        / ticks_per_second;
+    let measurement_seconds = profile
+        .context("observer missing performance profile")?
+        .measurement_ms as f64
+        / 1_000.0;
+    Ok(Some(crate::performance::ObserverEvidence {
+        identity: runtime.identity,
+        binary_sha256: runtime.binary_sha256,
+        config_hash: runtime.config_hash,
+        started_monotonic_ns: runtime.started_monotonic_ns,
+        measurement_started_monotonic_ns: runtime.measurement_started_monotonic_ns,
+        measurement_ended_monotonic_ns: runtime.measurement_ended_monotonic_ns,
+        stopped_monotonic_ns,
+        exit_status: status.and_then(|status| status.code()),
+        setup_wall_seconds: runtime
+            .measurement_started_monotonic_ns
+            .saturating_sub(runtime.started_monotonic_ns) as f64
+            / 1_000_000_000.0,
+        setup_cpu_seconds,
+        measurement_cpu_seconds,
+        measurement_cpu_percent: measurement_cpu_seconds / measurement_seconds * 100.0,
+        rss_mean_bytes: mean_u64(&runtime.rss_samples),
+        rss_peak_bytes: runtime.rss_samples.iter().copied().max(),
+        pss_mean_bytes: mean_u64(&runtime.pss_samples),
+        pss_peak_bytes: runtime.pss_samples.iter().copied().max(),
+        outside_worker_scope: runtime.outside_worker_scope,
+        isolated_storage_closed: true,
+    }))
+}
+
+fn wait_process_identity(pid: u32, timeout: Duration) -> Result<u64> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(start_ticks) = read_start_ticks(pid) {
+            return Ok(start_ticks);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    bail!("process identity did not become readable")
+}
+
+fn process_memory(pid: u32) -> (Vec<u64>, Vec<u64>) {
+    let status =
+        parse_key_u64(&fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default());
+    let rss = status
+        .get("VmRSS")
+        .copied()
+        .map(|value| value.saturating_mul(1024))
+        .into_iter()
+        .collect();
+    let pss = fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .ok()
+        .map(|text| parse_key_u64(&text))
+        .and_then(|values| values.get("Pss").copied())
+        .map(|value| value.saturating_mul(1024))
+        .into_iter()
+        .collect();
+    (rss, pss)
+}
+
+fn mean_u64(values: &[u64]) -> Option<f64> {
+    (!values.is_empty())
+        .then(|| values.iter().map(|value| *value as f64).sum::<f64>() / values.len() as f64)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerReady {
     pid: u32,
     start_ticks: u64,
 }
 
-pub fn run_worker(bytes: u64, control_dir: &Path) -> Result<()> {
-    if bytes != HARNESS_DEFAULT_WORKER_BYTES {
-        bail!("Checkpoint 2 worker requires exactly 64 MiB");
+pub fn run_worker(bytes: u64, seed: u64, control_dir: &Path) -> Result<()> {
+    if bytes == 0 || bytes > crate::performance::CHECKPOINT3A_MAX_PAYLOAD_BYTES {
+        bail!("owned synthetic worker payload is out of bounds");
     }
     let pid = std::process::id();
     let start_ticks = read_start_ticks(pid).context("cannot read worker identity")?;
@@ -1441,7 +1784,7 @@ pub fn run_worker(bytes: u64, control_dir: &Path) -> Result<()> {
     let setup_start = Instant::now();
     let mut memory = vec![0u8; usize::try_from(bytes)?];
     for (index, byte) in memory.iter_mut().enumerate() {
-        *byte = ((index / 4096) % 251) as u8 ^ 0x5a;
+        *byte = (((index / 4096 + seed as usize) % 4) as u8) * 0x11;
     }
     let fingerprint = Sha256::digest(&memory);
     let setup_wall_seconds = setup_start.elapsed().as_secs_f64();
@@ -1490,6 +1833,7 @@ fn monitor(
     control_dir: &Path,
     plan: &CgroupHarnessPlan,
     psi_threshold: f64,
+    mut observer: Option<&mut ObserverRuntime>,
 ) -> Result<(Vec<CgroupSample>, WatchdogEvidence)> {
     let started = Instant::now();
     let mut samples = Vec::new();
@@ -1568,7 +1912,27 @@ fn monitor(
             break;
         }
         samples.push(sample);
-        thread::sleep(Duration::from_millis(250));
+        if let Some(runtime) = observer.as_deref_mut() {
+            if read_start_ticks(runtime.identity.pid) != Some(runtime.identity.start_ticks) {
+                watchdog.reason = Some("owned_observer_identity_stale".into());
+                break;
+            }
+            let (rss, pss) = process_memory(runtime.identity.pid);
+            runtime.rss_samples.extend(rss);
+            runtime.pss_samples.extend(pss);
+        }
+        thread::sleep(Duration::from_millis(
+            if plan.measurement_ms >= crate::performance::CHECKPOINT3A_MIN_MEASUREMENT_MS {
+                crate::performance::CHECKPOINT3A_SAMPLE_INTERVAL_MS
+            } else {
+                250
+            },
+        ));
+    }
+    if let Some(runtime) = observer {
+        runtime.measurement_ended_monotonic_ns = now_ns();
+        runtime.measurement_cpu_end_ticks =
+            process_cpu_ticks(runtime.identity.pid).unwrap_or(runtime.measurement_cpu_start_ticks);
     }
     watchdog.triggered = watchdog.reason.is_some();
     Ok((samples, watchdog))
@@ -1606,6 +1970,9 @@ fn collect_cgroup_sample(group: &Path, pid: u32) -> Result<CgroupSample> {
             .ok()
             .and_then(|value| parse_io_stat(&value).ok()),
         memory_pressure: fs::read_to_string(group.join("memory.pressure"))
+            .ok()
+            .and_then(|value| parse_psi(&value).ok()),
+        host_memory_pressure: fs::read_to_string("/proc/pressure/memory")
             .ok()
             .and_then(|value| parse_psi(&value).ok()),
         worker_rss_bytes: status.get("VmRSS").copied().map(|value| value * 1024),
@@ -1743,7 +2110,7 @@ fn read_pids(path: &Path) -> Result<BTreeSet<u32>> {
         .collect::<std::result::Result<_, _>>()?)
 }
 
-fn read_start_ticks(pid: u32) -> Option<u64> {
+pub(crate) fn read_start_ticks(pid: u32) -> Option<u64> {
     read_process_stat(pid).and_then(|fields| fields.get(18).copied())
 }
 
@@ -1759,12 +2126,12 @@ fn read_process_stat(pid: u32) -> Option<Vec<u64>> {
     )
 }
 
-fn process_cpu_ticks(pid: u32) -> Option<u64> {
+pub(crate) fn process_cpu_ticks(pid: u32) -> Option<u64> {
     let fields = read_process_stat(pid)?;
     Some(fields.get(10)?.saturating_add(*fields.get(11)?))
 }
 
-fn detect_clk_tck() -> Option<u64> {
+pub(crate) fn detect_clk_tck() -> Option<u64> {
     let output = Command::new("/usr/bin/getconf")
         .arg("CLK_TCK")
         .output()

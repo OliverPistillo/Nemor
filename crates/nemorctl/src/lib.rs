@@ -475,19 +475,13 @@ pub fn benchmark_history(config_path: &Path) -> Result<Vec<serde_json::Value>> {
 pub fn benchmark_compare(config_path: &Path, experiment_id: &str) -> Result<serde_json::Value> {
     let loaded = LoadedConfig::load(config_path)?;
     let store = benchmark::BenchmarkStore::open_read_only(&loaded.config.general.database_path)?;
-    let runs = store.list_summaries(100)?;
-    let filtered: Vec<_> = runs
-        .into_iter()
-        .filter(|run| {
-            run.get("run_id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|run_id| run_id.contains(experiment_id))
-        })
-        .collect();
+    let comparison = store.comparison(experiment_id).ok();
+    let runs = store.experiment_runs(experiment_id)?;
     Ok(serde_json::json!({
         "experiment_id": experiment_id,
-        "runs": filtered,
-        "comparison_status": "not_evaluated_without_three_comparable_repetitions"
+        "runs": runs,
+        "comparison": comparison,
+        "capacity_gain_percent": "not_evaluated"
     }))
 }
 

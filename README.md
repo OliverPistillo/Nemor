@@ -36,7 +36,8 @@ development; ⚪ planned.
 | Workspace crates | 15 |
 | Tests defined / executed | 433 / 433 |
 | Passed / failed / ignored | 433 / 0 / 0 |
-| Phase 10 validation | framework + privileged transient-scope harness validated; real A/B pending |
+| Phase 10 validation | framework + privileged worker harness validated; observer service and real A/B pending |
+| Checkpoint 3A | blocked pending Checkpoint 3A-P transient DynamicUser observer validation |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -157,6 +158,18 @@ production performance claims.
   PID/start-ticks ownership, a 64 MiB steady worker, watchdog and restore
   model. Its full privileged transient-scope lifecycle passed on CachyOS in
   ATTEMPT 5; this is harness validation, not performance evidence.
+- an explicit Checkpoint 3A fixed-load `synthetic_compressible`
+  `cachyos_baseline`/`nemor_observe` pipeline with clean release-binary
+  provenance, deterministic six-run ordering, isolated exact-owned production
+  observer lifecycle, run-relative counters, per-run restore and
+  observer-overhead comparison. It is implemented but has not yet produced
+  live performance evidence.
+- a Checkpoint 3A-P boundary for one benchmark-owned transient
+  `nemor-benchmark-observer-*.service`. PID 1 creates the real release
+  `nemord` with `DynamicUser=true`, an ephemeral `RuntimeDirectory`, fixed
+  typed argv, production-equivalent hardening and isolated storage. Its
+  simulated lifecycle is implemented; one bounded privileged validation is
+  still required before Checkpoint 3A may run.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process

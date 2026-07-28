@@ -757,6 +757,8 @@ dependencies = [
  "futures-lite",
  "hex",
  "nemor-common",
+ "nemor-storage",
+ "nix",
  "rusqlite",
  "serde",
  "serde_json",

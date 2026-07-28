@@ -12,6 +12,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/nemor/config.toml";
+const BUILD_GIT_HEAD: &str = env!("NEMOR_BUILD_GIT_HEAD");
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Observe-only Nemor daemon")]
@@ -60,6 +61,7 @@ async fn run(loaded: LoadedConfig) -> Result<()> {
         config_path = %loaded.path.display(),
         config_hash = %loaded.sha256,
         mode = %loaded.config.general.mode,
+        build_git_head = BUILD_GIT_HEAD,
         "validated configuration loaded"
     );
 

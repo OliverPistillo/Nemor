@@ -219,6 +219,22 @@ pub struct TransientScopePlan {
 
 impl TransientScopePlan {
     pub fn new(run_id: &str, identity: OwnedProcessIdentity) -> Result<Self> {
+        Self::with_limits(
+            run_id,
+            identity,
+            128 * 1024 * 1024,
+            15_000_000,
+            "Nemor Phase 10 owned cgroup harness validation",
+        )
+    }
+
+    pub fn with_limits(
+        run_id: &str,
+        identity: OwnedProcessIdentity,
+        memory_max: u64,
+        runtime_max_usec: u64,
+        description: &str,
+    ) -> Result<Self> {
         let suffix: String = run_id
             .chars()
             .filter(char::is_ascii_alphanumeric)
@@ -231,10 +247,10 @@ impl TransientScopePlan {
         validate_unit_name(&unit_name)?;
         Ok(Self {
             unit_name,
-            description: "Nemor Phase 10 owned cgroup harness validation".into(),
+            description: description.into(),
             identity,
-            memory_max: 128 * 1024 * 1024,
-            runtime_max_usec: 15_000_000,
+            memory_max,
+            runtime_max_usec,
             memory_accounting: true,
             cpu_accounting: true,
             io_accounting: true,
@@ -244,8 +260,10 @@ impl TransientScopePlan {
 
     pub fn validate(&self) -> Result<()> {
         validate_unit_name(&self.unit_name)?;
-        if self.memory_max != 128 * 1024 * 1024
-            || self.runtime_max_usec != 15_000_000
+        if self.memory_max == 0
+            || self.memory_max > 512 * 1024 * 1024
+            || self.runtime_max_usec < 15_000_000
+            || self.runtime_max_usec > 120_000_000
             || !self.memory_accounting
             || !self.cpu_accounting
             || !self.io_accounting

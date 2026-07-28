@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const MIGRATION_VERSION: i64 = 8;
+pub const MIGRATION_VERSION: i64 = 9;
 pub const INITIAL_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0001_initial.sql"
@@ -50,6 +50,10 @@ pub const KSM_MIGRATION: &str = include_str!(concat!(
 pub const BENCHMARK_MIGRATION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0008_benchmark.sql"
+));
+pub const BENCHMARK_PERFORMANCE_MIGRATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0009_benchmark_performance.sql"
 ));
 
 pub struct Storage {
@@ -256,7 +260,8 @@ impl Storage {
         self.apply_migration(5, DAMON_MIGRATION, false)?;
         self.apply_migration(6, DAMOS_MIGRATION, false)?;
         self.apply_migration(7, KSM_MIGRATION, false)?;
-        self.apply_migration(8, BENCHMARK_MIGRATION, false)
+        self.apply_migration(8, BENCHMARK_MIGRATION, false)?;
+        self.apply_migration(9, BENCHMARK_PERFORMANCE_MIGRATION, false)
     }
 
     pub fn migrate_source(&mut self, source: &str) -> Result<()> {
@@ -1890,6 +1895,7 @@ mod tests {
                 (6, migration_checksum(DAMOS_MIGRATION)),
                 (7, migration_checksum(KSM_MIGRATION)),
                 (8, migration_checksum(BENCHMARK_MIGRATION)),
+                (9, migration_checksum(BENCHMARK_PERFORMANCE_MIGRATION)),
             ]
         );
     }

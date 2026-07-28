@@ -237,3 +237,138 @@ and health evidence. It cannot interpolate beyond tested levels or seek host
 failure. Baseline and candidate must use identical generator and worker hashes,
 loads, seeds, warmup/stabilization, cgroup ceiling, kernel, host fingerprint
 and thermal procedure; a candidate never receives a larger cgroup envelope.
+
+## Checkpoint 3A baseline versus observe
+
+Checkpoint 3A implements the first real `performance_benchmark` path, limited
+to `synthetic_compressible` at one fixed non-pressure load and exactly
+`cachyos_baseline,nemor_observe`. Its comparison purpose is
+`observer_overhead`, never capacity. At least three valid repetitions per
+variant are required. A seeded shuffle persists the complete six-run order,
+variant, repetition and per-run seed; invalid attempts remain evidence and a
+safety failure leaves the remaining planned order explicitly unexecuted.
+
+The default pilot uses 128 MiB of touched payload beneath an identical 256 MiB
+worker `MemoryMax` for both variants. Payload is hard-capped at 256 MiB.
+Observer warmup is five seconds, stabilization is at least two seconds,
+measurement is at least twenty seconds, sampling is one second, and cooldown
+is explicit. Dynamic headroom retains the worker, runtime/rollback margin and
+the larger of one GiB or ten percent of host RAM. OOM and pressure modes are
+not available.
+
+Baseline is the observed CachyOS host—including its existing zram, swap, KSM
+configuration and kernel tuning—with no Nemor observer. Observe adds only one
+exact-owned normal production `nemord` process. The runner writes an isolated
+config whose sole intended difference is its experiment-local SQLite path,
+validates observe/no-mutation settings, records PID/start ticks and independent
+binary/config hashes, warms it up after worker scope verification, keeps it
+outside the worker cgroup, measures CPU and RSS/PSS, and stops only that exact
+identity. Any pre-existing `nemord` contaminates either variant and is never
+adopted or stopped.
+
+Eligibility requires a clean relevant source tree, release runner and observer
+binaries, independently embedded matching Git commits, SHA-256 hashes, config
+hash and source-state identity. Recognized root-level Checkpoint 2/KSM JSON
+validation reports are non-source evidence only when their narrowly
+allow-listed names and bounded JSON content both match. Unknown JSON, nested
+artifacts, relevant untracked inputs and tracked changes remain dirty.
+
+Each repetition uses the validated systemd transient-scope worker boundary,
+records raw bounded samples and run-relative vmstat, CPU, I/O and PSI total
+deltas, verifies exact-owned absence and structural restore, and refuses to
+continue after a safety/restore failure. The experiment persists one
+experiment, all six manifests (including unexecuted ones), samples, summaries
+and the comparison. Percent changes use the baseline arithmetic mean as
+denominator and positive means observe is higher; no significance is claimed
+from three repetitions.
+
+Checkpoint 3A is implemented but not yet live validated. Capacity, maximum
+sustainable load, `capacity_gain_percent`, gaming, OOM avoidance,
+incompressible regression and overall Phase 10 acceptance remain
+`not_evaluated`.
+
+### Checkpoint 3A-P DynamicUser observer boundary
+
+Checkpoint 3A remains blocked until one bounded `harness_validation` proves
+the observer boundary. The worker continues to use the validated transient
+`.scope`; the observer uses an exact benchmark-owned transient `.service`
+created by PID 1 through the direct system D-Bus manager.
+
+Production `nemord.service` uses `DynamicUser=true`, `StateDirectory=nemor`
+mode `0700`, `/var/lib/nemor` as working directory, `UMask=0077`, empty
+bounding and ambient capability sets, `NoNewPrivileges`, strict
+filesystem/home/device/kernel/control-group protection, AF_UNIX-only
+networking with IP denied, native syscall architecture, and foreground
+`/usr/bin/nemord --config /etc/nemor/config.toml`. It defines no
+`RuntimeDirectory` or `SystemCallFilter`.
+
+The transient validation preserves the runtime identity, UMask, capability
+removal, foreground behavior and hardening. Deliberate differences are an
+ephemeral `RuntimeDirectory` instead of persistent `StateDirectory`, no
+restart, bounded start/stop/runtime backstops, read-only bind mounts for the
+approved release binary and config, and an isolated working directory and
+SQLite database below `/run`. These differences prevent production-state
+mutation and growing `/var/lib` validation state.
+
+This difference is classified
+`INTENTIONALLY_DIFFERENT_FOR_EPHEMERAL_STATE_ISOLATION`. Identity and
+hardening remain required-equivalent. `RuntimeDirectoryPreserve=no` is sent
+and read back explicitly, and validation still requires final directory
+absence.
+
+The fixed typed request calls `Manager.Subscribe()` before
+`StartTransientUnit(mode=fail)`, requires the exact returned
+`JobRemoved(result=done)`, and routes lifecycle properties through `Unit` and
+process/resource properties through `Service`. Readiness requires a real
+system telemetry sample persisted by the normal daemon loop. Stop uses the
+same asynchronous contract. Final validity requires process, unit, cgroup and
+runtime-directory absence plus structural restore.
+
+Preparation runs unprivileged and records clean Git/source identity, release
+binary hashes, embedded commit and config hash in an integrity-bound manifest.
+Privileged execution invokes no Git and re-hashes every input before mutation.
+This validation remains `evidence_kind=harness_validation` and
+`performance_claim_eligible=false`.
+
+`nemor-benchmark provenance --require-clean-release` is the authoritative
+future source barrier. It uses the same Rust classification as preparation:
+tracked changes and relevant untracked inputs are dirty, while only
+recognized, bounded, valid, root-level Checkpoint 2/KSM report JSON is
+non-source evidence. Shell-level `git status --porcelain` emptiness is not an
+equivalent policy.
+
+The prepared directory must be absolute, non-symlink, owned by the preparing
+UID and not group/world writable. Manifest and config must be bounded,
+regular, single-link files with matching ownership and safe modes. The
+observer must be the exact regular, single-link sibling release binary.
+Privileged execution repeats these checks, stages exact config bytes with
+`create_new` beneath `/run`, syncs and re-hashes them, and removes only the
+exact generated staging file.
+
+The later matched 3A timeline is fixed: after worker-scope verification,
+observe performs separately-accounted service setup; both variants then
+receive the same five-second hold—idle for baseline and observer-alive warmup
+for observe—before worker allocation, generation and prefault. READY is
+followed by at least two seconds stabilization, at least twenty seconds
+measurement, cleanup and two seconds cooldown. Observer setup wall/CPU remains
+outside sustained measurement CPU.
+
+## `nemor_capacity` readiness gap
+
+The policy engine and cgroup actuator expose deterministic planning and owned
+apply/rollback/recovery primitives. Zram and tiering expose owned
+transaction/rollback APIs, but Phase 6 zswap+NVMe boot validation is still
+pending and the host-equivalent zram state is not an independent candidate.
+DAMON monitor-only, controlled DAMOS and selective KSM have real host
+validation only within their specific ownership boundaries; DAMOS/KSM live
+paths remain controlled harness capabilities, not a production combined
+profile.
+
+What is missing is one versioned `nemor_capacity` orchestration contract that
+selects an evidence-backed subset, proves compatible ownership and ordering,
+defines a single audit/rollback/recovery transaction, resolves the resulting
+effective state, and validates it live before becoming executable. Arbitrarily
+enabling every optimizer would violate the existing boundaries. The minimum
+next step is a plan-only candidate manifest and simulated failure matrix for
+one conservative component set, followed by a separate bounded owned-host
+orchestration validation. Checkpoint 3A does not implement that candidate.

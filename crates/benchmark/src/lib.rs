@@ -11,6 +11,8 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod harness;
+pub mod observer_service;
+pub mod performance;
 pub mod systemd;
 
 pub const BENCHMARK_SCHEMA_VERSION: u32 = 1;
@@ -19,6 +21,7 @@ pub const DEFAULT_MAX_SAMPLES: usize = 4_096;
 pub const SMOKE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 pub const HARNESS_DEFAULT_WORKER_BYTES: u64 = 64 * 1024 * 1024;
 pub const HARNESS_MAX_WORKER_BYTES: u64 = 128 * 1024 * 1024;
+pub const BUILD_GIT_HEAD: &str = env!("NEMOR_BUILD_GIT_HEAD");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,15 +53,16 @@ impl BuildProvenance {
     pub fn capture() -> Result<Self> {
         let git_head = fixed_git(&["rev-parse", "HEAD"])?;
         let status = fixed_git(&["status", "--porcelain=v1", "--untracked-files=all"])?;
-        let git_dirty = status.lines().any(|line| {
-            let relative = line.get(3..).unwrap_or_default();
-            !relative.starts_with("ksm-attempt") && !relative.starts_with("target/")
-        });
+        let git_dirty = BUILD_GIT_HEAD != git_head
+            || status
+                .lines()
+                .any(|line| status_entry_is_relevant(Path::new("."), line));
         let diff = fixed_git_bytes(&["diff", "--binary", "HEAD"])?;
         let mut extra_sources = Vec::new();
         for line in status.lines() {
             let relative = line.get(3..).unwrap_or_default();
-            if relative.starts_with("ksm-attempt") || relative.starts_with("target/") {
+            if relative.starts_with("target/") || is_known_validation_artifact(Path::new(relative))
+            {
                 continue;
             }
             if line.starts_with("?? ") {
@@ -91,6 +95,51 @@ impl BuildProvenance {
             development_build: git_dirty,
         })
     }
+
+    #[must_use]
+    pub fn clean_release_eligible(&self) -> bool {
+        !self.git_dirty && self.build_profile == "release" && !self.development_build
+    }
+}
+
+pub fn is_known_validation_artifact(path: &Path) -> bool {
+    is_known_validation_artifact_at(Path::new("."), path)
+}
+
+pub fn is_known_validation_artifact_at(root: &Path, path: &Path) -> bool {
+    if path.parent().is_some_and(|parent| parent != Path::new("")) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    recognized_validation_artifact_name(name)
+        && fs::read(root.join(path))
+            .ok()
+            .is_some_and(|bytes| validation_artifact_content_is_bounded_json(&bytes))
+}
+
+pub fn status_entry_is_relevant(root: &Path, status_line: &str) -> bool {
+    let relative = status_line.get(3..).unwrap_or_default();
+    !relative.starts_with("target/") && !is_known_validation_artifact_at(root, Path::new(relative))
+}
+
+pub fn recognized_validation_artifact_name(name: &str) -> bool {
+    name.strip_prefix("ksm-attempt")
+        .and_then(|rest| rest.strip_suffix("-report.json"))
+        .is_some_and(|attempt| !attempt.is_empty() && attempt.chars().all(|c| c.is_ascii_digit()))
+        || name == "phase10-checkpoint2-report.json"
+        || name
+            .strip_prefix("phase10-checkpoint2-attempt")
+            .and_then(|rest| rest.strip_suffix("-report.json"))
+            .is_some_and(|attempt| {
+                !attempt.is_empty() && attempt.chars().all(|c| c.is_ascii_digit())
+            })
+}
+
+pub fn validation_artifact_content_is_bounded_json(bytes: &[u8]) -> bool {
+    bytes.len() <= 16 * 1024 * 1024
+        && serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|value| value.is_object())
 }
 
 pub fn calculate_source_state_id(
@@ -1801,6 +1850,25 @@ impl BenchmarkStore {
         let raw: String = self.connection.query_row(
             "SELECT manifest_json FROM benchmark_run_manifests WHERE id=?1",
             [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
+    pub fn experiment_runs(&self, experiment_id: &str) -> Result<Vec<serde_json::Value>> {
+        let mut statement = self.connection.prepare(
+            "SELECT manifest_json FROM benchmark_run_manifests
+             WHERE experiment_id=?1 ORDER BY run_order",
+        )?;
+        let rows = statement.query_map([experiment_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn comparison(&self, experiment_id: &str) -> Result<serde_json::Value> {
+        let raw: String = self.connection.query_row(
+            "SELECT comparison_json FROM benchmark_comparisons
+             WHERE experiment_id=?1 ORDER BY created_at_ns DESC LIMIT 1",
+            [experiment_id],
             |row| row.get(0),
         )?;
         Ok(serde_json::from_str(&raw)?)
