@@ -118,6 +118,8 @@ enum Command {
         execute: bool,
     },
     PrepareExperiment {
+        #[arg(long, default_value = "synthetic_incompressible")]
+        scenario: String,
         #[arg(long, default_value = ".")]
         repository: PathBuf,
         #[arg(long, default_value = "config/default.toml")]
@@ -157,6 +159,8 @@ enum Command {
         bytes: u64,
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        #[arg(long, default_value = "compressible")]
+        pattern: String,
         #[arg(long)]
         control_dir: PathBuf,
     },
@@ -314,6 +318,7 @@ fn run() -> Result<i32> {
                 performance_profile: None,
                 observer: None,
                 worker_seed: 0,
+                worker_pattern: nemor_benchmark::SyntheticPattern::Compressible,
             };
             let (report, path) = nemor_benchmark::harness::run_live(&options)?;
             println!(
@@ -489,6 +494,7 @@ fn run() -> Result<i32> {
             }
         }
         Command::PrepareExperiment {
+            scenario,
             repository,
             config,
             observer_binary,
@@ -498,6 +504,7 @@ fn run() -> Result<i32> {
             payload_bytes,
         } => {
             let path = nemor_benchmark::performance::prepare_experiment_manifest(
+                &scenario,
                 &repository,
                 &config,
                 &observer_binary,
@@ -545,9 +552,15 @@ fn run() -> Result<i32> {
         Command::WorkerHold {
             bytes,
             seed,
+            pattern,
             control_dir,
         } => {
-            nemor_benchmark::harness::run_worker(bytes, seed, &control_dir)?;
+            let pattern = match pattern.as_str() {
+                "compressible" => nemor_benchmark::SyntheticPattern::Compressible,
+                "incompressible" => nemor_benchmark::SyntheticPattern::Incompressible,
+                _ => bail!("unsupported synthetic worker pattern"),
+            };
+            nemor_benchmark::harness::run_worker(bytes, seed, pattern, &control_dir)?;
         }
     }
     Ok(0)

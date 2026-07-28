@@ -338,8 +338,13 @@ Checkpoint 3A execution bridge now reuses this DynamicUser systemd service;
 the raw child observer path is not reachable for performance evidence.
 Unprivileged preparation freezes an integrity-bound manifest and privileged
 execution consumes only that manifest. Real Checkpoint 3A baseline-versus-
-observe A/B performance validation is the next checkpoint. Phase 10 remains
-in development. The bridge hardening also requires a read-only manifest host
+observe A/B performance validation is CLOSED / PASS. Six V3 runs completed;
+the original invalid classification came from the full-environment versus
+material-environment hash-domain validator defect. Immutable evidence was
+preserved, and exact bounded offline revalidation returned
+`REVALIDATED_PASS` for three baseline and three observe repetitions. The
+observer-overhead comparison is comparable, with no significance claim from
+only three repetitions. The bridge hardening also requires a read-only manifest host
 preflight before authorization, exact transaction/output roles, and execution
 via `sudo` by the preparing user identity. Phase 6 zswap+NVMe boot
 validation remains pending on dedicated hardware.
@@ -354,7 +359,14 @@ Checkpoint 3A Experiment 1 Execution Attempt 2 completed six real runs. The
 historical report recorded all six invalid because the released RunEvidence
 validator compared material and full environment hash domains. The original
 report, manifest, and SQLite evidence are immutable; only the new unprivileged
-offline revalidator may derive a corrected result.
+offline revalidator may derive a corrected result. That bounded revalidation
+has now returned `REVALIDATED_PASS`, closing Checkpoint 3A without a V4.
+Capacity, gaming, OOM avoidance and effectiveness remain `not_evaluated`.
+
+Checkpoint 3B is the next validation step and reuses this exact privileged
+boundary for a bounded `synthetic_incompressible` baseline/observe pilot.
+Only framework and tests are present: no live 3B manifest has been prepared,
+no host preflight has run and no privileged A/B execution has started.
 
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,

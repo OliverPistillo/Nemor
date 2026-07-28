@@ -556,6 +556,9 @@ pub struct WorkerResult {
     pub full_prefault_passes: u64,
     pub full_rewrite_passes_during_measurement: u64,
     pub fingerprint_valid: bool,
+    pub payload_fingerprint_sha256: String,
+    pub generator_id: String,
+    pub generator_version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,6 +604,7 @@ pub struct HarnessOptions {
     pub performance_profile: Option<crate::performance::PerformanceProfile>,
     pub observer: Option<ObserverLaunch>,
     pub worker_seed: u64,
+    pub worker_pattern: crate::SyntheticPattern,
 }
 
 #[derive(Debug, Clone)]
@@ -641,6 +645,7 @@ impl Default for HarnessOptions {
             performance_profile: None,
             observer: None,
             worker_seed: 0,
+            worker_pattern: crate::SyntheticPattern::Compressible,
         }
     }
 }
@@ -747,7 +752,12 @@ pub fn run_live_with_provenance(
         GateState::Pass,
         "dynamic reserve and rollback headroom satisfied",
     );
-    let mut child = spawn_worker(options.worker_bytes, options.worker_seed, &control_dir)?;
+    let mut child = spawn_worker(
+        options.worker_bytes,
+        options.worker_seed,
+        options.worker_pattern,
+        &control_dir,
+    )?;
     let mut observer_runtime = None;
     set_gate(
         &mut gates,
@@ -1607,7 +1617,12 @@ fn cleanup_live(
     Ok(())
 }
 
-fn spawn_worker(bytes: u64, seed: u64, control_dir: &Path) -> Result<Child> {
+fn spawn_worker(
+    bytes: u64,
+    seed: u64,
+    pattern: crate::SyntheticPattern,
+    control_dir: &Path,
+) -> Result<Child> {
     let executable = std::env::current_exe()?;
     Ok(Command::new(executable)
         .arg("worker-hold")
@@ -1615,6 +1630,11 @@ fn spawn_worker(bytes: u64, seed: u64, control_dir: &Path) -> Result<Child> {
         .arg(bytes.to_string())
         .arg("--seed")
         .arg(seed.to_string())
+        .arg("--pattern")
+        .arg(match pattern {
+            crate::SyntheticPattern::Compressible => "compressible",
+            crate::SyntheticPattern::Incompressible => "incompressible",
+        })
         .arg("--control-dir")
         .arg(control_dir)
         .stdin(Stdio::null())
@@ -1771,7 +1791,12 @@ struct WorkerReady {
     start_ticks: u64,
 }
 
-pub fn run_worker(bytes: u64, seed: u64, control_dir: &Path) -> Result<()> {
+pub fn run_worker(
+    bytes: u64,
+    seed: u64,
+    pattern: crate::SyntheticPattern,
+    control_dir: &Path,
+) -> Result<()> {
     if bytes == 0 || bytes > crate::performance::CHECKPOINT3A_MAX_PAYLOAD_BYTES {
         bail!("owned synthetic worker payload is out of bounds");
     }
@@ -1789,7 +1814,12 @@ pub fn run_worker(bytes: u64, seed: u64, control_dir: &Path) -> Result<()> {
     let setup_start = Instant::now();
     let mut memory = vec![0u8; usize::try_from(bytes)?];
     for (index, byte) in memory.iter_mut().enumerate() {
-        *byte = (((index / 4096 + seed as usize) % 4) as u8) * 0x11;
+        *byte = match pattern {
+            crate::SyntheticPattern::Compressible => {
+                (((index / 4096 + seed as usize) % 4) as u8) * 0x11
+            }
+            crate::SyntheticPattern::Incompressible => crate::synthetic_byte(pattern, seed, index),
+        };
     }
     let fingerprint = Sha256::digest(&memory);
     let setup_wall_seconds = setup_start.elapsed().as_secs_f64();
@@ -1820,6 +1850,15 @@ pub fn run_worker(bytes: u64, seed: u64, control_dir: &Path) -> Result<()> {
         full_prefault_passes: 1,
         full_rewrite_passes_during_measurement: 0,
         fingerprint_valid: Sha256::digest(&memory).as_slice() == fingerprint.as_slice(),
+        payload_fingerprint_sha256: hex::encode(fingerprint),
+        generator_id: match pattern {
+            crate::SyntheticPattern::Compressible => crate::performance::COMPRESSIBLE_GENERATOR_ID,
+            crate::SyntheticPattern::Incompressible => {
+                crate::performance::INCOMPRESSIBLE_GENERATOR_ID
+            }
+        }
+        .into(),
+        generator_version: crate::performance::SYNTHETIC_GENERATOR_VERSION,
     };
     fs::write(
         control_dir.join("result.json"),

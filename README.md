@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 Framework + privileged harness + hardened 3A execution bridge validated / real A/B pending |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 Checkpoint 3A CLOSED / PASS; Checkpoint 3B framework ready |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -34,11 +34,12 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 503 / 503 |
-| Passed / failed / ignored | 503 / 0 / 0 |
-| Phase 10 validation | framework + privileged worker harness + 3A-P observer pipeline validated; real A/B pending |
+| Tests defined / executed | 511 / 511 |
+| Passed / failed / ignored | 511 / 0 / 0 |
+| Phase 10 validation | Checkpoint 3A CLOSED / PASS; incompressible Checkpoint 3B framework ready |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
-| Checkpoint 3A | Experiment 1 V1 collision rejected, V2 preflighted, V3 six-run Attempt 2 preserved with recorded hash-domain invalidity; offline revalidation pending |
+| Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
+| Checkpoint 3B | `synthetic_incompressible` baseline/observe framework ready; live preparation not started |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -165,7 +166,20 @@ production performance claims.
   observer lifecycle, run-relative counters, per-run restore and
   observer-overhead comparison. Preparation is unprivileged and freezes an
   integrity-bound manifest; privileged execution consumes only that manifest.
-  It has not yet produced live performance evidence.
+  Six real V3 runs completed (three baseline and three observe). Their original
+  invalid state was caused solely by the fixed full-environment versus material-
+  environment hash-domain validator defect. The immutable evidence was preserved
+  and exact bounded offline revalidation returned `REVALIDATED_PASS`; the
+  observer-overhead comparison is comparable. With only three repetitions no
+  significance claim is made. Checkpoint 3A is CLOSED / PASS.
+- a Checkpoint 3B `synthetic_incompressible` extension of the same prepared-
+  manifest, transient worker, DynamicUser observer, evidence, restore and
+  comparison architecture. Its deterministic SplitMix64 generator is bound by
+  scenario, generator identity/version, seed, payload, and worker-manifest
+  evidence; generation and prefault finish before measurement, with bounded
+  integrity reads and no sustained rewrite. The initial 128 MiB/256 MiB,
+  non-pressure three-plus-three observer-overhead profile is framework-only;
+  no live 3B preparation or execution has occurred.
 - a Checkpoint 3A-P boundary for one benchmark-owned transient
   `nemor-benchmark-observer-*.service`. PID 1 creates the real release
   `nemord` with `DynamicUser=true`, an ephemeral `RuntimeDirectory`, fixed
@@ -175,7 +189,8 @@ production performance claims.
   the user-owned Cargo inode directly. Its
   privileged pipeline validation passed on CachyOS in Checkpoint 3A-P ATTEMPT
   3. The three-attempt history is retained, and this harness evidence makes
-  no performance claim; Checkpoint 3A real A/B remains next.
+  no performance claim; its boundary is reused by the closed Checkpoint 3A and
+  the ready Checkpoint 3B framework.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process

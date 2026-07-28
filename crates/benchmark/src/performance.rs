@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CHECKPOINT3A_SCENARIO: &str = "synthetic_compressible";
+pub const CHECKPOINT3B_SCENARIO: &str = "synthetic_incompressible";
+pub const COMPRESSIBLE_GENERATOR_ID: &str = "nemor.synthetic.compressible";
+pub const INCOMPRESSIBLE_GENERATOR_ID: &str = "nemor.synthetic.splitmix64";
+pub const SYNTHETIC_GENERATOR_VERSION: u32 = 1;
 pub const CHECKPOINT3A_MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub const CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
 pub const CHECKPOINT3A_MIN_MEASUREMENT_MS: u64 = 20_000;
@@ -71,6 +75,10 @@ impl PerformanceProfile {
         Ok(profile)
     }
 
+    pub fn checkpoint3b(payload_bytes: u64) -> Result<Self> {
+        Self::checkpoint3a(payload_bytes)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.logical_payload_bytes > CHECKPOINT3A_MAX_PAYLOAD_BYTES
             || self.worker_memory_max_bytes
@@ -88,6 +96,60 @@ impl PerformanceProfile {
         }
         Ok(())
     }
+}
+
+pub fn generator_contract(scenario: &str) -> Result<(&'static str, u32, crate::SyntheticPattern)> {
+    match scenario {
+        CHECKPOINT3A_SCENARIO => Ok((
+            COMPRESSIBLE_GENERATOR_ID,
+            SYNTHETIC_GENERATOR_VERSION,
+            crate::SyntheticPattern::Compressible,
+        )),
+        CHECKPOINT3B_SCENARIO => Ok((
+            INCOMPRESSIBLE_GENERATOR_ID,
+            SYNTHETIC_GENERATOR_VERSION,
+            crate::SyntheticPattern::Incompressible,
+        )),
+        _ => bail!("performance checkpoint supports only synthetic_compressible or synthetic_incompressible"),
+    }
+}
+
+pub fn workload_identity(
+    scenario: &str,
+    generator_id: &str,
+    generator_version: u32,
+    seed: u64,
+    payload_bytes: u64,
+) -> Result<String> {
+    let (expected_id, expected_version, _) = generator_contract(scenario)?;
+    if generator_id != expected_id || generator_version != expected_version {
+        bail!("scenario and generator identity/version do not match");
+    }
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+        &serde_json::json!({
+            "scenario": scenario,
+            "generator_id": generator_id,
+            "generator_version": generator_version,
+            "seed": seed,
+            "payload_bytes": payload_bytes,
+        }),
+    )?)))
+}
+
+pub fn worker_manifest_hash(plan: &ExperimentPlan) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+        &serde_json::json!({
+            "scenario": plan.scenario,
+            "scenario_version": plan.scenario_version,
+            "payload": plan.profile.logical_payload_bytes,
+            "memory_max": plan.profile.worker_memory_max_bytes,
+            "pre_measurement_hold_ms": plan.profile.pre_measurement_hold_ms,
+            "measurement_ms": plan.profile.measurement_ms,
+            "sample_interval_ms": plan.profile.sample_interval_ms,
+            "generator_id": plan.generator_id,
+            "generator_version": plan.generator_version
+        }),
+    )?)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,6 +198,10 @@ pub struct ExperimentPlan {
     pub experiment_id: String,
     pub scenario: String,
     pub scenario_version: u32,
+    #[serde(default = "default_compressible_generator_id")]
+    pub generator_id: String,
+    #[serde(default = "default_generator_version")]
+    pub generator_version: u32,
     pub evidence_kind: EvidenceKind,
     pub comparison_purpose: ComparisonPurpose,
     pub variants: Vec<BenchmarkVariant>,
@@ -154,6 +220,14 @@ pub struct ExperimentPlan {
     pub thermal_state_unverified: bool,
     pub performance_claim_eligible: bool,
     pub capacity_gain_percent: EvaluationState,
+}
+
+fn default_compressible_generator_id() -> String {
+    COMPRESSIBLE_GENERATOR_ID.into()
+}
+
+const fn default_generator_version() -> u32 {
+    SYNTHETIC_GENERATOR_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,8 +261,8 @@ pub struct ExperimentInputs<'a> {
     pub observer_binary_path: &'a Path,
 }
 
-pub const PREPARED_EXPERIMENT_SCHEMA_VERSION: u32 = 2;
-pub const RUN_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+pub const PREPARED_EXPERIMENT_SCHEMA_VERSION: u32 = 3;
+pub const RUN_EVIDENCE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedExperimentPayload {
@@ -227,7 +301,12 @@ pub(crate) fn checkpoint3a_observer_run_id(
     order_index: usize,
     repetition_index: usize,
 ) -> String {
-    format!("c3a-o{order_index}-r{repetition_index}-{experiment_id}")
+    let checkpoint = if experiment_id.starts_with("checkpoint3b-") {
+        "c3b"
+    } else {
+        "c3a"
+    };
+    format!("{checkpoint}-o{order_index}-r{repetition_index}-{experiment_id}")
 }
 
 pub(crate) fn validate_observer_run_uniqueness(runs: &[PreparedObserveRun]) -> Result<()> {
@@ -297,8 +376,10 @@ impl PreparedExperimentManifest {
             bail!("prepared experiment directory ownership or mode is unsafe")
         }
         self.payload.plan.profile.validate()?;
-        if self.payload.plan.scenario != CHECKPOINT3A_SCENARIO
-            || self.payload.plan.scenario_version != 1
+        let (generator_id, generator_version, _) = generator_contract(&self.payload.plan.scenario)?;
+        if self.payload.plan.scenario_version != 1
+            || self.payload.plan.generator_id != generator_id
+            || self.payload.plan.generator_version != generator_version
             || self.payload.plan.repetitions != 3
             || self.payload.plan.variants
                 != [
@@ -307,10 +388,13 @@ impl PreparedExperimentManifest {
                 ]
             || self.payload.plan.randomized_order.len() != 6
         {
-            bail!("prepared plan is not the exact Checkpoint 3A experiment contract")
+            bail!("prepared plan is not the exact fixed-load performance experiment contract")
         }
-        let expected_profile =
-            PerformanceProfile::checkpoint3a(self.payload.plan.profile.logical_payload_bytes)?;
+        let expected_profile = if self.payload.plan.scenario == CHECKPOINT3B_SCENARIO {
+            PerformanceProfile::checkpoint3b(self.payload.plan.profile.logical_payload_bytes)?
+        } else {
+            PerformanceProfile::checkpoint3a(self.payload.plan.profile.logical_payload_bytes)?
+        };
         if self.payload.plan.profile != expected_profile {
             bail!("prepared performance profile differs from Checkpoint 3A defaults")
         }
@@ -530,6 +614,7 @@ impl PreparedExperimentManifest {
 
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_experiment_manifest(
+    scenario: &str,
     repository: &Path,
     config: &Path,
     observer_binary: &Path,
@@ -557,7 +642,7 @@ pub fn prepare_experiment_manifest(
         BenchmarkVariant::NemorObserve,
     ];
     let inputs = ExperimentInputs {
-        scenario: CHECKPOINT3A_SCENARIO,
+        scenario,
         variants: &variants,
         repetitions: 3,
         seed,
@@ -1149,9 +1234,7 @@ pub fn preflight_prepared_experiment(manifest_path: &Path) -> Result<serde_json:
 }
 
 pub fn plan_experiment(inputs: &ExperimentInputs<'_>) -> Result<ExperimentPlan> {
-    if inputs.scenario != CHECKPOINT3A_SCENARIO {
-        bail!("Checkpoint 3A supports only synthetic_compressible");
-    }
+    let (generator_id, generator_version, _) = generator_contract(inputs.scenario)?;
     if inputs.variants
         != [
             BenchmarkVariant::CachyosBaseline,
@@ -1201,16 +1284,30 @@ pub fn plan_experiment(inputs: &ExperimentInputs<'_>) -> Result<ExperimentPlan> 
         && observer_binary.build_profile == "release";
     Ok(ExperimentPlan {
         schema_version: BENCHMARK_SCHEMA_VERSION,
-        experiment_id: format!("checkpoint3a-{}", now_ns()),
+        experiment_id: format!(
+            "{}-{}",
+            if inputs.scenario == CHECKPOINT3B_SCENARIO {
+                "checkpoint3b"
+            } else {
+                "checkpoint3a"
+            },
+            now_ns()
+        ),
         scenario: inputs.scenario.into(),
         scenario_version: 1,
+        generator_id: generator_id.into(),
+        generator_version,
         evidence_kind: EvidenceKind::PerformanceBenchmark,
         comparison_purpose: ComparisonPurpose::ObserverOverhead,
         variants: inputs.variants.to_vec(),
         repetitions: inputs.repetitions,
         experiment_seed: inputs.seed,
         randomized_order,
-        profile: PerformanceProfile::checkpoint3a(inputs.payload_bytes)?,
+        profile: if inputs.scenario == CHECKPOINT3B_SCENARIO {
+            PerformanceProfile::checkpoint3b(inputs.payload_bytes)?
+        } else {
+            PerformanceProfile::checkpoint3a(inputs.payload_bytes)?
+        },
         provenance,
         benchmark_binary,
         observer_binary,
@@ -1223,6 +1320,18 @@ pub fn plan_experiment(inputs: &ExperimentInputs<'_>) -> Result<ExperimentPlan> 
         performance_claim_eligible,
         capacity_gain_percent: EvaluationState::NotEvaluated,
     })
+}
+
+pub fn plan_checkpoint3b(inputs: &ExperimentInputs<'_>) -> Result<ExperimentPlan> {
+    validate_checkpoint3b_scenario(inputs.scenario)?;
+    plan_experiment(inputs)
+}
+
+pub fn validate_checkpoint3b_scenario(scenario: &str) -> Result<()> {
+    if scenario != CHECKPOINT3B_SCENARIO {
+        bail!("Checkpoint 3B supports only synthetic_incompressible");
+    }
+    Ok(())
 }
 
 pub fn require_live_eligibility(plan: &ExperimentPlan) -> Result<()> {
@@ -1455,6 +1564,14 @@ pub struct RunEvidence {
     pub benchmark_binary_sha256: String,
     pub observer_binary_sha256: Option<String>,
     pub worker_manifest_hash: String,
+    #[serde(default = "default_compressible_generator_id")]
+    pub generator_id: String,
+    #[serde(default = "default_generator_version")]
+    pub generator_version: u32,
+    #[serde(default)]
+    pub workload_identity: String,
+    #[serde(default)]
+    pub payload_fingerprint_sha256: String,
     pub worker_cgroup_memory_max: u64,
     pub logical_payload_bytes: u64,
     pub measurement_ms: u64,
@@ -1481,6 +1598,17 @@ impl RunEvidence {
         if self.run_evidence_schema_version != RUN_EVIDENCE_SCHEMA_VERSION
             || self.material_environment_hash != plan.material_environment_hash
             || self.benchmark_binary_sha256 != plan.benchmark_binary.sha256
+            || self.generator_id != plan.generator_id
+            || self.generator_version != plan.generator_version
+            || self.workload_identity
+                != workload_identity(
+                    &plan.scenario,
+                    &plan.generator_id,
+                    plan.generator_version,
+                    self.planned.run_seed,
+                    plan.profile.logical_payload_bytes,
+                )?
+            || self.payload_fingerprint_sha256.is_empty()
             || self.worker_cgroup_memory_max != plan.profile.worker_memory_max_bytes
             || self.logical_payload_bytes != plan.profile.logical_payload_bytes
             || self.measurement_ms < CHECKPOINT3A_MIN_MEASUREMENT_MS
@@ -1763,6 +1891,7 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
             performance_profile: Some(plan.profile.clone()),
             observer,
             worker_seed: planned.run_seed,
+            worker_pattern: generator_contract(&plan.scenario)?.2,
         };
         let (report, _) =
             crate::harness::run_live_with_provenance(&options, Some(&plan.provenance))?;
@@ -1777,17 +1906,7 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
             .iter()
             .filter_map(|sample| sample.memory_current)
             .collect::<Vec<_>>();
-        let worker_manifest_hash =
-            hex::encode(Sha256::digest(serde_json::to_vec(&serde_json::json!({
-                "scenario": plan.scenario,
-                "scenario_version": plan.scenario_version,
-                "payload": plan.profile.logical_payload_bytes,
-                "memory_max": plan.profile.worker_memory_max_bytes,
-                "pre_measurement_hold_ms": plan.profile.pre_measurement_hold_ms,
-                "measurement_ms": plan.profile.measurement_ms,
-                "sample_interval_ms": plan.profile.sample_interval_ms,
-                "worker_generator_version": 1
-            }))?));
+        let worker_manifest_hash = worker_manifest_hash(plan)?;
         let oom = report
             .samples
             .last()
@@ -1801,6 +1920,7 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
             .copied()
             .unwrap_or(0);
         let observer = report.observer;
+        let worker_result = report.worker_result.as_ref();
         let observer_cleanup_failed =
             planned.variant == BenchmarkVariant::NemorObserve && observer.is_none();
         let invalid_reason = report
@@ -1827,6 +1947,18 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
                 .as_ref()
                 .map(|evidence| evidence.binary_sha256.clone()),
             worker_manifest_hash,
+            generator_id: plan.generator_id.clone(),
+            generator_version: plan.generator_version,
+            workload_identity: workload_identity(
+                &plan.scenario,
+                &plan.generator_id,
+                plan.generator_version,
+                planned.run_seed,
+                plan.profile.logical_payload_bytes,
+            )?,
+            payload_fingerprint_sha256: worker_result
+                .map(|result| result.payload_fingerprint_sha256.clone())
+                .unwrap_or_default(),
             worker_cgroup_memory_max: report.plan.memory_max_bytes,
             logical_payload_bytes: report.plan.worker_bytes,
             measurement_ms: report.plan.measurement_ms,
@@ -1842,8 +1974,11 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
             watchdog_triggered: report.watchdog.triggered,
             oom,
             oom_kill,
-            worker_integrity_valid: report.worker_result.as_ref().is_some_and(|result| {
-                result.fingerprint_valid && result.full_rewrite_passes_during_measurement == 0
+            worker_integrity_valid: worker_result.is_some_and(|result| {
+                result.fingerprint_valid
+                    && result.full_rewrite_passes_during_measurement == 0
+                    && result.generator_id == plan.generator_id
+                    && result.generator_version == plan.generator_version
             }),
             restore_passed: !observer_cleanup_failed
                 && report.structural_restore_passed
@@ -2032,23 +2167,45 @@ pub fn compare_observer_overhead(
         .iter()
         .map(|run| run.worker_manifest_hash.as_str())
         .collect::<BTreeSet<_>>();
-    if environment_hashes.len() != 1 || worker_manifests.len() != 1 {
-        bail!("material environment or worker manifest mismatch");
+    let generators = valid
+        .iter()
+        .map(|run| (run.generator_id.as_str(), run.generator_version))
+        .collect::<BTreeSet<_>>();
+    if environment_hashes.len() != 1 || worker_manifests.len() != 1 || generators.len() != 1 {
+        bail!("material environment, worker manifest, or generator mismatch");
     }
     let mut paired_seeds = BTreeMap::<usize, BTreeMap<BenchmarkVariant, u64>>::new();
+    let mut paired_workloads = BTreeMap::<usize, BTreeMap<BenchmarkVariant, &str>>::new();
+    let mut paired_payloads = BTreeMap::<usize, BTreeMap<BenchmarkVariant, &str>>::new();
     for run in &valid {
         paired_seeds
             .entry(run.planned.repetition_index)
             .or_default()
             .insert(run.planned.variant, run.planned.run_seed);
+        paired_workloads
+            .entry(run.planned.repetition_index)
+            .or_default()
+            .insert(run.planned.variant, &run.workload_identity);
+        paired_payloads
+            .entry(run.planned.repetition_index)
+            .or_default()
+            .insert(run.planned.variant, &run.payload_fingerprint_sha256);
     }
     if paired_seeds.len() < MIN_REPETITIONS
         || paired_seeds.values().any(|pair| {
             pair.get(&BenchmarkVariant::CachyosBaseline)
                 != pair.get(&BenchmarkVariant::NemorObserve)
         })
+        || paired_workloads.values().any(|pair| {
+            pair.get(&BenchmarkVariant::CachyosBaseline)
+                != pair.get(&BenchmarkVariant::NemorObserve)
+        })
+        || paired_payloads.values().any(|pair| {
+            pair.get(&BenchmarkVariant::CachyosBaseline)
+                != pair.get(&BenchmarkVariant::NemorObserve)
+        })
     {
-        bail!("baseline and observe repetitions do not have paired run seeds");
+        bail!("baseline and observe repetitions do not have paired workload identities");
     }
     let mut comparisons = BTreeMap::new();
     let mut observer_metrics = BTreeMap::new();

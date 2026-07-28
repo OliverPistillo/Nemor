@@ -283,8 +283,7 @@ denominator and positive means observe is higher; no significance is claimed
 from three repetitions.
 
 Checkpoint 3A-P is validated and the 3A execution bridge reuses its transient
-observer-service lifecycle. Checkpoint 3A remains pending its real baseline
-versus observe A/B performance experiment. Preparation is unprivileged and
+observer-service lifecycle. Checkpoint 3A is CLOSED / PASS. Preparation is unprivileged and
 freezes an integrity-bound manifest; privileged execution consumes only that
 manifest. The bridge now freezes one prepared observer config and service plan
 per observe repetition; each config points at that plan's isolated
@@ -295,9 +294,8 @@ Final pre-live gates also require exact Checkpoint 3A plan/profile reconstructio
 safe output roles, conservative headroom parity with the live cgroup plan, and
 an empty set of pre-existing benchmark transient units. Live execution must be
 invoked through `sudo` by the same UID/GID that prepared the manifest.
-Capacity, maximum sustainable
-load, `capacity_gain_percent`, gaming, OOM avoidance, incompressible
-regression and overall Phase 10 acceptance remain `not_evaluated`.
+Capacity, maximum sustainable load, `capacity_gain_percent`, gaming, OOM
+avoidance and effectiveness remain `not_evaluated`.
 
 The execution bridge is explicit: an unprivileged `prepare-experiment` command
 freezes the release identities, environment, six-run seeded order, profile,
@@ -323,11 +321,47 @@ change A/B environment identity.
 
 Preparation V3 passed both user and root read-only preflight and was executed
 once as Checkpoint 3A Experiment 1 Execution Attempt 2. Six real runs
-completed, but the released runner marked all six invalid because RunEvidence
-compared the material environment hash with the full observational plan hash.
-The immutable report and SQLite evidence remain preserved. The run-evidence
-domain fix and exact offline revalidation now determine whether another
-preparation is necessary.
+completed. The released runner originally marked all six invalid because
+RunEvidence compared the material environment hash with the full observational
+plan hash. The immutable report and SQLite evidence were preserved. After the
+hash-domain validator fix, exact bounded offline revalidation of that evidence
+returned `REVALIDATED_PASS`: three baseline and three observe repetitions are
+valid and the observer-overhead comparison is comparable. Three repetitions
+do not support a significance claim. No V4 is required.
+
+### Checkpoint 3B incompressible baseline versus observe
+
+Checkpoint 3B reuses the complete validated 3A architecture for
+`synthetic_incompressible`: clean release provenance, prepared manifests,
+user/root identity and material-environment contracts, per-run preflight,
+transient worker scope, DynamicUser observer, unique transactions, fresh
+outputs, raw samples, run-relative counters, watchdog, worker integrity,
+structural restore, failure persistence and observer-overhead statistics.
+
+The generator is `nemor.synthetic.splitmix64` version 1. It deterministically
+derives every byte from the persisted run seed, touches/prefaults the full
+declared payload before measurement, and records a workload identity derived
+from scenario, generator identity/version, seed and payload. The worker
+manifest separately binds scenario and generator identity/version. During the
+measurement window the worker performs only bounded integrity reads and
+heartbeats; it performs no full rewrite or artificial sustained CPU load.
+Baseline and observe use the same repetition seed, workload identity, logical
+payload, algorithm/version and cgroup envelope. Payload identity is not a
+compression-effectiveness claim; zram/zswap observations are telemetry only.
+
+The initial profile remains the conservative non-pressure pilot: 128 MiB
+payload, 256 MiB `MemoryMax`, five-second observer warmup, at least two seconds
+stabilization, at least twenty seconds measurement, one-second sampling,
+two-second cooldown and three repetitions per variant. OOM requests and
+pressure mode are rejected.
+
+Only `cachyos_baseline,nemor_observe` and `observer_overhead` are in scope.
+Comparison requires all three valid runs per variant with paired seeds and
+workload identities, the same generator/manifest, payload, envelope and
+material environment. No significance claim is made from three repetitions.
+`capacity_gain_percent`, capacity, gaming, OOM avoidance, progressive pressure
+and optimization effectiveness remain `not_evaluated`. Framework and tests are
+ready; no live 3B preparation, preflight or execution has occurred.
 
 ### Checkpoint 3A-P DynamicUser observer boundary
 

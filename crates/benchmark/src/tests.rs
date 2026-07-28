@@ -1948,6 +1948,8 @@ fn checkpoint3a_fixture_plan() -> ExperimentPlan {
         experiment_id: "checkpoint3a-test".into(),
         scenario: CHECKPOINT3A_SCENARIO.into(),
         scenario_version: 1,
+        generator_id: COMPRESSIBLE_GENERATOR_ID.into(),
+        generator_version: SYNTHETIC_GENERATOR_VERSION,
         evidence_kind: EvidenceKind::PerformanceBenchmark,
         comparison_purpose: ComparisonPurpose::ObserverOverhead,
         variants: vec![
@@ -2009,7 +2011,25 @@ fn checkpoint3a_fixture_plan() -> ExperimentPlan {
     }
 }
 
+fn checkpoint3b_fixture_plan() -> ExperimentPlan {
+    let mut plan = checkpoint3a_fixture_plan();
+    plan.experiment_id = "checkpoint3b-test".into();
+    plan.scenario = CHECKPOINT3B_SCENARIO.into();
+    plan.generator_id = INCOMPRESSIBLE_GENERATOR_ID.into();
+    plan.generator_version = SYNTHETIC_GENERATOR_VERSION;
+    plan.profile = PerformanceProfile::checkpoint3b(CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES).unwrap();
+    plan
+}
+
 fn checkpoint3a_run(plan: &ExperimentPlan, planned: PlannedRun) -> RunEvidence {
+    let workload_identity = workload_identity(
+        &plan.scenario,
+        &plan.generator_id,
+        plan.generator_version,
+        planned.run_seed,
+        plan.profile.logical_payload_bytes,
+    )
+    .unwrap();
     let snapshot = swap_snapshot(1, 100, 100);
     let observer = (planned.variant == BenchmarkVariant::NemorObserve).then(|| ObserverEvidence {
         identity: ProcessIdentity {
@@ -2054,6 +2074,10 @@ fn checkpoint3a_run(plan: &ExperimentPlan, planned: PlannedRun) -> RunEvidence {
             .as_ref()
             .map(|_| plan.observer_binary.sha256.clone()),
         worker_manifest_hash: "same-worker".into(),
+        generator_id: plan.generator_id.clone(),
+        generator_version: plan.generator_version,
+        workload_identity,
+        payload_fingerprint_sha256: "payload-fingerprint".into(),
         worker_cgroup_memory_max: plan.profile.worker_memory_max_bytes,
         logical_payload_bytes: plan.profile.logical_payload_bytes,
         measurement_ms: plan.profile.measurement_ms,
@@ -2108,6 +2132,162 @@ fn baseline_and_observe_share_worker_manifest_seed_load_and_envelope() {
     );
     assert!(baseline.observer.is_none());
     assert!(observe.observer.as_ref().unwrap().outside_worker_scope);
+}
+
+#[test]
+fn checkpoint3b_accepts_only_synthetic_incompressible() {
+    assert!(validate_checkpoint3b_scenario(CHECKPOINT3B_SCENARIO).is_ok());
+    assert!(validate_checkpoint3b_scenario(CHECKPOINT3A_SCENARIO).is_err());
+}
+
+#[test]
+fn generator_contracts_cannot_be_confused() {
+    let compressible = generator_contract(CHECKPOINT3A_SCENARIO).unwrap();
+    let incompressible = generator_contract(CHECKPOINT3B_SCENARIO).unwrap();
+    assert_ne!(compressible.0, incompressible.0);
+    assert_ne!(compressible.2, incompressible.2);
+    assert!(workload_identity(
+        CHECKPOINT3B_SCENARIO,
+        COMPRESSIBLE_GENERATOR_ID,
+        SYNTHETIC_GENERATOR_VERSION,
+        1,
+        CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES,
+    )
+    .is_err());
+}
+
+#[test]
+fn checkpoint3b_workload_identity_is_deterministic_paired_and_seeded() {
+    let plan = checkpoint3b_fixture_plan();
+    let identity = |seed| {
+        workload_identity(
+            &plan.scenario,
+            &plan.generator_id,
+            plan.generator_version,
+            seed,
+            plan.profile.logical_payload_bytes,
+        )
+        .unwrap()
+    };
+    assert_eq!(identity(7), identity(7));
+    assert_ne!(identity(7), identity(8));
+    let baseline = checkpoint3a_run(
+        &plan,
+        PlannedRun {
+            order_index: 0,
+            variant: BenchmarkVariant::CachyosBaseline,
+            repetition_index: 0,
+            run_seed: 7,
+            state: PlannedRunState::Planned,
+        },
+    );
+    let observe = checkpoint3a_run(
+        &plan,
+        PlannedRun {
+            variant: BenchmarkVariant::NemorObserve,
+            ..baseline.planned.clone()
+        },
+    );
+    assert_eq!(baseline.workload_identity, observe.workload_identity);
+}
+
+#[test]
+fn checkpoint3b_worker_manifest_binds_scenario_and_generator_version() {
+    let plan = checkpoint3b_fixture_plan();
+    let hash = worker_manifest_hash(&plan).unwrap();
+    let mut changed = plan.clone();
+    changed.scenario = CHECKPOINT3A_SCENARIO.into();
+    changed.generator_id = COMPRESSIBLE_GENERATOR_ID.into();
+    assert_ne!(hash, worker_manifest_hash(&changed).unwrap());
+    changed = plan.clone();
+    changed.generator_version += 1;
+    assert_ne!(hash, worker_manifest_hash(&changed).unwrap());
+}
+
+#[test]
+fn checkpoint3b_observer_transaction_identity_is_distinct() {
+    assert!(
+        crate::performance::checkpoint3a_observer_run_id("checkpoint3b-test", 2, 1)
+            .starts_with("c3b-")
+    );
+}
+
+#[test]
+fn checkpoint3b_profile_is_bounded_non_pressure() {
+    let profile = PerformanceProfile::checkpoint3b(CHECKPOINT3A_DEFAULT_PAYLOAD_BYTES).unwrap();
+    assert_eq!(profile.logical_payload_bytes, 128 * 1024 * 1024);
+    assert_eq!(profile.worker_memory_max_bytes, 256 * 1024 * 1024);
+    assert_eq!(profile.observer_warmup_ms, 5_000);
+    assert!(profile.stabilization_ms >= 2_000);
+    assert!(profile.measurement_ms >= 20_000);
+    assert_eq!(profile.sample_interval_ms, 1_000);
+    assert_eq!(profile.cooldown_ms, 2_000);
+    assert!(!profile.request_oom);
+    assert!(!profile.pressure_mode);
+
+    let mut unsafe_profile = profile.clone();
+    unsafe_profile.request_oom = true;
+    assert!(unsafe_profile.validate().is_err());
+    unsafe_profile.request_oom = false;
+    unsafe_profile.pressure_mode = true;
+    assert!(unsafe_profile.validate().is_err());
+}
+
+#[test]
+fn checkpoint3b_evidence_requires_material_binding_and_observer_ownership() {
+    let plan = checkpoint3b_fixture_plan();
+    let mut baseline = checkpoint3a_run(
+        &plan,
+        PlannedRun {
+            order_index: 0,
+            variant: BenchmarkVariant::CachyosBaseline,
+            repetition_index: 0,
+            run_seed: 7,
+            state: PlannedRunState::Planned,
+        },
+    );
+    baseline.observer = checkpoint3a_run(
+        &plan,
+        PlannedRun {
+            variant: BenchmarkVariant::NemorObserve,
+            ..baseline.planned.clone()
+        },
+    )
+    .observer;
+    assert!(baseline.validate(&plan).is_err());
+
+    let mut observe = checkpoint3a_run(
+        &plan,
+        PlannedRun {
+            variant: BenchmarkVariant::NemorObserve,
+            ..baseline.planned.clone()
+        },
+    );
+    observe.observer = None;
+    assert!(observe.validate(&plan).is_err());
+    observe.material_environment_hash = "wrong".into();
+    assert!(observe.validate(&plan).is_err());
+}
+
+#[test]
+fn checkpoint3b_comparison_requires_all_six_valid_and_never_capacity() {
+    let plan = checkpoint3b_fixture_plan();
+    let mut runs = plan
+        .randomized_order
+        .iter()
+        .cloned()
+        .map(|planned| checkpoint3a_run(&plan, planned))
+        .collect::<Vec<_>>();
+    let comparison = compare_observer_overhead(&runs, &BTreeMap::new()).unwrap();
+    assert_eq!(comparison.baseline_valid_repetitions, 3);
+    assert_eq!(comparison.observe_valid_repetitions, 3);
+    assert_eq!(
+        comparison.capacity_gain_percent,
+        EvaluationState::NotEvaluated
+    );
+    assert!(!comparison.significance_claimed);
+    runs[0].valid = false;
+    assert!(compare_observer_overhead(&runs, &BTreeMap::new()).is_err());
 }
 
 #[test]

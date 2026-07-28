@@ -1671,9 +1671,7 @@ pub fn run_synthetic(
             SyntheticPattern::Compressible => {
                 ((index / page_size + seed as usize) % 4) as u8 * 0x11
             }
-            SyntheticPattern::Incompressible => {
-                splitmix64(seed ^ index as u64).to_le_bytes()[index % 8]
-            }
+            SyntheticPattern::Incompressible => synthetic_byte(pattern, seed, index),
         };
     }
     let fingerprint = hex::encode(Sha256::digest(&data));
@@ -1689,6 +1687,15 @@ pub fn run_synthetic(
         integrity_valid: hex::encode(Sha256::digest(&data)) == fingerprint,
     };
     Ok((evidence, data))
+}
+
+pub fn synthetic_byte(pattern: SyntheticPattern, seed: u64, index: usize) -> u8 {
+    match pattern {
+        SyntheticPattern::Compressible => ((index / 4096 + seed as usize) % 4) as u8 * 0x11,
+        SyntheticPattern::Incompressible => {
+            splitmix64(seed ^ index as u64).to_le_bytes()[index % 8]
+        }
+    }
 }
 
 fn rle_size(data: &[u8]) -> usize {
