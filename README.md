@@ -34,11 +34,11 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 501 / 501 |
-| Passed / failed / ignored | 501 / 0 / 0 |
+| Tests defined / executed | 503 / 503 |
+| Passed / failed / ignored | 503 / 0 / 0 |
 | Phase 10 validation | framework + privileged worker harness + 3A-P observer pipeline validated; real A/B pending |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
-| Checkpoint 3A | Experiment 1 V1 collision rejected, V2 prepared/preflighted, execution attempt 1 rejected before run 0 by privilege-sensitive environment identity; material-contract fix and real A/B pending |
+| Checkpoint 3A | Experiment 1 V1 collision rejected, V2 preflighted, V3 six-run Attempt 2 preserved with recorded hash-domain invalidity; offline revalidation pending |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |

@@ -143,6 +143,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    RevalidateExperiment {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(hide = true)]
     WorkerHold {
         #[arg(long)]
@@ -516,6 +524,22 @@ fn run() -> Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 println!("{}", serde_json::to_string(&output)?);
+            }
+        }
+        Command::RevalidateExperiment {
+            manifest,
+            report,
+            json,
+        } => {
+            let result = nemor_benchmark::performance::revalidate_experiment(&manifest, &report)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "classification={} runs={}",
+                    result.classification,
+                    result.revalidated_runs.len()
+                );
             }
         }
         Command::WorkerHold {

@@ -2041,13 +2041,14 @@ fn checkpoint3a_run(plan: &ExperimentPlan, planned: PlannedRun) -> RunEvidence {
         readiness_duration_seconds: None,
     });
     RunEvidence {
+        run_evidence_schema_version: crate::performance::RUN_EVIDENCE_SCHEMA_VERSION,
         run_id: format!("run-{}", planned.order_index),
         experiment_id: plan.experiment_id.clone(),
         planned,
         valid: true,
         invalid_reason: None,
         safety_failure: false,
-        environment_hash: plan.environment_hash.clone(),
+        material_environment_hash: plan.material_environment_hash.clone(),
         benchmark_binary_sha256: plan.benchmark_binary.sha256.clone(),
         observer_binary_sha256: observer
             .as_ref()
@@ -2273,9 +2274,9 @@ fn environment_or_worker_manifest_mismatch_blocks_comparison() {
         .cloned()
         .map(|planned| checkpoint3a_run(&plan, planned))
         .collect::<Vec<_>>();
-    runs[0].environment_hash = "different".into();
+    runs[0].material_environment_hash = "different".into();
     assert!(compare_observer_overhead(&runs, &BTreeMap::new()).is_err());
-    runs[0].environment_hash = plan.environment_hash.clone();
+    runs[0].material_environment_hash = plan.material_environment_hash.clone();
     runs[0].worker_manifest_hash = "different".into();
     assert!(compare_observer_overhead(&runs, &BTreeMap::new()).is_err());
 }
@@ -2619,4 +2620,25 @@ fn checkpoint3a_runtime_bound_exceeds_measurement_and_is_finite() {
         + 5_000;
     assert!(runtime > bounded_lifecycle_ms * 1_000);
     assert!(runtime <= crate::observer_service::PERFORMANCE_SERVICE_RUNTIME_MAX_USEC);
+}
+
+#[test]
+fn run_evidence_uses_material_environment_domain() {
+    let plan = checkpoint3a_fixture_plan();
+    let planned = plan.randomized_order[0].clone();
+    let mut run = checkpoint3a_run(&plan, planned);
+    assert!(run.validate(&plan).is_ok());
+    run.material_environment_hash = plan.environment_hash.clone();
+    assert!(run.validate(&plan).is_err());
+    run.material_environment_hash = "different-material-hash".into();
+    assert!(run.validate(&plan).is_err());
+}
+
+#[test]
+fn run_evidence_schema_rejects_legacy_ambiguous_contract() {
+    let plan = checkpoint3a_fixture_plan();
+    let planned = plan.randomized_order[0].clone();
+    let mut run = checkpoint3a_run(&plan, planned);
+    run.run_evidence_schema_version = crate::performance::LEGACY_V3_RUN_SCHEMA_VERSION;
+    assert!(run.validate(&plan).is_err());
 }

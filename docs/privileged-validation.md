@@ -350,6 +350,12 @@ freezes and compares a versioned material environment contract without reading
 repository `.git` state under privilege; the full observational snapshot is
 retained separately.
 
+Checkpoint 3A Experiment 1 Execution Attempt 2 completed six real runs. The
+historical report recorded all six invalid because the released RunEvidence
+validator compared material and full environment hash domains. The original
+report, manifest, and SQLite evidence are immutable; only the new unprivileged
+offline revalidator may derive a corrected result.
+
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
 worker/unit/cgroup final absence, structural restore and full host restore.

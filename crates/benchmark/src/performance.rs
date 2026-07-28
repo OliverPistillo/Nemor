@@ -188,6 +188,7 @@ pub struct ExperimentInputs<'a> {
 }
 
 pub const PREPARED_EXPERIMENT_SCHEMA_VERSION: u32 = 2;
+pub const RUN_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedExperimentPayload {
@@ -739,6 +740,337 @@ pub(crate) fn canonical_experiment_report(
     }))?)
 }
 
+const LEGACY_V3_COMMIT: &str = "e1d4412162c474ec963993e90fd897f3c5f393b3";
+const LEGACY_V3_EXPERIMENT_ID: &str = "checkpoint3a-1785266551865231139";
+const LEGACY_V3_MANIFEST_FILE_SHA256: &str =
+    "a6359b0a33bd8571e0867ac011d6ca8f92c46d36f98e531dd595d82bde32ee1a";
+const LEGACY_V3_MANIFEST_PAYLOAD_SHA256: &str =
+    "7d555d59cfbc4acd11f2288e9356e458eb5ce40154b21ec31e659eaa20990c48";
+const LEGACY_V3_REPORT_SHA256: &str =
+    "57580523872fec1f3fe98cfee8b855ec4931a7fc44d4885e8e1b5e78ec3084fb";
+pub(crate) const LEGACY_V3_RUN_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineRunRevalidation {
+    pub order_index: usize,
+    pub variant: BenchmarkVariant,
+    pub repetition_index: usize,
+    pub recorded_validity: bool,
+    pub revalidated_validity: bool,
+    pub gates: BTreeMap<String, bool>,
+    pub failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineRevalidationResult {
+    pub classification: String,
+    pub historical_schema_version: u32,
+    pub validator_run_evidence_schema_version: u32,
+    pub experiment_id: String,
+    pub source_commit: String,
+    pub report_sha256: String,
+    pub manifest_file_sha256: String,
+    pub manifest_payload_sha256: String,
+    pub recorded_run_states: Vec<PlannedRunState>,
+    pub revalidated_runs: Vec<OfflineRunRevalidation>,
+    pub comparison: Option<ObserverOverheadComparison>,
+    pub capacity_gain_percent: EvaluationState,
+    pub failures: Vec<String>,
+}
+
+fn verify_offline_input(path: &Path, max_size: u64) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > max_size
+    {
+        bail!(
+            "offline evidence input is not a bounded regular file: {}",
+            path.display()
+        );
+    }
+    Ok(fs::read(path)?)
+}
+
+fn legacy_v3_run(value: &serde_json::Value) -> Result<RunEvidence> {
+    let mut value = value.clone();
+    let object = value
+        .as_object_mut()
+        .context("legacy run evidence is not an object")?;
+    if object.get("environment_hash").is_none() || object.get("material_environment_hash").is_some()
+    {
+        bail!("legacy V3 run evidence has unexpected hash fields");
+    }
+    let material_hash = object
+        .remove("environment_hash")
+        .context("legacy V3 run material hash missing")?;
+    object.insert("material_environment_hash".into(), material_hash);
+    object.insert(
+        "run_evidence_schema_version".into(),
+        serde_json::json!(RUN_EVIDENCE_SCHEMA_VERSION),
+    );
+    Ok(serde_json::from_value(value)?)
+}
+
+fn historical_observer_gates(
+    run: &RunEvidence,
+    plan: &ExperimentPlan,
+    expected_config_hash: Option<&str>,
+) -> Result<BTreeMap<String, bool>> {
+    let mut gates = BTreeMap::new();
+    let mut require = |name: &str, condition: bool| {
+        gates.insert(name.to_owned(), condition);
+    };
+    require("observer_presence", run.observer.is_some());
+    if let Some(observer) = &run.observer {
+        require(
+            "observer_binary_identity",
+            observer.binary_sha256 == plan.observer_binary.sha256
+                && run.observer_binary_sha256.as_deref()
+                    == Some(plan.observer_binary.sha256.as_str()),
+        );
+        require(
+            "observer_config_identity",
+            expected_config_hash.is_some_and(|hash| observer.config_hash == hash),
+        );
+        require("observer_exit_success", observer.exit_status == Some(0));
+        require(
+            "observer_lifecycle",
+            observer.validate(run.measurement_ms).is_ok(),
+        );
+        require(
+            "observer_identity_settled",
+            observer.settling.as_ref().is_some_and(|settling| {
+                settling.status == "EXEC_IDENTITY_SETTLED"
+                    && settling.final_uid != 0
+                    && settling.final_gid != 0
+                    && settling.final_executable_sha256 == plan.observer_binary.sha256
+            }),
+        );
+        require(
+            "observer_readiness",
+            observer
+                .readiness_duration_seconds
+                .is_some_and(|value| value.is_finite()),
+        );
+    }
+    Ok(gates)
+}
+
+pub fn revalidate_experiment(
+    manifest_path: &Path,
+    report_path: &Path,
+) -> Result<OfflineRevalidationResult> {
+    let manifest_bytes = verify_offline_input(manifest_path, 2 * 1024 * 1024)?;
+    let report_bytes = verify_offline_input(report_path, 64 * 1024 * 1024)?;
+    let manifest_file_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+    let report_sha256 = hex::encode(Sha256::digest(&report_bytes));
+    if manifest_file_sha256 != LEGACY_V3_MANIFEST_FILE_SHA256
+        || report_sha256 != LEGACY_V3_REPORT_SHA256
+    {
+        bail!("legacy V3 evidence file identity mismatch");
+    }
+    let manifest: PreparedExperimentManifest = serde_json::from_slice(&manifest_bytes)?;
+    let manifest_payload_sha256 =
+        hex::encode(Sha256::digest(serde_json::to_vec(&manifest.payload)?));
+    if manifest.payload_sha256 != LEGACY_V3_MANIFEST_PAYLOAD_SHA256
+        || manifest_payload_sha256 != LEGACY_V3_MANIFEST_PAYLOAD_SHA256
+    {
+        bail!("legacy V3 manifest payload integrity mismatch");
+    }
+    let report: serde_json::Value = serde_json::from_slice(&report_bytes)?;
+    if report
+        .get("manifest_file_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(LEGACY_V3_MANIFEST_FILE_SHA256)
+        || report
+            .get("manifest_payload_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(LEGACY_V3_MANIFEST_PAYLOAD_SHA256)
+    {
+        bail!("legacy V3 report manifest identity mismatch");
+    }
+    let plan: ExperimentPlan = serde_json::from_value(report["plan"].clone())?;
+    if plan.experiment_id != LEGACY_V3_EXPERIMENT_ID
+        || plan.provenance.git_head != LEGACY_V3_COMMIT
+        || plan.benchmark_binary.embedded_git_head != LEGACY_V3_COMMIT
+        || plan.observer_binary.embedded_git_head != LEGACY_V3_COMMIT
+        || manifest.payload.experiment_id != LEGACY_V3_EXPERIMENT_ID
+        || manifest.payload.plan.experiment_id != LEGACY_V3_EXPERIMENT_ID
+    {
+        bail!("legacy V3 experiment or source identity mismatch");
+    }
+    let report_runs = report["runs"]
+        .as_array()
+        .context("legacy V3 runs missing")?;
+    if report_runs.len() != 6 {
+        bail!("legacy V3 must contain six runs");
+    }
+    let mut revalidated = Vec::new();
+    let mut failures = Vec::new();
+    let mut valid_runs = Vec::new();
+    let mut metrics = BTreeMap::<String, Vec<(String, BenchmarkVariant, f64)>>::new();
+    for value in report_runs {
+        let run = legacy_v3_run(value)?;
+        let mut gates = BTreeMap::new();
+        let mut run_failures = Vec::new();
+        let planned = &run.planned;
+        gates.insert(
+            "experiment_id".into(),
+            run.experiment_id == plan.experiment_id,
+        );
+        gates.insert(
+            "material_environment_identity".into(),
+            run.material_environment_hash == plan.material_environment_hash,
+        );
+        gates.insert(
+            "benchmark_binary_identity".into(),
+            run.benchmark_binary_sha256 == plan.benchmark_binary.sha256,
+        );
+        gates.insert(
+            "worker_manifest_contract".into(),
+            !run.worker_manifest_hash.is_empty(),
+        );
+        gates.insert(
+            "memory_max".into(),
+            run.worker_cgroup_memory_max == plan.profile.worker_memory_max_bytes,
+        );
+        gates.insert(
+            "logical_payload".into(),
+            run.logical_payload_bytes == plan.profile.logical_payload_bytes,
+        );
+        gates.insert(
+            "measurement_duration".into(),
+            run.measurement_ms >= CHECKPOINT3A_MIN_MEASUREMENT_MS,
+        );
+        gates.insert(
+            "sample_interval".into(),
+            run.sample_interval_ms == CHECKPOINT3A_SAMPLE_INTERVAL_MS,
+        );
+        gates.insert(
+            "sample_count".into(),
+            run.sample_count >= (run.measurement_ms / run.sample_interval_ms) as usize,
+        );
+        gates.insert("watchdog".into(), !run.watchdog_triggered);
+        gates.insert("oom".into(), run.oom == 0);
+        gates.insert("oom_kill".into(), run.oom_kill == 0);
+        gates.insert("worker_integrity".into(), run.worker_integrity_valid);
+        gates.insert(
+            "restore".into(),
+            run.restore_passed && run.structural_before.matches(&run.structural_after),
+        );
+        if planned.variant == BenchmarkVariant::CachyosBaseline {
+            gates.insert("baseline_observer_absence".into(), run.observer.is_none());
+        } else {
+            let expected_config_hash = manifest
+                .payload
+                .observer_runs
+                .iter()
+                .find(|observer_run| observer_run.order_index == planned.order_index)
+                .map(|observer_run| observer_run.prepared_config_sha256.as_str());
+            gates.extend(historical_observer_gates(
+                &run,
+                &plan,
+                expected_config_hash,
+            )?);
+        }
+        for (name, passed) in &gates {
+            if !passed {
+                run_failures.push(name.clone());
+            }
+        }
+        let mut derived = run.clone();
+        derived.valid = run_failures.is_empty();
+        derived.invalid_reason = None;
+        if derived.valid {
+            valid_runs.push(derived.clone());
+            if let Some(value) = derived.worker_cpu_seconds {
+                metrics
+                    .entry("worker_cpu_seconds".into())
+                    .or_default()
+                    .push((derived.run_id.clone(), planned.variant, value));
+            }
+            if let Some(value) = derived.runner_cpu_seconds {
+                metrics
+                    .entry("runner_cpu_seconds".into())
+                    .or_default()
+                    .push((derived.run_id.clone(), planned.variant, value));
+            }
+            if let Some(observer) = &derived.observer {
+                metrics
+                    .entry("observer_cpu_seconds".into())
+                    .or_default()
+                    .push((
+                        derived.run_id.clone(),
+                        planned.variant,
+                        observer.measurement_cpu_seconds,
+                    ));
+                metrics
+                    .entry("observer_rss_mean_bytes".into())
+                    .or_default()
+                    .push((
+                        derived.run_id.clone(),
+                        planned.variant,
+                        observer.rss_mean_bytes.unwrap_or_default(),
+                    ));
+                metrics
+                    .entry("observer_pss_mean_bytes".into())
+                    .or_default()
+                    .push((
+                        derived.run_id.clone(),
+                        planned.variant,
+                        observer.pss_mean_bytes.unwrap_or_default(),
+                    ));
+            }
+        }
+        if !run_failures.is_empty() {
+            failures.push(format!(
+                "order {}: {}",
+                planned.order_index,
+                run_failures.join(", ")
+            ));
+        }
+        revalidated.push(OfflineRunRevalidation {
+            order_index: planned.order_index,
+            variant: planned.variant,
+            repetition_index: planned.repetition_index,
+            recorded_validity: run.valid,
+            revalidated_validity: run_failures.is_empty(),
+            gates,
+            failures: run_failures,
+        });
+    }
+    let comparison = if failures.is_empty() {
+        Some(compare_observer_overhead(&valid_runs, &metrics)?)
+    } else {
+        None
+    };
+    Ok(OfflineRevalidationResult {
+        classification: if failures.is_empty() {
+            "REVALIDATED_PASS"
+        } else {
+            "REVALIDATED_FAIL"
+        }
+        .into(),
+        historical_schema_version: LEGACY_V3_RUN_SCHEMA_VERSION,
+        validator_run_evidence_schema_version: RUN_EVIDENCE_SCHEMA_VERSION,
+        experiment_id: plan.experiment_id,
+        source_commit: plan.provenance.git_head,
+        report_sha256,
+        manifest_file_sha256,
+        manifest_payload_sha256,
+        recorded_run_states: report_runs
+            .iter()
+            .map(|value| serde_json::from_value(value["planned"]["state"].clone()))
+            .collect::<Result<Vec<_>, _>>()?,
+        revalidated_runs: revalidated,
+        comparison,
+        capacity_gain_percent: EvaluationState::NotEvaluated,
+        failures,
+    })
+}
+
 pub fn preflight_prepared_experiment(manifest_path: &Path) -> Result<serde_json::Value> {
     let bytes = fs::read(manifest_path)?;
     let manifest: PreparedExperimentManifest = serde_json::from_slice(&bytes)?;
@@ -1112,13 +1444,14 @@ pub fn derive_performance_deltas(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvidence {
+    pub run_evidence_schema_version: u32,
     pub run_id: String,
     pub experiment_id: String,
     pub planned: PlannedRun,
     pub valid: bool,
     pub invalid_reason: Option<String>,
     pub safety_failure: bool,
-    pub environment_hash: String,
+    pub material_environment_hash: String,
     pub benchmark_binary_sha256: String,
     pub observer_binary_sha256: Option<String>,
     pub worker_manifest_hash: String,
@@ -1145,7 +1478,8 @@ pub struct RunEvidence {
 
 impl RunEvidence {
     pub fn validate(&self, plan: &ExperimentPlan) -> Result<()> {
-        if self.environment_hash != plan.environment_hash
+        if self.run_evidence_schema_version != RUN_EVIDENCE_SCHEMA_VERSION
+            || self.material_environment_hash != plan.material_environment_hash
             || self.benchmark_binary_sha256 != plan.benchmark_binary.sha256
             || self.worker_cgroup_memory_max != plan.profile.worker_memory_max_bytes
             || self.logical_payload_bytes != plan.profile.logical_payload_bytes
@@ -1196,9 +1530,24 @@ pub struct ExperimentOutcome {
     pub execution_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunPreflightObservation {
+    pub order_index: usize,
+    pub material_environment_hash: String,
+}
+
 pub trait ExperimentRunBackend {
-    fn preflight_run(&mut self, plan: &ExperimentPlan, planned: &PlannedRun) -> Result<()>;
-    fn execute_run(&mut self, plan: &ExperimentPlan, planned: &PlannedRun) -> Result<RunEvidence>;
+    fn preflight_run(
+        &mut self,
+        plan: &ExperimentPlan,
+        planned: &PlannedRun,
+    ) -> Result<RunPreflightObservation>;
+    fn execute_run(
+        &mut self,
+        plan: &ExperimentPlan,
+        planned: &PlannedRun,
+        preflight: &RunPreflightObservation,
+    ) -> Result<RunEvidence>;
     fn verify_between_run_restore(
         &mut self,
         plan: &ExperimentPlan,
@@ -1222,20 +1571,46 @@ pub fn execute_planned_experiment(
     };
     let planned_order = outcome.plan.randomized_order.clone();
     for planned in planned_order {
-        if let Err(error) = backend.preflight_run(&outcome.plan, &planned) {
-            outcome.execution_error = Some(error.to_string());
-            outcome.aborted_after_order = Some(planned.order_index);
-            for pending in outcome
-                .plan
-                .randomized_order
-                .iter_mut()
-                .filter(|pending| pending.order_index >= planned.order_index)
+        let preflight = match backend.preflight_run(&outcome.plan, &planned) {
+            Ok(observation)
+                if observation.order_index == planned.order_index
+                    && observation.material_environment_hash
+                        == outcome.plan.material_environment_hash =>
             {
-                pending.state = PlannedRunState::NotExecutedAfterAbort;
+                observation
             }
-            break;
-        }
-        let mut run = match backend.execute_run(&outcome.plan, &planned) {
+            Ok(observation) => {
+                outcome.execution_error = Some(format!(
+                    "preflight observation does not match order {} or material environment",
+                    planned.order_index
+                ));
+                outcome.aborted_after_order = Some(planned.order_index);
+                for pending in outcome
+                    .plan
+                    .randomized_order
+                    .iter_mut()
+                    .filter(|pending| pending.order_index >= planned.order_index)
+                {
+                    pending.state = PlannedRunState::NotExecutedAfterAbort;
+                }
+                let _ = observation;
+                break;
+            }
+            Err(error) => {
+                outcome.execution_error = Some(error.to_string());
+                outcome.aborted_after_order = Some(planned.order_index);
+                for pending in outcome
+                    .plan
+                    .randomized_order
+                    .iter_mut()
+                    .filter(|pending| pending.order_index >= planned.order_index)
+                {
+                    pending.state = PlannedRunState::NotExecutedAfterAbort;
+                }
+                break;
+            }
+        };
+        let mut run = match backend.execute_run(&outcome.plan, &planned, &preflight) {
             Ok(run) => run,
             Err(error) => {
                 outcome.execution_error = Some(error.to_string());
@@ -1328,7 +1703,11 @@ impl LiveCheckpoint3aBackend {
 }
 
 impl ExperimentRunBackend for LiveCheckpoint3aBackend {
-    fn preflight_run(&mut self, plan: &ExperimentPlan, _planned: &PlannedRun) -> Result<()> {
+    fn preflight_run(
+        &mut self,
+        plan: &ExperimentPlan,
+        planned: &PlannedRun,
+    ) -> Result<RunPreflightObservation> {
         let environment = EnvironmentFingerprint::capture_for_performance(
             &plan.config_hash,
             &plan.provenance.git_head,
@@ -1341,10 +1720,19 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
             bail!("material_environment_mismatch: {}", differences.join(", "));
         }
         let detected = detect_nemord_processes(&self.observer_binary, None);
-        reject_foreign_nemord(&detected, None)
+        reject_foreign_nemord(&detected, None)?;
+        Ok(RunPreflightObservation {
+            order_index: planned.order_index,
+            material_environment_hash: environment.material_hash()?,
+        })
     }
 
-    fn execute_run(&mut self, plan: &ExperimentPlan, planned: &PlannedRun) -> Result<RunEvidence> {
+    fn execute_run(
+        &mut self,
+        plan: &ExperimentPlan,
+        planned: &PlannedRun,
+        preflight: &RunPreflightObservation,
+    ) -> Result<RunEvidence> {
         fs::create_dir_all(&self.report_dir)?;
         let run_dir = self.report_dir.join(format!(
             "{}-run-{}",
@@ -1420,6 +1808,7 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
             .clone()
             .or(report.outcome.failure_reason.clone());
         Ok(RunEvidence {
+            run_evidence_schema_version: RUN_EVIDENCE_SCHEMA_VERSION,
             run_id: report.run_id,
             experiment_id: plan.experiment_id.clone(),
             planned: planned.clone(),
@@ -1432,7 +1821,7 @@ impl ExperimentRunBackend for LiveCheckpoint3aBackend {
                     .failure_class
                     .as_deref()
                     .is_some_and(|class| class == "safety_failure" || class == "cleanup_failure"),
-            environment_hash: plan.material_environment_hash.clone(),
+            material_environment_hash: preflight.material_environment_hash.clone(),
             benchmark_binary_sha256: plan.benchmark_binary.sha256.clone(),
             observer_binary_sha256: observer
                 .as_ref()
@@ -1637,7 +2026,7 @@ pub fn compare_observer_overhead(
     }
     let environment_hashes = valid
         .iter()
-        .map(|run| run.environment_hash.as_str())
+        .map(|run| run.material_environment_hash.as_str())
         .collect::<BTreeSet<_>>();
     let worker_manifests = valid
         .iter()

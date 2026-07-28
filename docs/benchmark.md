@@ -321,6 +321,14 @@ versioned material environment projection while retaining the full snapshot
 for evidence; energy counter accessibility is observational and does not
 change A/B environment identity.
 
+Preparation V3 passed both user and root read-only preflight and was executed
+once as Checkpoint 3A Experiment 1 Execution Attempt 2. Six real runs
+completed, but the released runner marked all six invalid because RunEvidence
+compared the material environment hash with the full observational plan hash.
+The immutable report and SQLite evidence remain preserved. The run-evidence
+domain fix and exact offline revalidation now determine whether another
+preparation is necessary.
+
 ### Checkpoint 3A-P DynamicUser observer boundary
 
 Checkpoint 3A-P now proves the observer boundary through one bounded
