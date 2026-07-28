@@ -357,7 +357,22 @@ fn run() -> Result<i32> {
             bounded.verify(&manifest)?;
             let backend =
                 nemor_benchmark::observer_service::SystemdObserverServiceBackend::system()?;
-            backend.preflight()?;
+            let systemd_version = backend.systemd_version()?;
+            if let Err(error) = backend.preflight() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "systemd_version": systemd_version,
+                            "systemd_api_capable": false,
+                            "property_contract_supported": false,
+                            "property_contract_diagnostic": format!("{error:#}"),
+                            "preflight_mutated": false,
+                        }))?
+                    );
+                }
+                return Err(error);
+            }
             let foreign = nemor_benchmark::performance::detect_nemord_processes(
                 &bounded.payload.source_observer_path,
                 None,
@@ -367,6 +382,9 @@ fn run() -> Result<i32> {
             let privileged = nix::unistd::geteuid().is_root();
             let output = serde_json::json!({
                 "systemd_api_capable": true,
+                "systemd_version": systemd_version,
+                "property_contract_version": nemor_benchmark::observer_service::OBSERVER_PROPERTY_CONTRACT_VERSION,
+                "property_contract_supported": true,
                 "manager": "system",
                 "required_authorization": "privileged_root",
                 "requires_privileged_execution": true,

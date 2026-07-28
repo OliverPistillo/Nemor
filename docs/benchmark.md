@@ -375,8 +375,23 @@ remains the stamp source, while runtime provenance independently rejects any
 embedded-commit mismatch or dirty relevant source.
 
 Neither preparation blocker counts as live ATTEMPT 1. The historical V1
-directory remains untouched, V2 was never created, and the next preparation
-lineage uses V3.
+directory remains untouched and V2 was never created. V3 prepared
+successfully but its single permitted read-only preflight exposed a property
+contract defect before foreign-process checking or mutation:
+`ProtectHome=true` in unit-file syntax had incorrectly been modeled as a
+D-Bus boolean. On systemd 261 the transient request and effective
+`org.freedesktop.systemd1.Service` readback are the canonical string
+`"yes"` (`s`). The corrected fixed contract retains boolean `b` for the
+legacy `PrivateTmp` and `ProtectControlGroups` properties, whose effective
+production settings are simple true values.
+
+Host introspection now verifies the complete fixed request/readback map and
+reports missing property, wrong interface, wrong signature, value-contract
+mismatch, and unsupported-required-property failures distinctly. The
+preparation schema and observer property-contract version were advanced, so
+the historical V3 manifest is deterministically rejected by corrected
+binaries. V3 remains untouched; the next preparation lineage uses V4. This
+was pre-live capability discovery, not live ATTEMPT 1.
 
 The later matched 3A timeline is fixed: after worker-scope verification,
 observe performs separately-accounted service setup; both variants then

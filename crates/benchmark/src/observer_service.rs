@@ -33,6 +33,8 @@ const MAX_PREPARED_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SOURCE_OBSERVER_BYTES: u64 = 128 * 1024 * 1024;
 const STAGED_BINARY_PREFIX: &str = "nemor-benchmark-observer-bin-";
 const STAGED_CONFIG_PREFIX: &str = "nemor-benchmark-observer-config-";
+pub const OBSERVER_PROPERTY_CONTRACT_VERSION: u32 = 2;
+const PREPARED_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObserverReadbackProperty {
@@ -135,7 +137,7 @@ pub const OBSERVER_READBACK_CONTRACT: [ObserverReadbackProperty; 31] = [
     ObserverReadbackProperty {
         interface: SERVICE_INTERFACE,
         property: "ProtectHome",
-        signature: "b",
+        signature: "s",
     },
     ObserverReadbackProperty {
         interface: SERVICE_INTERFACE,
@@ -199,6 +201,106 @@ pub const OBSERVER_READBACK_CONTRACT: [ObserverReadbackProperty; 31] = [
     },
 ];
 
+const OBSERVER_TRANSIENT_PROPERTIES: [&str; 31] = [
+    "Description",
+    "Type",
+    "ExecStart",
+    "DynamicUser",
+    "UMask",
+    "CollectMode",
+    "TimeoutStartUSec",
+    "TimeoutStopUSec",
+    "RuntimeMaxUSec",
+    "RuntimeDirectory",
+    "RuntimeDirectoryMode",
+    "RuntimeDirectoryPreserve",
+    "BindReadOnlyPaths",
+    "WorkingDirectory",
+    "NoNewPrivileges",
+    "CapabilityBoundingSet",
+    "AmbientCapabilities",
+    "ProtectSystem",
+    "ProtectHome",
+    "PrivateTmp",
+    "PrivateDevices",
+    "ProtectKernelModules",
+    "ProtectKernelTunables",
+    "ProtectControlGroups",
+    "MemoryDenyWriteExecute",
+    "LockPersonality",
+    "RestrictRealtime",
+    "RestrictSUIDSGID",
+    "RestrictAddressFamilies",
+    "IPAddressDeny",
+    "SystemCallArchitectures",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PropertyContractFailureKind {
+    PropertyMissing,
+    InterfaceMismatch,
+    SignatureMismatch,
+    ValueContractMismatch,
+    UnsupportedRequiredProperty,
+}
+
+fn introspected_signature<'a>(xml: &'a str, interface: &str, property: &str) -> Option<&'a str> {
+    let marker = format!("<interface name=\"{interface}\">");
+    let body = xml.split(&marker).nth(1)?.split("</interface>").next()?;
+    let marker = format!("<property name=\"{property}\" type=\"");
+    body.split(&marker).nth(1)?.split('"').next()
+}
+
+fn verify_readback_contract(xml: &str) -> Result<()> {
+    let mut expected_properties = OBSERVER_READBACK_CONTRACT.to_vec();
+    for property in OBSERVER_TRANSIENT_PROPERTIES {
+        let (interface, signature) = readback_contract(property)?;
+        let expected = ObserverReadbackProperty {
+            interface,
+            property,
+            signature,
+        };
+        if !expected_properties.contains(&expected) {
+            expected_properties.push(expected);
+        }
+    }
+    for expected in expected_properties {
+        if let Some(observed) = introspected_signature(xml, expected.interface, expected.property) {
+            if observed != expected.signature {
+                bail!(
+                    "property_contract_failure=SIGNATURE_MISMATCH interface={} property={} expected={} observed={}",
+                    expected.interface,
+                    expected.property,
+                    expected.signature,
+                    observed
+                );
+            }
+            continue;
+        }
+        let other_interface = [UNIT_INTERFACE, SERVICE_INTERFACE]
+            .into_iter()
+            .find(|interface| {
+                *interface != expected.interface
+                    && introspected_signature(xml, interface, expected.property).is_some()
+            });
+        if let Some(observed_interface) = other_interface {
+            bail!(
+                "property_contract_failure=INTERFACE_MISMATCH interface={} property={} observed_interface={}",
+                expected.interface,
+                expected.property,
+                observed_interface
+            );
+        }
+        bail!(
+            "property_contract_failure=PROPERTY_MISSING interface={} property={}",
+            expected.interface,
+            expected.property
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserverServicePlan {
     pub unit_name: String,
@@ -221,6 +323,42 @@ pub struct ObserverTransientPropertyAudit {
     pub applicability: String,
     pub required: bool,
     pub request_value: String,
+    pub readback_interface: String,
+    pub readback_signature: String,
+    pub expected_readback_value: String,
+}
+
+fn readback_contract(property: &str) -> Result<(&'static str, &'static str)> {
+    Ok(match property {
+        "Description" | "CollectMode" => (UNIT_INTERFACE, "s"),
+        "Type" => (SERVICE_INTERFACE, "s"),
+        "ExecStart" => (SERVICE_INTERFACE, "a(sasbttttuii)"),
+        "DynamicUser"
+        | "NoNewPrivileges"
+        | "PrivateTmp"
+        | "PrivateDevices"
+        | "ProtectKernelModules"
+        | "ProtectKernelTunables"
+        | "ProtectControlGroups"
+        | "MemoryDenyWriteExecute"
+        | "LockPersonality"
+        | "RestrictRealtime"
+        | "RestrictSUIDSGID" => (SERVICE_INTERFACE, "b"),
+        "UMask" | "RuntimeDirectoryMode" => (SERVICE_INTERFACE, "u"),
+        "TimeoutStartUSec"
+        | "TimeoutStopUSec"
+        | "RuntimeMaxUSec"
+        | "CapabilityBoundingSet"
+        | "AmbientCapabilities" => (SERVICE_INTERFACE, "t"),
+        "RuntimeDirectory" | "SystemCallArchitectures" => (SERVICE_INTERFACE, "as"),
+        "RuntimeDirectoryPreserve" | "WorkingDirectory" | "ProtectSystem" | "ProtectHome" => {
+            (SERVICE_INTERFACE, "s")
+        }
+        "BindReadOnlyPaths" => (SERVICE_INTERFACE, "a(ssbt)"),
+        "RestrictAddressFamilies" => (SERVICE_INTERFACE, "(bas)"),
+        "IPAddressDeny" => (SERVICE_INTERFACE, "a(iayu)"),
+        _ => bail!("observer transient property lacks a readback contract"),
+    })
 }
 
 impl ObserverServicePlan {
@@ -323,6 +461,9 @@ impl ObserverServicePlan {
                     .into(),
                     required: true,
                     request_value: self.property_value_description(&property)?,
+                    readback_interface: readback_contract(&property)?.0.into(),
+                    readback_signature: readback_contract(&property)?.1.into(),
+                    expected_readback_value: self.property_value_description(&property)?,
                     property,
                     signature,
                 })
@@ -361,11 +502,11 @@ impl ObserverServicePlan {
                 .to_string(),
             "CapabilityBoundingSet" | "AmbientCapabilities" => "empty".into(),
             "ProtectSystem" => "strict".into(),
+            "ProtectHome" => "yes".into(),
             "RestrictAddressFamilies" => "allow AF_UNIX only".into(),
             "IPAddressDeny" => "IPv4+IPv6 any".into(),
             "SystemCallArchitectures" => "native".into(),
             "NoNewPrivileges"
-            | "ProtectHome"
             | "PrivateTmp"
             | "PrivateDevices"
             | "ProtectKernelModules"
@@ -433,7 +574,7 @@ impl ObserverServicePlan {
             ("CapabilityBoundingSet", Value::from(0_u64)),
             ("AmbientCapabilities", Value::from(0_u64)),
             ("ProtectSystem", Value::from("strict")),
-            ("ProtectHome", Value::from(true)),
+            ("ProtectHome", Value::from("yes")),
             ("PrivateTmp", Value::from(true)),
             ("PrivateDevices", Value::from(true)),
             ("ProtectKernelModules", Value::from(true)),
@@ -529,6 +670,8 @@ fn staged_config_path(run_id: &str) -> Result<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreparedObserverManifest {
     pub schema_version: u32,
+    #[serde(default)]
+    pub property_contract_version: u32,
     pub run_id: String,
     pub created_uid: u32,
     pub prepared_directory: PathBuf,
@@ -567,8 +710,11 @@ impl IntegrityBoundManifest {
     }
 
     pub fn verify(&self, manifest_path: &Path) -> Result<()> {
-        if self.payload.schema_version != 2 {
+        if self.payload.schema_version != PREPARED_MANIFEST_SCHEMA_VERSION {
             bail!("unsupported observer preparation manifest schema");
+        }
+        if self.payload.property_contract_version != OBSERVER_PROPERTY_CONTRACT_VERSION {
+            bail!("unsupported observer transient property contract");
         }
         if hash_json(&self.payload)? != self.payload_sha256 {
             bail!("observer preparation manifest integrity mismatch");
@@ -582,7 +728,49 @@ impl IntegrityBoundManifest {
             bail!("prepared manifest/config escaped the verified directory");
         }
         if self.payload.transient_property_audit != self.payload.plan.property_audit()? {
-            bail!("observer transient property audit differs from encoded request");
+            let expected = self.payload.plan.property_audit()?;
+            for required in expected {
+                let Some(observed) = self
+                    .payload
+                    .transient_property_audit
+                    .iter()
+                    .find(|entry| entry.property == required.property)
+                else {
+                    bail!(
+                        "property_contract_failure=UNSUPPORTED_REQUIRED_PROPERTY property={}",
+                        required.property
+                    );
+                };
+                if observed.signature != required.signature
+                    || observed.readback_signature != required.readback_signature
+                {
+                    bail!(
+                        "property_contract_failure=SIGNATURE_MISMATCH property={} expected_request={} observed_request={} expected_readback={} observed_readback={}",
+                        required.property,
+                        required.signature,
+                        observed.signature,
+                        required.readback_signature,
+                        observed.readback_signature
+                    );
+                }
+                if observed.request_value != required.request_value
+                    || observed.expected_readback_value != required.expected_readback_value
+                {
+                    bail!(
+                        "property_contract_failure=VALUE_CONTRACT_MISMATCH property={}",
+                        required.property
+                    );
+                }
+                if observed.readback_interface != required.readback_interface {
+                    bail!(
+                        "property_contract_failure=INTERFACE_MISMATCH property={} expected={} observed={}",
+                        required.property,
+                        required.readback_interface,
+                        observed.readback_interface
+                    );
+                }
+            }
+            bail!("observer transient property audit contains unsupported entries");
         }
         let current = std::env::current_exe()?.canonicalize()?;
         if current != self.payload.runner_path.canonicalize()? {
@@ -794,7 +982,8 @@ pub fn prepare_observer_manifest(
         bail!("observer binary does not embed prepared Git commit");
     }
     let payload = PreparedObserverManifest {
-        schema_version: 2,
+        schema_version: PREPARED_MANIFEST_SCHEMA_VERSION,
+        property_contract_version: OBSERVER_PROPERTY_CONTRACT_VERSION,
         run_id: run_id.clone(),
         created_uid: nix::unistd::getuid().as_raw(),
         prepared_directory: destination_dir.to_path_buf(),
@@ -846,7 +1035,7 @@ pub struct ObserverServiceState {
     pub capability_bounding_set: u64,
     pub ambient_capabilities: u64,
     pub protect_system: String,
-    pub protect_home: bool,
+    pub protect_home: String,
     pub private_tmp: bool,
     pub private_devices: bool,
     pub protect_kernel_tunables: bool,
@@ -885,7 +1074,7 @@ impl ObserverServiceState {
             || self.capability_bounding_set != 0
             || self.ambient_capabilities != 0
             || self.protect_system != "strict"
-            || !self.protect_home
+            || self.protect_home != "yes"
             || !self.private_tmp
             || !self.private_devices
             || !self.protect_kernel_tunables
@@ -955,6 +1144,12 @@ impl SystemdObserverServiceBackend {
         Ok(Self {
             connection: Connection::system()?,
         })
+    }
+
+    pub fn systemd_version(&self) -> Result<String> {
+        self.manager()?
+            .get_property("Version")
+            .context("system manager Version property unavailable")
     }
 
     fn manager(&self) -> Result<Proxy<'_>> {
@@ -1117,25 +1312,7 @@ impl ObserverServiceBackend for SystemdObserverServiceBackend {
             "org.freedesktop.DBus.Introspectable",
         )?
         .call("Introspect", &())?;
-        for expected in OBSERVER_READBACK_CONTRACT {
-            let marker = format!("<interface name=\"{}\">", expected.interface);
-            let body = service_xml
-                .split(&marker)
-                .nth(1)
-                .and_then(|tail| tail.split("</interface>").next())
-                .context("observer Unit/Service interface unavailable")?;
-            if !body.contains(&format!(
-                "<property name=\"{}\" type=\"{}\"",
-                expected.property, expected.signature
-            )) {
-                bail!(
-                    "observer readback property contract missing {}.{}",
-                    expected.interface,
-                    expected.property
-                );
-            }
-        }
-        Ok(())
+        verify_readback_contract(&service_xml)
     }
 
     fn unit_exists(&self, unit_name: &str) -> Result<bool> {
@@ -1817,7 +1994,7 @@ mod tests {
             capability_bounding_set: 0,
             ambient_capabilities: 0,
             protect_system: "strict".into(),
-            protect_home: true,
+            protect_home: "yes".into(),
             private_tmp: true,
             private_devices: true,
             protect_kernel_tunables: true,
@@ -1860,10 +2037,20 @@ mod tests {
         assert_eq!(lookup("IPAddressDeny"), Some("a(iayu)"));
         assert_eq!(lookup("CapabilityBoundingSet"), Some("t"));
         assert_eq!(lookup("AmbientCapabilities"), Some("t"));
+        assert_eq!(lookup("ProtectHome"), Some("s"));
         assert_eq!(observer_aux_signature(), "a(sa(sv))");
         let audit = plan.property_audit().unwrap();
         assert_eq!(audit.len(), properties.len());
         assert!(audit.iter().all(|entry| entry.required));
+        let protect_home = audit
+            .iter()
+            .find(|entry| entry.property == "ProtectHome")
+            .unwrap();
+        assert_eq!(protect_home.signature, "s");
+        assert_eq!(protect_home.request_value, "yes");
+        assert_eq!(protect_home.readback_interface, SERVICE_INTERFACE);
+        assert_eq!(protect_home.readback_signature, "s");
+        assert_eq!(protect_home.expected_readback_value, "yes");
         assert_eq!(
             audit
                 .iter()
@@ -1903,6 +2090,67 @@ mod tests {
                 "SystemCallArchitectures",
             ]
         );
+    }
+
+    #[test]
+    fn host_contract_parser_distinguishes_missing_interface_and_signature() {
+        let valid = format!(
+            r#"<interface name="{SERVICE_INTERFACE}"><property name="ProtectHome" type="s" access="read"/></interface>"#
+        );
+        assert_eq!(
+            introspected_signature(&valid, SERVICE_INTERFACE, "ProtectHome"),
+            Some("s")
+        );
+        let wrong_signature = valid.replace("type=\"s\"", "type=\"b\"");
+        let single = [ObserverReadbackProperty {
+            interface: SERVICE_INTERFACE,
+            property: "ProtectHome",
+            signature: "s",
+        }];
+        let check = |xml: &str| -> Result<()> {
+            for expected in single {
+                match introspected_signature(xml, expected.interface, expected.property) {
+                    Some(observed) if observed == expected.signature => {}
+                    Some(observed) => bail!(
+                        "property_contract_failure=SIGNATURE_MISMATCH expected={} observed={}",
+                        expected.signature,
+                        observed
+                    ),
+                    None if introspected_signature(xml, UNIT_INTERFACE, expected.property)
+                        .is_some() =>
+                    {
+                        bail!("property_contract_failure=INTERFACE_MISMATCH")
+                    }
+                    None => bail!("property_contract_failure=PROPERTY_MISSING"),
+                }
+            }
+            Ok(())
+        };
+        assert!(check(&wrong_signature)
+            .unwrap_err()
+            .to_string()
+            .contains("SIGNATURE_MISMATCH"));
+        assert!(check(&valid.replace(SERVICE_INTERFACE, UNIT_INTERFACE))
+            .unwrap_err()
+            .to_string()
+            .contains("INTERFACE_MISMATCH"));
+        assert!(check("<node/>")
+            .unwrap_err()
+            .to_string()
+            .contains("PROPERTY_MISSING"));
+    }
+
+    #[test]
+    fn old_property_contract_manifest_is_rejected() {
+        let mut manifest = fake_manifest(plan());
+        manifest.payload.schema_version = 2;
+        manifest.payload.property_contract_version = 1;
+        manifest.payload_sha256 = hash_json(&manifest.payload).unwrap();
+        assert!(manifest
+            .verify(Path::new("/tmp/prepared/manifest.json"))
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported observer preparation manifest schema"));
     }
 
     #[test]
@@ -2329,7 +2577,8 @@ mod tests {
 
     fn fake_manifest(plan: ObserverServicePlan) -> IntegrityBoundManifest {
         IntegrityBoundManifest::new(PreparedObserverManifest {
-            schema_version: 2,
+            schema_version: PREPARED_MANIFEST_SCHEMA_VERSION,
+            property_contract_version: OBSERVER_PROPERTY_CONTRACT_VERSION,
             run_id: "attempt1".into(),
             created_uid: 1000,
             prepared_directory: PathBuf::from("/tmp/prepared"),
