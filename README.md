@@ -20,6 +20,8 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 Framework + privileged harness validated / real A/B validation pending |
+| Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
 development; ⚪ planned.
@@ -31,9 +33,10 @@ development; ⚪ planned.
 | Platform | CachyOS Linux, x86_64 |
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
-| Workspace crates | 14 |
-| Tests defined / executed | 316 / 316 |
-| Passed / failed / ignored | 316 / 0 / 0 |
+| Workspace crates | 15 |
+| Tests defined / executed | 433 / 433 |
+| Passed / failed / ignored | 433 / 0 / 0 |
+| Phase 10 validation | framework + privileged transient-scope harness validated; real A/B pending |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -145,6 +148,15 @@ production performance claims.
   profit/CPU-per-GiB evaluation, an ineffective-plan cooldown controller and
   owned rollback/recovery. Normal runtime is read-only; live KSM is confined
   to the validated explicit cooperative synthetic harness scopes.
+- a versioned A/B benchmark framework with eight scenarios, capability-aware
+  variants, anonymized host comparability, scoped metrics, deterministic
+  statistics, bounded SQLite/JSON evidence, restore proof and an explicit
+  non-privileged owned-synthetic smoke runner. Real A/B validation is pending.
+- an explicit Checkpoint 2 owned-cgroup harness with dirty-source provenance,
+  evidence-kind isolation, effective-state variant resolution, audited
+  PID/start-ticks ownership, a 64 MiB steady worker, watchdog and restore
+  model. Its full privileged transient-scope lifecycle passed on CachyOS in
+  ATTEMPT 5; this is harness validation, not performance evidence.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process
@@ -278,7 +290,9 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
   validation of Phases 3, 5, 6, 7 and 8.
 - Phase 9 validated both profitable selective KSM and real ineffective-workload
   auto-disable/cooldown on cooperative owned targets.
-- Phase 10 is not started.
+- Phase 10 remains in development: the benchmark framework and privileged
+  owned-cgroup harness are validated; real A/B evidence is pending.
+- Phase 11 is not started.
 
 ## Documentation
 
@@ -292,6 +306,7 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - [DAMON monitor-only telemetry](docs/damon.md)
 - [DAMOS controlled reclaim](docs/damos.md)
 - [Selective KSM](docs/ksm.md)
+- [Benchmark framework](docs/benchmark.md)
 - [Safety model](docs/safety-model.md)
 - [Database](docs/database.md)
 - [CachyOS validation](docs/cachyos-validation.md)
@@ -310,3 +325,4 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 | 7 | 213 | CachyOS real `vaddr`, 9 windows, zero DAMOS, host unchanged | current Phase 7 commit |
 | 8 | 268 | CachyOS controlled synthetic DAMOS pageout; 8 MiB COLD-only reclaim, refault/recovery, host unchanged | current Phase 8 commit |
 | 9 | 316 | CachyOS selective KSM: profitable path plus ineffective auto-disable/cooldown; host unchanged | current Phase 9 commit |
+| 10 checkpoint 2 | 433 | Framework and privileged systemd transient-scope harness validated; real A/B pending | current checkpoint |

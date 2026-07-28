@@ -121,3 +121,20 @@ evaluations linked to policy decisions, plans and controller transitions. It
 stores no memory contents, PFNs, environment variables or secrets. Validation
 hash evidence is bounded to counts, aggregate digests and at most sixteen
 sample hashes per child.
+
+## Benchmark migration
+
+`0008_benchmark.sql` extends the legacy benchmark storage rather than
+replacing it. Normalized experiment, manifest, bounded time-series sample,
+event, summary and comparison tables retain scenario/version, variant,
+fingerprint/config hashes, seeds, repetitions, validity and explicit missing
+evidence. Foreign keys and run/time indexes support bounded reads. Sample
+insertion is capped by runner configuration and scenario duration/interval;
+invalid runs remain permanent evidence. No RAM contents, URLs, document names,
+VM contents, secrets or PFNs are stored.
+
+The unreleased Phase 10 migration also stores evidence kind, source-state and
+binary hashes, development/performance eligibility, requested/resolved
+variant state, effective-state hash, variant difference, owned-cgroup evidence
+and restore evidence. Harness-validation rows are isolated from performance
+aggregates.

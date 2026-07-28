@@ -246,3 +246,43 @@ CPU, residual global accounting or safety failure—causes the owned controller
 stop and cooldown rejection. Non-zero historical KSM counters are recorded but
 do not imply a live external consumer; current process `smaps` `KSM:` bytes and
 mergeability flags provide that evidence. It is never included in `--all`.
+
+## Phase 10 benchmark validation
+
+Checkpoint 1 executes no privileged benchmark. Future performance pressure
+workloads will bind to an owned cgroup v2 with a measured bounded
+`memory.max`, host-headroom guard, watchdog, timeout, audit, rollback,
+recovery and before/after structural snapshots. It must never intentionally
+trigger host OOM. Real application scenarios remain manual/cooperative and
+the zswap/NVMe variant remains pending Phase 6 boot validation.
+
+The first Phase 10 privileged checkpoint is only
+`nemor-benchmark validate-cgroup`. It validates a 64 MiB owned steady worker
+inside one derived owned cgroup with a 128 MiB non-OOM ceiling, dynamic host
+reserve, exact identity, durable pre-mutation audit, exclusive membership,
+metrics, watchdog and complete removal. It is harness evidence, not a
+performance or capacity benchmark. No other Phase 10 privileged scenario is
+enabled at this checkpoint.
+
+Checkpoint 2 uses a systemd transient scope through the fixed system D-Bus
+destination `org.freedesktop.systemd1`. It uses `StartTransientUnit` with
+collision-failing mode and later `StopUnit` only for the exact audited unit.
+The client invokes Manager `Subscribe()`, installs the `JobRemoved` match, and
+then issues the method. Each returned job is awaited through that signal;
+only `result=done` permits the next lifecycle stage.
+The actual cgroup path comes exclusively from systemd's `ControlGroup`
+property. No `Delegate=`, subtree-controller write, systemd command-line tool,
+or locally derived unit path is used.
+The D-Bus object is read through two fixed interfaces: `Unit` for
+`Id`/`LoadState`/`ActiveState`/`SubState`, and `Scope` for `MemoryMax`,
+`ControlGroup`, accounting flags, and the runtime bound. The kernel
+`memory.max` and exact PID/start-ticks membership remain independent mandatory
+cross-checks before the worker receives `ALLOCATE`.
+
+ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
+gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
+worker/unit/cgroup final absence, structural restore and full host restore.
+The validation was a dirty development build and is explicitly
+`harness_validation`; it is ineligible for performance claims. Attempts 1–4
+were safe harness-development iterations, not performance failures. Real
+Phase 10 A/B validation remains pending.

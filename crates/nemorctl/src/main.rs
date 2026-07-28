@@ -2,13 +2,14 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use nemorctl::{
-    cgroups_status, damon_export, damon_report_latest, damon_sessions, damon_status,
-    damos_blacklist, damos_history, damos_plan_latest, damos_status, doctor, ksm_history,
-    ksm_plan_latest, ksm_processes, ksm_report_latest, ksm_status, policy_latest, policy_status,
-    render_cgroups_status, render_doctor, render_policy_latest, render_policy_status,
-    render_report, render_status, render_workload, render_zram, report_latest, status,
-    tiering_recommend, tiering_report_latest, tiering_status, workload_latest, zram_profiles,
-    zram_report_latest, zram_status, DoctorEnvironment,
+    benchmark_compare, benchmark_export, benchmark_history, benchmark_list, benchmark_plan,
+    benchmark_report, benchmark_status, cgroups_status, damon_export, damon_report_latest,
+    damon_sessions, damon_status, damos_blacklist, damos_history, damos_plan_latest, damos_status,
+    doctor, ksm_history, ksm_plan_latest, ksm_processes, ksm_report_latest, ksm_status,
+    policy_latest, policy_status, render_cgroups_status, render_doctor, render_policy_latest,
+    render_policy_status, render_report, render_status, render_workload, render_zram,
+    report_latest, status, tiering_recommend, tiering_report_latest, tiering_status,
+    workload_latest, zram_profiles, zram_report_latest, zram_status, DoctorEnvironment,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -69,6 +70,10 @@ enum Command {
     Ksm {
         #[command(subcommand)]
         command: KsmCommand,
+    },
+    Benchmark {
+        #[command(subcommand)]
+        command: BenchmarkCommand,
     },
 }
 
@@ -258,6 +263,48 @@ enum KsmReportCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum BenchmarkCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Plan {
+        scenario: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Report {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Compare {
+        experiment_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    History {
+        #[arg(long)]
+        json: bool,
+    },
+    Export {
+        experiment_id: String,
+        #[arg(long, value_enum)]
+        format: BenchmarkExportFormat,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BenchmarkExportFormat {
+    Json,
+    Csv,
 }
 
 fn main() -> ExitCode {
@@ -458,6 +505,67 @@ fn run() -> anyhow::Result<i32> {
             command: KsmCommand::History { json },
         } => {
             print!("{}", render_zram(&ksm_history(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Benchmark {
+            command: BenchmarkCommand::List { json },
+        } => {
+            print!("{}", render_zram(&benchmark_list(), json)?);
+            Ok(0)
+        }
+        Command::Benchmark {
+            command: BenchmarkCommand::Status { json },
+        } => {
+            print!("{}", render_zram(&benchmark_status(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Benchmark {
+            command: BenchmarkCommand::Plan { scenario, json },
+        } => {
+            print!("{}", render_zram(&benchmark_plan(&scenario)?, json)?);
+            Ok(0)
+        }
+        Command::Benchmark {
+            command: BenchmarkCommand::Report { run_id, json },
+        } => {
+            let run_id = (run_id != "latest").then_some(run_id.as_str());
+            print!(
+                "{}",
+                render_zram(&benchmark_report(&cli.config, run_id)?, json)?
+            );
+            Ok(0)
+        }
+        Command::Benchmark {
+            command:
+                BenchmarkCommand::Compare {
+                    experiment_id,
+                    json,
+                },
+        } => {
+            print!(
+                "{}",
+                render_zram(&benchmark_compare(&cli.config, &experiment_id)?, json)?
+            );
+            Ok(0)
+        }
+        Command::Benchmark {
+            command: BenchmarkCommand::History { json },
+        } => {
+            print!("{}", render_zram(&benchmark_history(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Benchmark {
+            command:
+                BenchmarkCommand::Export {
+                    experiment_id,
+                    format,
+                },
+        } => {
+            let format = match format {
+                BenchmarkExportFormat::Json => "json",
+                BenchmarkExportFormat::Csv => "csv",
+            };
+            print!("{}", benchmark_export(&cli.config, &experiment_id, format)?);
             Ok(0)
         }
     }

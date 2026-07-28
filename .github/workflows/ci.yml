@@ -46,3 +46,9 @@ jobs:
 
       - name: Run privileged validation harness read-only preflight
         run: cargo run -p nemor-test-support --bin nemor-privileged-validation -- --preflight
+
+      - name: Benchmark framework read-only preflight
+        run: cargo run -p nemor-benchmark -- preflight --json
+
+      - name: Tiny non-pressure benchmark instrumentation smoke
+        run: cargo run -p nemor-benchmark -- smoke --scenario synthetic_compressible --bytes 1048576 --seed 1 --database /tmp/nemor-benchmark-ci.sqlite --report-dir /tmp/nemor-benchmark-ci-reports

@@ -137,3 +137,33 @@ validated mutating paths are manual `--ksm` and `--ksm-inefficient` scopes with
 cooperative synthetic children; they
 cannot opt arbitrary external processes into KSM and hard-rejects global
 `run=2`. See [Selective KSM](ksm.md).
+
+## Phase 10 benchmark boundary
+
+`nemor-benchmark` is the fifteenth workspace crate. It owns versioned scenario
+and variant definitions, manifests, fingerprinting, metric semantics,
+statistics, comparison/acceptance, report persistence, restore proof and the
+explicit safe runner. It orchestrates validated component APIs but cannot
+write KSM, DAMON/DAMOS, zram, zswap or cgroup sysfs behind those boundaries.
+Checkpoint 1 runner execution is restricted to tiny owned non-pressure
+synthetic smoke workloads. `nemorctl` exposes read-only benchmark inspection;
+normal `nemord` production behavior is unchanged.
+
+Checkpoint 2 uses a narrowly scoped `zbus` system-bus backend for systemd
+transient scopes. Only fixed systemd destination/interface/method/property
+identifiers are exposed. The backend is not a generic systemd control API and
+does not invoke systemd command-line tools. It creates fixed `Unit` and
+`Scope` proxies for the same systemd-returned object path. Generic identity
+and lifecycle state is read from `org.freedesktop.systemd1.Unit`; bounded
+resource-control state and `ControlGroup` are read from
+`org.freedesktop.systemd1.Scope`. A fixed property/interface/type contract is
+checked during read-only capability discovery.
+
+`Manager.Subscribe()` and the `JobRemoved` match precede
+`StartTransientUnit(mode=fail)`. The exact returned job path must complete
+with `result=done`; `GetUnit(expected unit)` and `GetUnitByPID(exact worker)`
+must resolve the same object. `StopUnit` is likewise asynchronous and bounded.
+Systemd is the cgroup writer. Nemor does not write controller, limit or
+membership files; create/remove systemd cgroups; restructure `user.slice`; or
+migrate foreign processes. ATTEMPT 5 validated this architecture and its
+common exact-owned cleanup path on CachyOS.

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use actuator::{BackendKind, CgroupBackend, CgroupStatus, LinuxCgroupBackend};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use common::{
     CheckResult, CheckStatus, DoctorReport, LinuxPaths, LoadedConfig, StatusReport, StatusState,
 };
@@ -427,6 +427,89 @@ pub fn ksm_status(config_path: &Path) -> Result<ksm::KsmReport> {
             .map(|value| value.as_nanos())
             .unwrap_or_default(),
     ))
+}
+
+pub fn benchmark_list() -> Vec<benchmark::ScenarioDefinition> {
+    benchmark::required_scenarios()
+}
+
+pub fn benchmark_status(config_path: &Path) -> Result<serde_json::Value> {
+    let loaded = LoadedConfig::load(config_path)?;
+    let history = benchmark::BenchmarkStore::open_read_only(&loaded.config.general.database_path)
+        .and_then(|store| store.list_summaries(1))
+        .unwrap_or_default();
+    Ok(serde_json::json!({
+        "phase": "in_development",
+        "framework_implemented": true,
+        "real_ab_validation": "pending",
+        "execution_available_via_nemorctl": false,
+        "scenario_count": benchmark::ScenarioId::ALL.len(),
+        "variants": benchmark::default_variant_availability(),
+        "latest": history.first(),
+    }))
+}
+
+pub fn benchmark_plan(scenario: &str) -> Result<benchmark::ScenarioDefinition> {
+    let scenario: benchmark::ScenarioId = scenario.parse()?;
+    benchmark::required_scenarios()
+        .into_iter()
+        .find(|definition| definition.scenario_id == scenario)
+        .context("required benchmark scenario is missing")
+}
+
+pub fn benchmark_report(config_path: &Path, run_id: Option<&str>) -> Result<serde_json::Value> {
+    let loaded = LoadedConfig::load(config_path)?;
+    let store = benchmark::BenchmarkStore::open_read_only(&loaded.config.general.database_path)?;
+    match run_id {
+        Some(run_id) => store.report(run_id),
+        None => store.latest(),
+    }
+}
+
+pub fn benchmark_history(config_path: &Path) -> Result<Vec<serde_json::Value>> {
+    let loaded = LoadedConfig::load(config_path)?;
+    benchmark::BenchmarkStore::open_read_only(&loaded.config.general.database_path)?
+        .list_summaries(100)
+}
+
+pub fn benchmark_compare(config_path: &Path, experiment_id: &str) -> Result<serde_json::Value> {
+    let loaded = LoadedConfig::load(config_path)?;
+    let store = benchmark::BenchmarkStore::open_read_only(&loaded.config.general.database_path)?;
+    let runs = store.list_summaries(100)?;
+    let filtered: Vec<_> = runs
+        .into_iter()
+        .filter(|run| {
+            run.get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|run_id| run_id.contains(experiment_id))
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "experiment_id": experiment_id,
+        "runs": filtered,
+        "comparison_status": "not_evaluated_without_three_comparable_repetitions"
+    }))
+}
+
+pub fn benchmark_export(config_path: &Path, experiment_id: &str, format: &str) -> Result<String> {
+    let comparison = benchmark_compare(config_path, experiment_id)?;
+    match format {
+        "json" => Ok(serde_json::to_string_pretty(&comparison)? + "\n"),
+        "csv" => {
+            let mut output = String::from("experiment_id,run_id,valid,state\n");
+            for run in comparison["runs"].as_array().into_iter().flatten() {
+                output.push_str(&format!(
+                    "{},{},{},{}\n",
+                    experiment_id,
+                    run["run_id"].as_str().unwrap_or(""),
+                    run["valid"].as_bool().unwrap_or(false),
+                    run["state"].as_str().unwrap_or("")
+                ));
+            }
+            Ok(output)
+        }
+        _ => bail!("benchmark export format must be json or csv"),
+    }
 }
 
 pub fn ksm_processes(config_path: &Path) -> Result<Vec<ksm::KsmProcessMetrics>> {

@@ -311,3 +311,51 @@ stopped its owned scanner, entered COOLDOWN and rejected the same plan.
 Sustained CPU was about 0.480%. Both runs preserved content, configuration and
 host structure. These are host-specific synthetic results, not application
 benchmarks.
+
+## Phase 10 Checkpoints 1–2
+
+The fifteenth crate implements the reproducible A/B framework. Only
+non-privileged tiny owned synthetic instrumentation smoke runs are permitted
+at this checkpoint. They validate fingerprints, procfs/PSI collection,
+deterministic touched payloads, SQLite/JSON reporting and structural restore
+comparison. They provide no evidence for the 30% favorable capacity target,
+15% gaming background target, OOM avoidance, frametime, or full Phase 10
+validation. Phase 6 zswap+NVMe remains pending.
+
+Checkpoint 2 ATTEMPT 1 safely aborted under the superseded raw-child model
+because the Konsole leaf did not delegate the memory controller to children;
+cleanup and host restore passed. ATTEMPT 2 preparation changes only the
+harness boundary to a systemd-owned transient scope created through
+`StartTransientUnit`. ATTEMPT 2 safely aborted before payload allocation:
+systemd's journal proves the exact scope started and later deactivated, while
+the client timed out because it had not invoked Manager `Subscribe()` to
+enable `JobRemoved` delivery. The property request was therefore accepted;
+the defect was client-side asynchronous completion tracking. The raw swap
+`Used` field moved by -32 KiB, but parsed swap topology and captured host
+configuration were unchanged.
+ATTEMPT 3 completed the subscribed start job but failed post-start readback
+because systemd 261.2 no longer exports the deprecated `CPUAccounting` scope
+property. No payload was allocated. Its report retained an owned unit and
+worker at final snapshot time, so full harness restore failed; the journal
+later recorded deactivation and current read-only inspection proves the exact
+unit and PID are absent.
+ATTEMPT 4 completed the start job and independently matched `GetUnit`,
+`GetUnitByPID`, and `Unit.Id`, then stopped before payload allocation when the
+client requested `ControlGroup` from the generic Unit interface instead of
+the Scope interface. Common recovery removed the exact worker and scope, and
+all restore gates passed. The readback now uses a fixed systemd-261-compatible
+Unit/Scope property map without changing the transient workload or cleanup
+semantics.
+ATTEMPT 5 used that corrected routing and passed every mandatory gate. It
+proved the subscribed asynchronous job lifecycle, exact PID/start-ticks and
+unit identity, typed systemd and kernel readback, payload allocation only
+after the safety boundary, bounded metrics and integrity monitoring, watchdog,
+zero OOM/OOM kill, common cleanup, scope collection, final owned-resource
+absence, configuration restore and full host restore. The fixed 64 MiB worker
+ran beneath a 128 MiB `MemoryMax`, produced eight samples and 26 heartbeats,
+and had zero KiB runtime swap-used delta. These are harness-validation facts,
+not performance results.
+
+Phase 10 therefore remains in development: framework and privileged harness
+validated, real A/B validation pending. No capacity, OOM-avoidance or
+optimization result is claimed.

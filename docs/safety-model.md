@@ -106,3 +106,26 @@ all paths. Owned rollback uses `run=0`, headroom-guarded child unmerge or child
 termination, scanner snapshot restoration and idempotent owned recovery.
 Real profitable and inefficient-controller paths are validated only for owned
 synthetic targets; normal runtime remains non-mutating.
+
+## Benchmark safety
+
+Phase 10 never turns measurement into an authority bypass. The normal CLI is
+read-only and the explicit runner only permits small owned synthetic smoke
+workloads at Checkpoint 1. No configuration-supplied shell command is
+executed. Future memory-pressure validation is confined to an owned cgroup
+whose limit is below measured host headroom, with watchdog, timeout, structural
+snapshot and restore proof. Host OOM and restore mismatch are safety failures.
+Unavailable or unknown capability fails closed.
+
+Checkpoint 2 adds one explicit privileged-capable transient-scope lifecycle,
+validated explicitly in ATTEMPT 5 but never executed automatically. Systemd
+PID 1 is the sole cgroup
+writer. Audit precedes `StartTransientUnit`; the request contains one exact
+PID, 128 MiB `MemoryMax`, accounting and a 15 second bound. Nemor resolves the
+kernel path only from systemd's `ControlGroup` property and performs read-only
+metric collection there. It never writes `memory.max`, `cgroup.procs` or
+`cgroup.subtree_control`, and never adopts or replaces an unknown unit.
+PID/start-ticks remain authoritative through cleanup. Every spawned-worker
+path evaluates worker cleanup; every post-mutation path evaluates scope
+cleanup. Only the exact owned worker, unit and transaction may be affected,
+and `host_unchanged` requires all three resources to be absent.
