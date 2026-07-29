@@ -28,7 +28,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub const PREPARED_PRESSURE_SCHEMA_VERSION: u32 = 3;
+pub const PREPARED_PRESSURE_SCHEMA_VERSION: u32 = 4;
 pub const PRESSURE_RUN_PLAN_VERSION: u32 = 1;
 pub const CONSERVATIVE_PILOT_POLICY_VERSION: u32 = 1;
 pub const PRESSURE_WORKER_PROTOCOL_VERSION: u32 = 1;
@@ -278,6 +278,7 @@ pub struct PreparedPressurePayload {
     pub memory_max_derivation: MemoryMaxDerivation,
     pub run_plan: PressureExperimentRunPlan,
     pub pressure_plans: Vec<ProgressivePressurePlan>,
+    pub expected_level_workload_identities: Vec<Vec<String>>,
     pub observer_property_contract_version: u32,
     pub observer_runs: Vec<PreparedObserveRun>,
     pub capacity_gain_percent: EvaluationState,
@@ -311,6 +312,7 @@ impl PreparedPressureManifest {
                 != crate::pressure_live::PRESSURE_EXECUTION_SCHEMA_VERSION
             || self.payload.worker_executable_path != self.payload.runner_path
             || self.payload.pressure_plans.len() != 6
+            || self.payload.expected_level_workload_identities.len() != 6
             || self.payload.observer_runs.len() != 3
             || self.payload.observer_property_contract_version != OBSERVER_PROPERTY_CONTRACT_VERSION
             || !self.payload.performance_source_eligible
@@ -342,6 +344,41 @@ impl PreparedPressureManifest {
                     != self.payload.memory_max_derivation.shared_memory_max_bytes
             {
                 bail!("per-run pressure contract differs from the paired frozen pilot");
+            }
+        }
+        for ((run, plan), identities) in self
+            .payload
+            .run_plan
+            .runs
+            .iter()
+            .zip(&self.payload.pressure_plans)
+            .zip(&self.payload.expected_level_workload_identities)
+        {
+            if identities.len() != plan.levels.len() {
+                bail!("prepared pressure workload identity schedule is incomplete");
+            }
+            for (level, frozen) in plan.levels.iter().zip(identities) {
+                let expected = crate::pressure::pressure_workload_identity(
+                    &crate::pressure::PressureWorkloadIdentityContract {
+                        domain: "nemor.phase10.pressure_workload",
+                        version: crate::pressure::PRESSURE_WORKLOAD_IDENTITY_VERSION,
+                        scenario: &plan.scenario,
+                        scenario_version: plan.scenario_version,
+                        generator_id: &plan.generator_id,
+                        generator_version: plan.generator_version,
+                        run_seed: run.run_seed,
+                        level_index: level.level_index,
+                        planned_logical_bytes: level.target_logical_bytes,
+                        planned_touched_bytes: level.target_touched_bytes,
+                        pressure_plan_version: plan.version,
+                        worker_implementation_identity: &self
+                            .payload
+                            .worker_implementation_identity,
+                    },
+                )?;
+                if frozen != &expected {
+                    bail!("prepared pressure workload identity is not integrity-bound");
+                }
             }
         }
         for repetition in 0..3 {
@@ -611,6 +648,34 @@ pub fn prepare_pressure_experiment(
         INCOMPRESSIBLE_GENERATOR_ID,
         SYNTHETIC_GENERATOR_VERSION
     )));
+    let expected_level_workload_identities = run_plan
+        .runs
+        .iter()
+        .zip(&pressure_plans)
+        .map(|(run, plan)| {
+            plan.levels
+                .iter()
+                .map(|level| {
+                    crate::pressure::pressure_workload_identity(
+                        &crate::pressure::PressureWorkloadIdentityContract {
+                            domain: "nemor.phase10.pressure_workload",
+                            version: crate::pressure::PRESSURE_WORKLOAD_IDENTITY_VERSION,
+                            scenario: &plan.scenario,
+                            scenario_version: plan.scenario_version,
+                            generator_id: &plan.generator_id,
+                            generator_version: plan.generator_version,
+                            run_seed: run.run_seed,
+                            level_index: level.level_index,
+                            planned_logical_bytes: level.target_logical_bytes,
+                            planned_touched_bytes: level.target_touched_bytes,
+                            pressure_plan_version: plan.version,
+                            worker_implementation_identity: &worker_implementation_identity,
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
     let payload = PreparedPressurePayload {
         schema_version: PREPARED_PRESSURE_SCHEMA_VERSION,
         experiment_id,
@@ -650,6 +715,7 @@ pub fn prepare_pressure_experiment(
         memory_max_derivation,
         run_plan,
         pressure_plans,
+        expected_level_workload_identities,
         observer_property_contract_version: OBSERVER_PROPERTY_CONTRACT_VERSION,
         observer_runs,
         capacity_gain_percent: EvaluationState::NotEvaluated,

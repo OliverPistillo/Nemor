@@ -23,7 +23,7 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const PRESSURE_EXECUTION_SCHEMA_VERSION: u32 = 1;
+pub const PRESSURE_EXECUTION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PressurePreflightHost {
@@ -267,15 +267,52 @@ pub enum PressureExperimentState {
     ExecutionError,
 }
 
+pub fn pressure_execution_exit_status(state: PressureExperimentState) -> i32 {
+    if state == PressureExperimentState::CompletedFrameworkValidation {
+        0
+    } else {
+        1
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PressureRunRecord {
     pub planned: PlannedPressureRun,
     pub state: PressureRunState,
     pub levels: Vec<LevelEvidence>,
+    pub level_progress: Vec<PressureLevelProgress>,
     pub structural_before: Option<StructuralSnapshot>,
     pub structural_after: Option<StructuralSnapshot>,
     pub stop_reason: Option<String>,
     pub restore_passed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureLevelProgressStage {
+    TransitionStarting,
+    LevelAcknowledged,
+    StabilizationStarting,
+    HoldStarting,
+    Sampling,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PressureLevelProgress {
+    pub level_index: usize,
+    pub stage: PressureLevelProgressStage,
+    pub monotonic_ns: u64,
+    pub expected_workload_identity: String,
+    pub acknowledgement: Option<crate::pressure::WorkerLevelAcknowledgement>,
+    pub transition_duration_ms: Option<u64>,
+    pub sample: Option<crate::pressure::PressureLevelSample>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PressurePersistenceEvent {
+    Progress(Box<PressureLevelProgress>),
+    Completed(Box<LevelEvidence>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +342,7 @@ impl PressureExecutionEvidence {
                     state: planned.state,
                     planned,
                     levels: Vec::new(),
+                    level_progress: Vec::new(),
                     structural_before: None,
                     structural_after: None,
                     stop_reason: None,
@@ -340,6 +378,12 @@ impl IncrementalPressureStore {
                  experiment_id TEXT NOT NULL, run_order INTEGER NOT NULL,
                  level_index INTEGER NOT NULL, evidence_json TEXT NOT NULL,
                  PRIMARY KEY(experiment_id,run_order,level_index)
+             );
+             CREATE TABLE pressure_level_progress (
+                 experiment_id TEXT NOT NULL, run_order INTEGER NOT NULL,
+                 level_index INTEGER NOT NULL, stage TEXT NOT NULL,
+                 monotonic_ns INTEGER NOT NULL, evidence_json TEXT NOT NULL,
+                 PRIMARY KEY(experiment_id,run_order,level_index,stage,monotonic_ns)
              );",
         )?;
         Ok(Self {
@@ -379,6 +423,21 @@ impl IncrementalPressureStore {
                     ],
                 )?;
             }
+            for progress in &run.level_progress {
+                connection.execute(
+                    "INSERT OR REPLACE INTO pressure_level_progress(
+                         experiment_id,run_order,level_index,stage,monotonic_ns,evidence_json
+                     ) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        evidence.experiment_id,
+                        order as i64,
+                        progress.level_index as i64,
+                        format!("{:?}", progress.stage),
+                        progress.monotonic_ns as i64,
+                        serde_json::to_string(progress)?
+                    ],
+                )?;
+            }
         }
         Ok(())
     }
@@ -389,7 +448,7 @@ pub trait PressureExecutionBackend {
         &mut self,
         manifest: &PreparedPressureManifest,
         order_index: usize,
-        persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
+        persist_event: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
     ) -> Result<PressureBackendRunResult>;
 
     fn structural_snapshot(&mut self) -> StructuralSnapshot {
@@ -400,17 +459,80 @@ pub trait PressureExecutionBackend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureCleanupEvidence {
     pub worker_absent: bool,
+    pub worker_scope_stopped: bool,
+    pub worker_scope_zero_members: bool,
     pub worker_scope_absent: bool,
     pub observer_absent: bool,
     pub observer_runtime_directory_absent: bool,
+    pub stop_job_result: Option<String>,
+    pub final_active_state: Option<String>,
+    pub final_sub_state: Option<String>,
+    pub cgroup_member_count: Option<usize>,
+    pub unit_removed: bool,
+    pub removal_wait_ms: u64,
+    pub classification: PressureScopeCleanupClassification,
+    pub failure_reason: Option<String>,
 }
 
 impl PressureCleanupEvidence {
     pub fn passed(&self) -> bool {
         self.worker_absent
+            && self.worker_scope_stopped
+            && self.worker_scope_zero_members
             && self.worker_scope_absent
             && self.observer_absent
             && self.observer_runtime_directory_absent
+            && self.unit_removed
+            && self.classification == PressureScopeCleanupClassification::Clean
+    }
+
+    #[cfg(test)]
+    fn simulated(passed: bool) -> Self {
+        Self {
+            worker_absent: passed,
+            worker_scope_stopped: passed,
+            worker_scope_zero_members: passed,
+            worker_scope_absent: passed,
+            observer_absent: passed,
+            observer_runtime_directory_absent: passed,
+            stop_job_result: Some(if passed { "done" } else { "failed" }.into()),
+            final_active_state: Some(if passed { "inactive" } else { "active" }.into()),
+            final_sub_state: Some(if passed { "dead" } else { "running" }.into()),
+            cgroup_member_count: Some(usize::from(!passed)),
+            unit_removed: passed,
+            removal_wait_ms: 0,
+            classification: if passed {
+                PressureScopeCleanupClassification::Clean
+            } else {
+                PressureScopeCleanupClassification::ActiveOrMembered
+            },
+            failure_reason: (!passed).then(|| "simulated cleanup failure".into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureScopeCleanupClassification {
+    Clean,
+    ActiveOrMembered,
+    TransientScopeRemovalTimeout,
+    StopFailed,
+}
+
+pub fn wait_for_transient_scope_removal(
+    timeout: Duration,
+    mut unit_exists: impl FnMut() -> Result<bool>,
+) -> Result<u64> {
+    let started = Instant::now();
+    loop {
+        if !unit_exists()? {
+            return Ok(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+        }
+        if started.elapsed() >= timeout {
+            bail!("TRANSIENT_SCOPE_REMOVAL_TIMEOUT");
+        }
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -432,10 +554,26 @@ pub fn execute_pressure_with_backend(
     for order in 0..evidence.runs.len() {
         evidence.runs[order].structural_before = Some(backend.structural_snapshot());
         store.persist(&evidence)?;
-        let mut collected = Vec::new();
-        let result = backend.execute_run(manifest, order, &mut |level| {
-            collected.push(level);
-            evidence.runs[order].levels = collected.clone();
+        let result = backend.execute_run(manifest, order, &mut |event| {
+            match event {
+                PressurePersistenceEvent::Progress(progress) => {
+                    evidence.runs[order].level_progress.push(*progress);
+                }
+                PressurePersistenceEvent::Completed(level) => {
+                    evidence.runs[order]
+                        .level_progress
+                        .push(PressureLevelProgress {
+                            level_index: level.level_index,
+                            stage: PressureLevelProgressStage::Completed,
+                            monotonic_ns: level.ended_monotonic_ns,
+                            expected_workload_identity: level.workload_identity.clone(),
+                            acknowledgement: Some(level.worker_acknowledgement.clone()),
+                            transition_duration_ms: None,
+                            sample: None,
+                        });
+                    evidence.runs[order].levels.push(*level);
+                }
+            }
             store.persist(&evidence)
         });
         match result {
@@ -452,10 +590,14 @@ pub fn execute_pressure_with_backend(
                 evidence.runs[order].restore_passed = Some(restore_passed);
                 store.persist(&evidence)?;
                 if !restore_passed {
+                    let original = match result.execution_error.as_deref() {
+                        Some(error) => format!("{}; execution_error={error}", result.reason),
+                        None => result.reason.clone(),
+                    };
                     evidence.runs[order].state = PressureRunState::SafetyAbort;
                     evidence.runs[order].stop_reason = Some(format!(
                         "RESTORE_FAILURE cleanup={:?} structural_match={structural_restore}; original={}",
-                        result.cleanup, result.reason
+                        result.cleanup, original
                     ));
                     evidence.state = PressureExperimentState::SafetyAbort;
                     if let Some(error) = result.execution_error {
@@ -553,9 +695,9 @@ impl PressureExecutionBackend for RealPressureExecutionBackend {
         &mut self,
         manifest: &PreparedPressureManifest,
         order_index: usize,
-        persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
+        persist_event: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
     ) -> Result<PressureBackendRunResult> {
-        execute_real_pressure_run(manifest, order_index, persist_level)
+        execute_real_pressure_run(manifest, order_index, persist_event)
     }
 }
 
@@ -721,7 +863,7 @@ fn send_stop(
 fn execute_real_pressure_run(
     manifest: &PreparedPressureManifest,
     order_index: usize,
-    persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
+    persist_event: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
 ) -> Result<PressureBackendRunResult> {
     use crate::systemd::TransientScopeBackend;
     let payload = &manifest.payload;
@@ -882,6 +1024,31 @@ fn execute_real_pressure_run(
         }
         let total_deadline = Instant::now() + total_timeout;
         for level in &plan.levels {
+            let expected_workload_identity = payload
+                .expected_level_workload_identities
+                .get(order_index)
+                .and_then(|levels| levels.get(level.level_index))
+                .context("frozen pressure workload identity missing")?
+                .clone();
+            let recomputed_workload_identity = crate::pressure::pressure_workload_identity(
+                &crate::pressure::PressureWorkloadIdentityContract {
+                    domain: "nemor.phase10.pressure_workload",
+                    version: crate::pressure::PRESSURE_WORKLOAD_IDENTITY_VERSION,
+                    scenario: &plan.scenario,
+                    scenario_version: plan.scenario_version,
+                    generator_id: &plan.generator_id,
+                    generator_version: plan.generator_version,
+                    run_seed: planned.run_seed,
+                    level_index: level.level_index,
+                    planned_logical_bytes: level.target_logical_bytes,
+                    planned_touched_bytes: level.target_touched_bytes,
+                    pressure_plan_version: plan.version,
+                    worker_implementation_identity: &payload.worker_implementation_identity,
+                },
+            )?;
+            if recomputed_workload_identity != expected_workload_identity {
+                bail!("frozen pressure workload identity mismatch before allocation");
+            }
             if Instant::now() >= total_deadline {
                 final_state = PressureRunState::SafetyAbort;
                 reason = "WATCHDOG_TIMEOUT before next level".into();
@@ -926,6 +1093,17 @@ fn execute_real_pressure_run(
                 level,
                 prior,
             )?;
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index: level.level_index,
+                    stage: PressureLevelProgressStage::TransitionStarting,
+                    monotonic_ns: timestamp_ns(),
+                    expected_workload_identity: expected_workload_identity.clone(),
+                    acknowledgement: None,
+                    transition_duration_ms: None,
+                    sample: None,
+                },
+            )))?;
             let (version, experiment_id, ipc_run_id, ipc_pid, ipc_ticks) =
                 worker_message_identity(&payload.experiment_id, &run_id, pid, start_ticks);
             let transition_started = Instant::now();
@@ -953,6 +1131,22 @@ fn execute_real_pressure_run(
                 } => acknowledgement,
                 _ => bail!("worker LEVEL_ACK missing"),
             };
+            let transition_duration_ms = transition_started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index: level.level_index,
+                    stage: PressureLevelProgressStage::LevelAcknowledged,
+                    monotonic_ns: timestamp_ns(),
+                    expected_workload_identity: expected_workload_identity.clone(),
+                    acknowledgement: Some(acknowledgement.clone()),
+                    transition_duration_ms: Some(transition_duration_ms),
+                    sample: None,
+                },
+            )))?;
             if !touched_ack_allows_hold(
                 acknowledgement.actual_touched_bytes,
                 level.target_touched_bytes,
@@ -996,13 +1190,7 @@ fn execute_real_pressure_run(
                     worker_memory_max_bytes: plan.worker_memory_max_bytes,
                     generator_id: plan.generator_id.clone(),
                     generator_version: plan.generator_version,
-                    workload_identity: crate::performance::workload_identity(
-                        &plan.scenario,
-                        &plan.generator_id,
-                        plan.generator_version,
-                        level.seed,
-                        level.target_logical_bytes,
-                    )?,
+                    workload_identity: expected_workload_identity.clone(),
                     payload_integrity_identity,
                     started_monotonic_ns: started,
                     ended_monotonic_ns: started.saturating_add(1),
@@ -1026,9 +1214,20 @@ fn execute_real_pressure_run(
                     failure_reason: Some("worker_level_contract_failure".into()),
                 };
                 invalid.validate(level, plan)?;
-                persist_level(invalid)?;
+                persist_event(PressurePersistenceEvent::Completed(Box::new(invalid)))?;
                 break;
             }
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index: level.level_index,
+                    stage: PressureLevelProgressStage::StabilizationStarting,
+                    monotonic_ns: timestamp_ns(),
+                    expected_workload_identity: expected_workload_identity.clone(),
+                    acknowledgement: Some(acknowledgement.clone()),
+                    transition_duration_ms: Some(transition_duration_ms),
+                    sample: None,
+                },
+            )))?;
             thread::sleep(Duration::from_millis(plan.stabilization_duration_ms));
             if Instant::now() >= level_deadline || Instant::now() >= total_deadline {
                 final_state = PressureRunState::SafetyAbort;
@@ -1048,6 +1247,17 @@ fn execute_real_pressure_run(
                 heartbeat_timeout,
                 "BEGIN_HOLD",
             )?;
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index: level.level_index,
+                    stage: PressureLevelProgressStage::HoldStarting,
+                    monotonic_ns: timestamp_ns(),
+                    expected_workload_identity: expected_workload_identity.clone(),
+                    acknowledgement: Some(acknowledgement.clone()),
+                    transition_duration_ms: Some(transition_duration_ms),
+                    sample: None,
+                },
+            )))?;
             if !matches!(
                 first_integrity,
                 crate::pressure_worker::WorkerIpcMessage::IntegrityResult { .. }
@@ -1106,7 +1316,7 @@ fn execute_real_pressure_run(
                     .ok()
                     .and_then(|value| crate::parse_psi(&value).ok())
                     .and_then(|psi| psi.full.map(|full| full.avg10));
-                raw_samples.push(crate::pressure::PressureLevelSample {
+                let sample = crate::pressure::PressureLevelSample {
                     monotonic_ns: timestamp_ns(),
                     memory_current_bytes: memory_current,
                     host_memory_full_avg10_percent: host_full,
@@ -1114,8 +1324,20 @@ fn execute_real_pressure_run(
                     worker_alive: process_start_ticks(pid).ok() == Some(start_ticks),
                     heartbeat_touched_bytes: heartbeat_touched,
                     integrity_identity,
-                });
+                };
+                raw_samples.push(sample.clone());
                 sample_count += 1;
+                persist_event(PressurePersistenceEvent::Progress(Box::new(
+                    PressureLevelProgress {
+                        level_index: level.level_index,
+                        stage: PressureLevelProgressStage::Sampling,
+                        monotonic_ns: sample.monotonic_ns,
+                        expected_workload_identity: expected_workload_identity.clone(),
+                        acknowledgement: Some(acknowledgement.clone()),
+                        transition_duration_ms: Some(transition_duration_ms),
+                        sample: Some(sample),
+                    },
+                )))?;
             }
             let ended = measurement_start.elapsed();
             let events = counter_map(&cgroup.join("memory.events")).unwrap_or_default();
@@ -1267,13 +1489,7 @@ fn execute_real_pressure_run(
                 worker_memory_max_bytes: plan.worker_memory_max_bytes,
                 generator_id: plan.generator_id.clone(),
                 generator_version: plan.generator_version,
-                workload_identity: crate::performance::workload_identity(
-                    &plan.scenario,
-                    &plan.generator_id,
-                    plan.generator_version,
-                    level.seed,
-                    level.target_logical_bytes,
-                )?,
+                workload_identity: expected_workload_identity,
                 payload_integrity_identity,
                 started_monotonic_ns: timestamp_ns().saturating_sub(ended.as_nanos() as u64),
                 ended_monotonic_ns: timestamp_ns(),
@@ -1324,7 +1540,9 @@ fn execute_real_pressure_run(
                     .then(|| format!("{classification:?}")),
             };
             level_evidence.validate(level, plan)?;
-            persist_level(level_evidence)?;
+            persist_event(PressurePersistenceEvent::Completed(Box::new(
+                level_evidence,
+            )))?;
             prior = level.target_touched_bytes;
             if classification != LevelClassification::Sustainable {
                 final_state = match classification {
@@ -1357,23 +1575,92 @@ fn execute_real_pressure_run(
         .take()
         .map(|handle| handle.stop_and_cleanup().is_ok())
         .unwrap_or(true);
-    let scope_stopped = systemd
-        .stop_owned_scope(&scope_plan)
-        .and_then(|_| systemd.wait_inactive_or_removed(&scope_plan.unit_name, heartbeat_timeout))
-        .is_ok();
-    let worker_scope_absent = scope_stopped
+    let stop_result = systemd.stop_owned_scope(&scope_plan);
+    let stop_job_result = Some(match &stop_result {
+        Ok(()) => "done".to_string(),
+        Err(error) => format!("failed: {error:#}"),
+    });
+    let worker_scope_stopped = stop_result.is_ok()
         && systemd
-            .list_owned_benchmark_units()
-            .is_ok_and(|units| !units.iter().any(|unit| unit == &scope_plan.unit_name));
+            .wait_inactive_or_removed(&scope_plan.unit_name, heartbeat_timeout)
+            .is_ok();
+    let final_scope_state = systemd
+        .read_scope_state(&scope_plan.unit_name)
+        .ok()
+        .flatten();
+    let final_active_state = final_scope_state
+        .as_ref()
+        .map(|state| state.active_state.clone());
+    let final_sub_state = final_scope_state
+        .as_ref()
+        .map(|state| state.sub_state.clone());
+    let cgroup_member_count = if cgroup.join("cgroup.procs").is_file() {
+        fs::read_to_string(cgroup.join("cgroup.procs"))
+            .ok()
+            .map(|members| {
+                members
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count()
+            })
+    } else {
+        Some(0)
+    };
+    let worker_scope_zero_members = cgroup_member_count == Some(0);
+    let removal_started = Instant::now();
+    let removal_result = if worker_scope_stopped && worker_scope_zero_members {
+        wait_for_transient_scope_removal(heartbeat_timeout, || {
+            systemd.unit_exists(&scope_plan.unit_name)
+        })
+    } else {
+        Err(anyhow::anyhow!("scope remained active or membered"))
+    };
+    let removal_wait_ms = removal_result.as_ref().copied().unwrap_or_else(|_| {
+        removal_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    });
+    let unit_removed = removal_result.is_ok();
+    let classification = if stop_result.is_err() {
+        PressureScopeCleanupClassification::StopFailed
+    } else if !worker_scope_stopped || !worker_scope_zero_members {
+        PressureScopeCleanupClassification::ActiveOrMembered
+    } else if !unit_removed {
+        PressureScopeCleanupClassification::TransientScopeRemovalTimeout
+    } else {
+        PressureScopeCleanupClassification::Clean
+    };
+    let failure_reason = match classification {
+        PressureScopeCleanupClassification::Clean => None,
+        PressureScopeCleanupClassification::TransientScopeRemovalTimeout => {
+            Some("TRANSIENT_SCOPE_REMOVAL_TIMEOUT".into())
+        }
+        PressureScopeCleanupClassification::ActiveOrMembered => {
+            Some("worker scope remained active or membered".into())
+        }
+        PressureScopeCleanupClassification::StopFailed => stop_job_result.clone(),
+    };
     let _ = fs::remove_file(&socket);
     let observer_runtime_directory_absent = observer_runtime_directory
         .as_ref()
         .is_none_or(|path| !path.exists());
     let cleanup = PressureCleanupEvidence {
         worker_absent: child_stopped && process_start_ticks(pid).is_err(),
-        worker_scope_absent,
+        worker_scope_stopped,
+        worker_scope_zero_members,
+        worker_scope_absent: unit_removed,
         observer_absent: observer_stopped,
         observer_runtime_directory_absent,
+        stop_job_result,
+        final_active_state,
+        final_sub_state,
+        cgroup_member_count,
+        unit_removed,
+        removal_wait_ms,
+        classification,
+        failure_reason,
     };
     let workload_error = run_result.err().map(|error| format!("{error:#}"));
     let timed_out = workload_error
@@ -1382,6 +1669,9 @@ fn execute_real_pressure_run(
     if timed_out {
         final_state = PressureRunState::SafetyAbort;
         reason = "WATCHDOG_TIMEOUT during bounded worker IPC".into();
+    } else if let Some(error) = workload_error.as_deref() {
+        final_state = PressureRunState::Invalid;
+        reason = format!("pressure workload/executor error: {error}");
     }
     Ok(PressureBackendRunResult {
         state: final_state,
@@ -1462,7 +1752,7 @@ mod tests {
     fn manifest_fixture() -> PreparedPressureManifest {
         let value = serde_json::json!({
             "payload": {
-                "schema_version": 3,
+                "schema_version": 4,
                 "experiment_id": "checkpoint3c-test",
                 "scenario": "progressive_memory_pressure",
                 "scenario_version": 1,
@@ -1478,7 +1768,7 @@ mod tests {
                 "observer_binary":{"path_role":"nemord","sha256":"observer","build_profile":"release","source_state_id":"source","embedded_git_head":"head"},
                 "worker_implementation_identity":"worker",
                 "worker_protocol_version":1,
-                "pressure_executor_schema_version":1,
+                "pressure_executor_schema_version":2,
                 "worker_executable_path":"/runner",
                 "config_sha256":"config",
                 "environment":{
@@ -1510,7 +1800,8 @@ mod tests {
                 "memory_max_derivation":{"highest_target_bytes":2500,"worker_margin_bytes":500,
                     "alignment_bytes":1,"shared_memory_max_bytes":3000},
                 "run_plan":{"version":1,"repetitions":3,"experiment_seed":1,"runs":[],"automatic_retry":false},
-                "pressure_plans":[],"observer_property_contract_version":2,"observer_runs":[],
+                "pressure_plans":[],"expected_level_workload_identities":[],
+                "observer_property_contract_version":2,"observer_runs":[],
                 "capacity_gain_percent":"not_evaluated","search_complete":false,
                 "preparation_audit":{"privileged_operations":0,"systemd_units_started":0,
                     "cgroup_writes":0,"workload_bytes_allocated":0,"observer_processes_started":0}
@@ -1591,6 +1882,17 @@ mod tests {
     fn pressure_manifest_type_does_not_parse_fixed_load_shape() {
         let fixed = serde_json::json!({"payload":{"plan":{"scenario":"synthetic_incompressible"}}});
         assert!(serde_json::from_value::<PreparedPressureManifest>(fixed).is_err());
+    }
+
+    #[test]
+    fn historical_v3_pressure_manifest_is_not_reinterpreted_as_current_evidence() {
+        let mut historical = manifest_fixture();
+        historical.payload.schema_version = 3;
+        historical.payload.pressure_executor_schema_version = 1;
+        historical.payload_sha256 = hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&historical.payload).unwrap(),
+        ));
+        assert!(historical.verify_payload().is_err());
     }
 
     fn identity_fixture() -> (tempfile::TempDir, PreparedPressureManifest, PathBuf) {
@@ -1712,19 +2014,14 @@ mod tests {
             &mut self,
             _manifest: &PreparedPressureManifest,
             _order_index: usize,
-            _persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
+            _persist_level: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
         ) -> Result<PressureBackendRunResult> {
             self.calls += 1;
             Ok(PressureBackendRunResult {
                 state: PressureRunState::Completed,
                 reason: "simulated".into(),
                 execution_error: None,
-                cleanup: PressureCleanupEvidence {
-                    worker_absent: false,
-                    worker_scope_absent: true,
-                    observer_absent: true,
-                    observer_runtime_directory_absent: true,
-                },
+                cleanup: PressureCleanupEvidence::simulated(false),
             })
         }
     }
@@ -1780,19 +2077,14 @@ mod tests {
             &mut self,
             _manifest: &PreparedPressureManifest,
             _order_index: usize,
-            _persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
+            _persist_level: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
         ) -> Result<PressureBackendRunResult> {
             self.calls += 1;
             Ok(PressureBackendRunResult {
                 state: PressureRunState::Completed,
                 reason: "simulated workload result".into(),
                 execution_error: self.execution_error.clone(),
-                cleanup: PressureCleanupEvidence {
-                    worker_absent: self.cleanup_passes,
-                    worker_scope_absent: self.cleanup_passes,
-                    observer_absent: self.cleanup_passes,
-                    observer_runtime_directory_absent: self.cleanup_passes,
-                },
+                cleanup: PressureCleanupEvidence::simulated(self.cleanup_passes),
             })
         }
 
@@ -1879,6 +2171,124 @@ mod tests {
                 }
             );
             assert_eq!(evidence.runs[0].restore_passed, Some(cleanup_passes));
+            let reason = evidence.runs[0].stop_reason.as_deref().unwrap();
+            assert!(reason.contains("simulated IPC failure"));
+            if !cleanup_passes {
+                assert!(reason.contains("RESTORE_FAILURE"));
+                assert!(reason.contains("simulated cleanup failure"));
+            }
         }
+    }
+
+    #[test]
+    fn pressure_cli_status_is_zero_only_for_completed_framework_validation() {
+        assert_eq!(
+            pressure_execution_exit_status(PressureExperimentState::CompletedFrameworkValidation),
+            0
+        );
+        for state in [
+            PressureExperimentState::RejectedBeforeRun0,
+            PressureExperimentState::InvalidRun,
+            PressureExperimentState::UnsustainableHealth,
+            PressureExperimentState::SafetyAbort,
+            PressureExperimentState::ExecutionError,
+        ] {
+            assert_ne!(pressure_execution_exit_status(state), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_scope_gc_wait_accepts_eventual_removal() {
+        let mut observations = 0;
+        let waited = wait_for_transient_scope_removal(Duration::from_millis(200), || {
+            observations += 1;
+            Ok(observations < 3)
+        })
+        .unwrap();
+        assert!(observations >= 3);
+        assert!(waited <= 200);
+    }
+
+    #[test]
+    fn bounded_scope_gc_wait_reports_explicit_timeout() {
+        let error =
+            wait_for_transient_scope_removal(Duration::from_millis(20), || Ok(true)).unwrap_err();
+        assert!(format!("{error:#}").contains("TRANSIENT_SCOPE_REMOVAL_TIMEOUT"));
+    }
+
+    struct PartialEvidenceBackend;
+
+    impl PressureExecutionBackend for PartialEvidenceBackend {
+        fn execute_run(
+            &mut self,
+            manifest: &PreparedPressureManifest,
+            order_index: usize,
+            persist_event: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
+        ) -> Result<PressureBackendRunResult> {
+            let identity = "frozen-pressure-identity".to_string();
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index: 0,
+                    stage: PressureLevelProgressStage::TransitionStarting,
+                    monotonic_ns: 1,
+                    expected_workload_identity: identity.clone(),
+                    acknowledgement: None,
+                    transition_duration_ms: None,
+                    sample: None,
+                },
+            )))?;
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index: 0,
+                    stage: PressureLevelProgressStage::LevelAcknowledged,
+                    monotonic_ns: 2,
+                    expected_workload_identity: identity,
+                    acknowledgement: Some(crate::pressure::WorkerLevelAcknowledgement {
+                        experiment_id: manifest.payload.experiment_id.clone(),
+                        run_id: format!("run-{order_index}"),
+                        level_index: 0,
+                        seed: 1,
+                        prior_touched_bytes: 0,
+                        requested_delta_bytes: 4096,
+                        actual_touched_bytes: 4096,
+                        worker_pid: 10,
+                        worker_start_ticks: 20,
+                        generator_id: crate::performance::INCOMPRESSIBLE_GENERATOR_ID.into(),
+                        generator_version: crate::performance::SYNTHETIC_GENERATOR_VERSION,
+                        integrity_identity: "integrity".into(),
+                        acknowledged_monotonic_ns: 2,
+                    }),
+                    transition_duration_ms: Some(1),
+                    sample: None,
+                },
+            )))?;
+            Ok(PressureBackendRunResult {
+                state: PressureRunState::Invalid,
+                reason: "pressure workload identity construction failed".into(),
+                execution_error: Some("pressure workload identity construction failed".into()),
+                cleanup: PressureCleanupEvidence::simulated(true),
+            })
+        }
+    }
+
+    #[test]
+    fn partial_transition_and_ack_survive_later_level_construction_error() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = runnable_manifest(&temporary);
+        let store = IncrementalPressureStore::create(&manifest).unwrap();
+        let evidence =
+            execute_pressure_with_backend(&manifest, &mut PartialEvidenceBackend, &store).unwrap();
+        assert_eq!(evidence.state, PressureExperimentState::ExecutionError);
+        assert!(evidence.runs[0].levels.is_empty());
+        assert_eq!(evidence.runs[0].level_progress.len(), 2);
+        assert_eq!(
+            evidence.runs[0].level_progress[0].stage,
+            PressureLevelProgressStage::TransitionStarting
+        );
+        assert!(evidence.runs[0].level_progress[1].acknowledgement.is_some());
+        let persisted: PressureExecutionEvidence =
+            serde_json::from_slice(&fs::read(&manifest.payload.report_path).unwrap()).unwrap();
+        assert_eq!(persisted.runs[0].level_progress.len(), 2);
+        assert!(persisted.runs[0].levels.is_empty());
     }
 }

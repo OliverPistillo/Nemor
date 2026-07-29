@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C final live hardening implemented, V3 preparation next |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C V3 ATTEMPT 1 safety-aborted on executor defect; corrected V4 preparation next |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -34,13 +34,13 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 547 / 547 |
-| Passed / failed / ignored | 547 / 0 / 0 |
-| Phase 10 validation | 3A/3B CLOSED / PASS; 3C final live hardening implemented / no pressure run |
+| Tests defined / executed | 575 / 575 |
+| Passed / failed / ignored | 575 / 0 / 0 |
+| Phase 10 validation | 3A/3B CLOSED / PASS; 3C V3 ATTEMPT 1 safety-aborted on executor defect / V4 pending |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
-| Checkpoint 3C | V1 static-only; V2 static reviewed and not authorized; final runner/watchdog/restore hardening implemented; V3 preparation next |
+| Checkpoint 3C | V3 ATTEMPT 1: SAFETY ABORT / EXECUTOR DEFECT / NOT PERFORMANCE EVIDENCE; immutable and never rerun |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -239,6 +239,18 @@ production performance claims.
   material hash, and reports user/root authorization separately.
   `execute-pressure-experiment` accepts only pressure manifests and requires
   root plus the exact preparing `SUDO_UID:SUDO_GID`.
+- V3 experiment `checkpoint3c-1785312245488429386` passed its final freeze
+  and both user/root preflights, then its one execution attempt safety-aborted
+  in run 0. The executor incorrectly sent `progressive_memory_pressure` to the
+  fixed-load workload-identity function, so no completed `LevelEvidence` was
+  persisted; this does not prove that no payload was allocated. Structural
+  state matched, but scope removal was reported false, runs 1–5 were not
+  executed, and the CLI incorrectly returned zero. The immutable report
+  (`b06671794cd0179f6d9ebd5545b785e9df892f03ca49d99c97a4bbabe4a10c76`)
+  and database
+  (`b8f8974327450451e2256911f39d97460a4e85256861126fdc6dfb0e9e29ecf7`)
+  are authoritative negative evidence. V3 is never rerun or revalidated into
+  performance evidence and supports no capacity claim.
 - The live worker is a separate initially unallocated process controlled by a
   versioned mode-0600 AF_UNIX protocol. Systemd D-Bus attaches its exact
   PID/start-ticks identity to the frozen scope and verifies `MemoryMax` before

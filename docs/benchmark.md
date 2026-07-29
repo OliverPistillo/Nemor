@@ -455,6 +455,32 @@ experiment, run and worker identity; level requests also bind seed, prior
 bytes, delta, target and generator. Foreign, duplicate and out-of-order
 messages fail closed.
 
+V3 experiment `checkpoint3c-1785312245488429386` is permanently classified
+**SAFETY ABORT / EXECUTOR DEFECT / NOT PERFORMANCE EVIDENCE**. Its final
+freeze and user/root preflights passed, but run 0 entered execution and the
+executor used the fixed-load `workload_identity` domain for
+`progressive_memory_pressure`. That fallible post-hold construction failed,
+leaving zero completed `LevelEvidence`; this does not establish that no first
+level payload was allocated or that the level passed scientifically. Runs 1–5
+were not executed. Structural restore matched, scope absence was false, and
+the command incorrectly exited zero. The immutable report SHA-256 is
+`b06671794cd0179f6d9ebd5545b785e9df892f03ca49d99c97a4bbabe4a10c76`;
+the database SHA-256 is
+`b8f8974327450451e2256911f39d97460a4e85256861126fdc6dfb0e9e29ecf7`.
+V3 is never rerun, reconstructed, or offline-revalidated into performance
+evidence and makes no capacity claim.
+
+The corrected schema freezes a separate versioned pressure workload identity
+for every run/level before execution. It binds scenario/version,
+SplitMix64/version, run seed, level index, planned logical/touched bytes,
+pressure-plan version and worker implementation identity. Transition start,
+worker acknowledgement, stabilization/hold state and bounded samples persist
+incrementally, independently of final completed-level construction. Scope
+cleanup now records stopped, zero-member and removed states separately and
+uses a bounded transient-unit garbage-collection wait; timeout is explicitly
+`TRANSIENT_SCOPE_REMOVAL_TIMEOUT`. Pressure execution exits zero only for
+`completed_framework_validation`.
+
 `pressure-preflight` accepts only `PreparedPressureManifest` and is read-only.
 It reports manifest/provenance/scenario/run/worker/observer support,
 material-environment match, cgroup and PSI availability, foreign-process and

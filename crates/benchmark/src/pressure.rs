@@ -7,6 +7,7 @@ use crate::performance::{INCOMPRESSIBLE_GENERATOR_ID, SYNTHETIC_GENERATOR_VERSIO
 use crate::{BenchmarkVariant, EvaluationState, MetricScope};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PRESSURE_SCENARIO: &str = "progressive_memory_pressure";
@@ -18,6 +19,42 @@ pub const MAX_PRESSURE_LEVELS: usize = 12;
 pub const MAX_PRESSURE_DURATION_MS: u64 = 15 * 60 * 1_000;
 pub const PRESSURE_FRAMEWORK_MANIFEST_VERSION: u32 = 1;
 pub const PSI_AVG10_UNIT: &str = "percent_stall_time_as_emitted_by_linux";
+pub const PRESSURE_WORKLOAD_IDENTITY_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+pub struct PressureWorkloadIdentityContract<'a> {
+    pub domain: &'static str,
+    pub version: u32,
+    pub scenario: &'a str,
+    pub scenario_version: u32,
+    pub generator_id: &'a str,
+    pub generator_version: u32,
+    pub run_seed: u64,
+    pub level_index: usize,
+    pub planned_logical_bytes: u64,
+    pub planned_touched_bytes: u64,
+    pub pressure_plan_version: u32,
+    pub worker_implementation_identity: &'a str,
+}
+
+pub fn pressure_workload_identity(
+    contract: &PressureWorkloadIdentityContract<'_>,
+) -> Result<String> {
+    if contract.domain != "nemor.phase10.pressure_workload"
+        || contract.version != PRESSURE_WORKLOAD_IDENTITY_VERSION
+        || contract.scenario != PRESSURE_SCENARIO
+        || contract.scenario_version != PRESSURE_SCENARIO_VERSION
+        || contract.generator_id != INCOMPRESSIBLE_GENERATOR_ID
+        || contract.generator_version != SYNTHETIC_GENERATOR_VERSION
+        || contract.pressure_plan_version != PRESSURE_PLAN_VERSION
+        || contract.planned_logical_bytes == 0
+        || contract.planned_touched_bytes != contract.planned_logical_bytes
+        || contract.worker_implementation_identity.is_empty()
+    {
+        bail!("invalid progressive-pressure workload identity contract");
+    }
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&contract)?)))
+}
 
 pub fn psi_avg10_threshold_crossed(observed_linux_avg10: f64, threshold: f64) -> Result<bool> {
     if !observed_linux_avg10.is_finite()
@@ -1333,13 +1370,97 @@ impl ConservativePilotPolicy {
     }
 }
 
-use sha2::Digest;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
+
+    fn pressure_identity(seed: u64, level_index: usize, bytes: u64) -> String {
+        pressure_workload_identity(&PressureWorkloadIdentityContract {
+            domain: "nemor.phase10.pressure_workload",
+            version: PRESSURE_WORKLOAD_IDENTITY_VERSION,
+            scenario: PRESSURE_SCENARIO,
+            scenario_version: PRESSURE_SCENARIO_VERSION,
+            generator_id: INCOMPRESSIBLE_GENERATOR_ID,
+            generator_version: SYNTHETIC_GENERATOR_VERSION,
+            run_seed: seed,
+            level_index,
+            planned_logical_bytes: bytes,
+            planned_touched_bytes: bytes,
+            pressure_plan_version: PRESSURE_PLAN_VERSION,
+            worker_implementation_identity: "worker-implementation",
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn fixed_load_identity_still_rejects_progressive_pressure() {
+        assert!(crate::performance::workload_identity(
+            PRESSURE_SCENARIO,
+            INCOMPRESSIBLE_GENERATOR_ID,
+            SYNTHETIC_GENERATOR_VERSION,
+            1,
+            MIB,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pressure_identity_accepts_only_exact_pressure_contract() {
+        assert!(!pressure_identity(1, 0, MIB).is_empty());
+        assert!(
+            pressure_workload_identity(&PressureWorkloadIdentityContract {
+                domain: "nemor.phase10.pressure_workload",
+                version: PRESSURE_WORKLOAD_IDENTITY_VERSION,
+                scenario: "synthetic_incompressible",
+                scenario_version: PRESSURE_SCENARIO_VERSION,
+                generator_id: INCOMPRESSIBLE_GENERATOR_ID,
+                generator_version: SYNTHETIC_GENERATOR_VERSION,
+                run_seed: 1,
+                level_index: 0,
+                planned_logical_bytes: MIB,
+                planned_touched_bytes: MIB,
+                pressure_plan_version: PRESSURE_PLAN_VERSION,
+                worker_implementation_identity: "worker",
+            })
+            .is_err()
+        );
+        assert!(
+            pressure_workload_identity(&PressureWorkloadIdentityContract {
+                domain: "nemor.phase10.pressure_workload",
+                version: PRESSURE_WORKLOAD_IDENTITY_VERSION,
+                scenario: PRESSURE_SCENARIO,
+                scenario_version: PRESSURE_SCENARIO_VERSION,
+                generator_id: "nemor.synthetic.zero_page",
+                generator_version: SYNTHETIC_GENERATOR_VERSION,
+                run_seed: 1,
+                level_index: 0,
+                planned_logical_bytes: MIB,
+                planned_touched_bytes: MIB,
+                pressure_plan_version: PRESSURE_PLAN_VERSION,
+                worker_implementation_identity: "worker",
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pressure_identity_has_distinct_domain_and_binds_level_seed_and_bytes() {
+        let fixed = crate::performance::workload_identity(
+            "synthetic_incompressible",
+            INCOMPRESSIBLE_GENERATOR_ID,
+            SYNTHETIC_GENERATOR_VERSION,
+            1,
+            MIB,
+        )
+        .unwrap();
+        let base = pressure_identity(1, 0, MIB);
+        assert_ne!(base, fixed);
+        assert_ne!(base, pressure_identity(1, 1, MIB));
+        assert_ne!(base, pressure_identity(2, 0, MIB));
+        assert_ne!(base, pressure_identity(1, 0, 2 * MIB));
+    }
 
     fn fixture_plan() -> ProgressivePressurePlan {
         let headroom = HeadroomPolicy {

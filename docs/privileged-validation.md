@@ -470,6 +470,32 @@ zero-hold evidence and cleans up immediately. Mandatory health gates are
 derived independently from their actual liveness, identity, integrity,
 cgroup, `MemoryMax`, PSI, fault, swap, I/O, CPU, observer and timing evidence.
 
+Checkpoint 3C V3 experiment `checkpoint3c-1785312245488429386` passed the
+static freeze and both user/root preflights, then its single execution attempt
+was consumed by an executor defect. Run 0 entered execution, but completed
+level construction called the fixed-load-only workload identity domain with
+`progressive_memory_pressure`; the report therefore contains no completed
+`LevelEvidence`. That absence does not prove that no payload was allocated.
+Runs 1–5 are `not_executed_after_stop`. Structural state matched, while
+`worker_scope_absent=false`, and the CLI incorrectly returned status 0. The
+immutable report SHA-256 is
+`b06671794cd0179f6d9ebd5545b785e9df892f03ca49d99c97a4bbabe4a10c76`
+and database SHA-256 is
+`b8f8974327450451e2256911f39d97460a4e85256861126fdc6dfb0e9e29ecf7`.
+Official classification is **SAFETY ABORT / EXECUTOR DEFECT / NOT PERFORMANCE
+EVIDENCE**. V3 is never rerun or revalidated and supports no capacity,
+incompressible-workload, Nemor-performance, OOM, PSI or integrity conclusion.
+
+The corrected live contract uses a pressure-owned, versioned workload identity
+frozen per run/level during preparation; fixed-load 3A/3B identity semantics
+remain unchanged. Incremental partial evidence persists transition start,
+level acknowledgement, identity, transition duration and bounded hold samples
+before final `LevelEvidence` validation. Exact scope cleanup separately proves
+stopped, zero-member and removed states, boundedly waits for transient-unit
+garbage collection, and reports `TRANSIENT_SCOPE_REMOVAL_TIMEOUT` explicitly.
+Execution and cleanup diagnostics are both retained, and only completed
+framework validation returns CLI status 0.
+
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
 worker/unit/cgroup final absence, structural restore and full host restore.

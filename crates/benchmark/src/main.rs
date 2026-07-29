@@ -582,6 +582,9 @@ fn run() -> Result<i32> {
                 "experiment_id={} state={:?} capacity_gain_percent=not_evaluated",
                 evidence.experiment_id, evidence.state
             );
+            return Ok(
+                nemor_benchmark::pressure_live::pressure_execution_exit_status(evidence.state),
+            );
         }
         Command::ExecuteExperiment { manifest } => {
             let outcome = nemor_benchmark::performance::execute_prepared_experiment(&manifest)?;
