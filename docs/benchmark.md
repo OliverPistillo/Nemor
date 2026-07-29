@@ -447,6 +447,49 @@ derives and freezes exact conservative levels, manifest review, separately
 authorized read-only host preflight, and only then a separately approved live
 pilot. None of those live steps occurred here.
 
+The external review is now incorporated. A sustainable level must contain the
+complete variant-applicable gate set, with every gate mandatory and passing;
+absence is never PASS. Completed evidence must cover the frozen hold at the
+frozen sample interval within one explicit interval of scheduler tolerance,
+and its recorded and monotonic durations must agree. Restore/ownership is
+explicitly retained as a lifecycle-completion gate.
+
+A worker that does not reach its exact requested touched total produces
+`invalid_level_evidence`, not an unsustainable capacity boundary. It stops the
+run, disables refinement and capacity, and leaves later levels
+`not_executed_after_invalid`. Normal health boundaries and emergency aborts
+instead leave distinct `not_executed_after_unsustainable` and
+`not_executed_after_safety_abort` states. V1 requires
+`stop_after_first_unsustainable=true`; safety abort always stops immediately.
+
+Watchdogs cover stabilization, hold and heartbeat allowance for every possible
+frozen level. The total watchdog cannot be shorter than that path. PSI
+thresholds must be finite percentages in `[0,100]`; numeric activity limits
+are explicit and zero means zero tolerance, never disabled. Capacity summaries
+are integrity-bound to actual valid level evidence, and gain refuses
+inconsistent or incomplete summaries.
+
+The typed worker-step protocol begins with zero allocation. Only after the
+future executor verifies the exact-owned scope and `MemoryMax` may the same
+worker accept the next fixed command, touch only the planned delta using the
+existing SplitMix64 v1 generator, acknowledge the complete experiment/run/
+seed/PID/start-ticks/generator/integrity identity, stabilize, hold and perform
+bounded integrity checks. Emergency gates are checked before any next-level
+command.
+
+`prepare-pressure-experiment` is the dedicated unprivileged preparation
+command. It accepts only repository, config, observer binary, fresh
+prepared/output roots and seed. V1 freezes three baseline and three observe
+runs with paired seeds; aligned 10%, 20% and 30% levels derived from captured
+available memory; explicit host, runner, observer, rollback and OS-variance
+reserves; one shared target-plus-margin `MemoryMax`; three unique DynamicUser
+observer transactions; and refinement `disabled_for_framework_pilot`. The
+manifest is versioned and payload-hashed and binds release provenance, binary,
+config, environment, worker, output and transaction identities. Preparation
+rejects root and path reuse and performs no systemd/cgroup action, observer
+startup, workload allocation or pressure. This pilot is not a capacity search:
+`search_complete=false` and `capacity_gain_percent=not_evaluated`.
+
 ### Checkpoint 3A-P DynamicUser observer boundary
 
 Checkpoint 3A-P now proves the observer boundary through one bounded

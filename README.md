@@ -34,13 +34,13 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 529 / 529 |
-| Passed / failed / ignored | 529 / 0 / 0 |
+| Tests defined / executed | 547 / 547 |
+| Passed / failed / ignored | 547 / 0 / 0 |
 | Phase 10 validation | 3A/3B CLOSED / PASS; 3C framework ready / live validation pending |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
-| Checkpoint 3C | controlled progressive-pressure framework ready; external review required before live pilot preparation |
+| Checkpoint 3C | external-review hardening and dedicated live-preparation bridge ready; V1 preparation is the next gated step |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -214,6 +214,22 @@ production performance claims.
   simulator covers negative levels, aborts, restore failure and refinement.
   The framework is ready, but no 3C preparation, preflight or live validation
   has occurred.
+- Checkpoint 3C pre-live hardening makes the mandatory health-gate set
+  complete, enforces coherent hold/sample/monotonic timing, separates
+  protocol-invalid touched-byte evidence from valid unsustainable boundaries,
+  distinguishes later-level stop states, validates watchdog/PSI policies and
+  integrity-binds capacity summaries. The typed progressive worker starts
+  unallocated, accepts a fixed level delta only after scope/`MemoryMax`
+  verification, reuses the SplitMix64 v1 generator and binds acknowledgements
+  to the complete run/worker/generator identity.
+- `prepare-pressure-experiment` is a separate unprivileged, fresh-path-only
+  bridge. It freezes three paired baseline/observe repetitions, conservative
+  aligned 10/20/30% levels derived from captured `MemAvailable` after explicit
+  reserves, one shared bounded `MemoryMax`, observer transactions, and
+  `disabled_for_framework_pilot` refinement. Preparation starts no service,
+  writes no cgroup, and allocates no workload. The resulting pilot remains
+  framework validation: `search_complete=false` and capacity is
+  `not_evaluated`.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process

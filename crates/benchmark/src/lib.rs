@@ -14,6 +14,8 @@ pub mod harness;
 pub mod observer_service;
 pub mod performance;
 pub mod pressure;
+pub mod pressure_prepare;
+pub mod pressure_worker;
 pub mod systemd;
 
 pub const BENCHMARK_SCHEMA_VERSION: u32 = 1;

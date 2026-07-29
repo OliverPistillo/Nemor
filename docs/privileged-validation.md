@@ -401,6 +401,24 @@ is required before any conservative live pilot preparation. No 3C preparation,
 preflight, transient unit, observer, pressure allocation or privileged action
 was performed while implementing the framework.
 
+The pre-live review hardening is fail-closed: sustainable evidence requires
+the complete gate set and valid sample/duration coverage; an unacknowledged
+target is protocol-invalid rather than a capacity boundary; normal
+unsustainable, invalid and safety-abort stops remain distinct; watchdogs cover
+the full frozen path; PSI thresholds reject non-finite/negative values; and
+capacity summaries must validate against actual level evidence.
+
+The dedicated `prepare-pressure-experiment` bridge is unprivileged and has no
+execution branch. It captures read-only host inputs, derives explicit reserves,
+freezes aligned 10/20/30% pilot levels and a shared bounded `MemoryMax`, and
+creates immutable run/observer transaction plans in fresh directories. It
+rejects root, reuse and unsafe provenance. Future systemd remains the sole
+cgroup writer. No preflight or cleanup action is part of preparation.
+
+After the separately gated V1 preparation succeeds, Checkpoint 3C status is
+**LIVE PILOT V1 PREPARED / PREFLIGHT PENDING**, not PASS. Static manifest
+review must precede any separately authorized user/root pressure preflight.
+
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
 worker/unit/cgroup final absence, structural restore and full host restore.

@@ -81,8 +81,11 @@ pub enum PlannedLevelState {
     Planned,
     CompletedSustainable,
     CompletedUnsustainable,
+    InvalidLevelEvidence,
     SafetyAbort,
-    NotExecutedAfterAbort,
+    NotExecutedAfterUnsustainable,
+    NotExecutedAfterInvalid,
+    NotExecutedAfterSafetyAbort,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,10 +115,19 @@ pub struct PressureHealthPolicy {
     pub max_block_writes_bytes_per_level: u64,
     pub host_oom_forbidden: bool,
     pub request_oom: bool,
+    pub zero_limits_mean_zero_tolerance: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefinementMode {
+    DeterministicBracket,
+    DisabledForFrameworkPilot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefinementPolicy {
+    pub mode: RefinementMode,
     pub granularity_bytes: u64,
     pub maximum_refinements: usize,
 }
@@ -143,7 +155,15 @@ pub struct HeadroomPolicy {
 
 impl HeadroomPolicy {
     pub fn derive(&self, available_bytes: u64) -> Result<HeadroomReserve> {
-        if self.host_reserve_permille > 1_000 || available_bytes == 0 {
+        if self.host_reserve_permille == 0
+            || self.host_reserve_permille > 1_000
+            || self.minimum_host_reserve_bytes == 0
+            || self.runner_reserve_bytes == 0
+            || self.observer_reserve_bytes == 0
+            || self.rollback_cleanup_reserve_bytes == 0
+            || self.operating_system_variance_bytes == 0
+            || available_bytes == 0
+        {
             bail!("invalid pressure headroom policy");
         }
         let fractional = available_bytes
@@ -238,34 +258,59 @@ impl ProgressivePressurePlan {
             || self.sample_interval_ms == 0
             || self.sample_interval_ms > self.hold_duration_ms
             || self.watchdog.heartbeat_timeout_ms == 0
-            || self.watchdog.level_timeout_ms
-                < self
-                    .hold_duration_ms
-                    .saturating_add(self.stabilization_duration_ms)
+            || self.watchdog.level_timeout_ms == 0
+            || self.watchdog.total_timeout_ms == 0
             || self.watchdog.total_timeout_ms > self.maximum_total_duration_ms
             || self.health.version != PRESSURE_HEALTH_POLICY_VERSION
+            || !self.health.host_psi_full_avg10_emergency.is_finite()
+            || self.health.host_psi_full_avg10_emergency < 0.0
+            || self.health.host_psi_full_avg10_emergency > 100.0
+            || !self.health.cgroup_psi_full_avg10_unsustainable.is_finite()
+            || self.health.cgroup_psi_full_avg10_unsustainable < 0.0
+            || self.health.cgroup_psi_full_avg10_unsustainable > 100.0
             || self.health.request_oom
             || !self.health.host_oom_forbidden
+            || !self.health.zero_limits_mean_zero_tolerance
+            || !self.stop_policy.stop_after_first_unsustainable
             || !self.stop_policy.stop_immediately_on_safety_abort
             || !self.stop_policy.never_use_safety_abort_as_capacity_bound
             || self.refinement.granularity_bytes == 0
-            || self.refinement.maximum_refinements == 0
             || self.refinement.maximum_refinements > self.maximum_levels
+            || (self.refinement.mode == RefinementMode::DeterministicBracket
+                && self.refinement.maximum_refinements == 0)
+            || (self.refinement.mode == RefinementMode::DisabledForFrameworkPilot
+                && self.refinement.maximum_refinements != 0)
         {
             bail!("unsafe or unbounded Checkpoint 3C pressure plan");
         }
-        let planned_duration = (self.levels.len() as u64)
-            .checked_mul(
-                self.hold_duration_ms
-                    .checked_add(self.stabilization_duration_ms)
-                    .ok_or_else(|| anyhow::anyhow!("level duration overflow"))?,
-            )
+        let per_level_lifecycle = self
+            .hold_duration_ms
+            .checked_add(self.stabilization_duration_ms)
+            .and_then(|value| value.checked_add(self.watchdog.heartbeat_timeout_ms))
+            .ok_or_else(|| anyhow::anyhow!("level lifecycle overflow"))?;
+        if self.watchdog.level_timeout_ms < per_level_lifecycle {
+            bail!("level watchdog cannot cover the frozen level lifecycle");
+        }
+        let possible_level_count = self
+            .levels
+            .len()
+            .checked_add(self.refinement.maximum_refinements)
+            .ok_or_else(|| anyhow::anyhow!("pressure level count overflow"))?;
+        let planned_duration = (possible_level_count as u64)
+            .checked_mul(per_level_lifecycle)
             .ok_or_else(|| anyhow::anyhow!("planned duration overflow"))?;
-        if planned_duration > self.maximum_total_duration_ms {
+        if planned_duration > self.maximum_total_duration_ms
+            || self.watchdog.total_timeout_ms < planned_duration
+        {
             bail!("planned levels exceed maximum experiment duration");
         }
         let mut previous = 0;
         let mut indices = BTreeSet::new();
+        if self.worker_memory_max_bytes == 0
+            || self.worker_memory_max_bytes > self.headroom.effective_maximum_bytes
+        {
+            bail!("worker MemoryMax exceeds the derived effective headroom");
+        }
         for (expected_index, level) in self.levels.iter().enumerate() {
             if level.target_logical_bytes == 0
                 || level.target_touched_bytes != level.target_logical_bytes
@@ -320,6 +365,75 @@ pub struct PressureMetric {
     pub source: String,
     pub available: bool,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTelemetryContract {
+    pub host_sources: BTreeMap<String, String>,
+    pub worker_cgroup_sources: BTreeMap<String, String>,
+    pub worker_process_sources: BTreeMap<String, String>,
+    pub runner_sources: BTreeMap<String, String>,
+    pub observer_sources: BTreeMap<String, String>,
+    pub host_oom_separate_from_cgroup_events: bool,
+    pub unavailable_is_not_zero: bool,
+}
+
+impl LiveTelemetryContract {
+    pub fn checkpoint3c_v1() -> Self {
+        Self {
+            host_sources: BTreeMap::from([
+                ("psi".into(), "/proc/pressure/memory".into()),
+                ("oom".into(), "host_oom_evidence".into()),
+                ("swap".into(), "/proc/vmstat".into()),
+                ("block_writes".into(), "/proc/diskstats".into()),
+            ]),
+            worker_cgroup_sources: BTreeMap::from([
+                ("memory_current".into(), "memory.current".into()),
+                ("memory_events".into(), "memory.events".into()),
+                ("memory_psi".into(), "memory.pressure".into()),
+                ("membership".into(), "cgroup.procs_read_only".into()),
+                ("memory_max".into(), "MemoryMax_dbus_readback".into()),
+            ]),
+            worker_process_sources: BTreeMap::from([
+                ("identity".into(), "pid_start_ticks".into()),
+                ("heartbeat".into(), "owned_worker_protocol".into()),
+                ("integrity".into(), "bounded_payload_check".into()),
+                ("cpu".into(), "/proc/pid/stat".into()),
+            ]),
+            runner_sources: BTreeMap::from([("cpu".into(), "/proc/self/stat".into())]),
+            observer_sources: BTreeMap::from([
+                ("identity".into(), "owned_dynamic_user_service".into()),
+                ("cpu".into(), "/proc/pid/stat".into()),
+            ]),
+            host_oom_separate_from_cgroup_events: true,
+            unavailable_is_not_zero: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureExecutorAction {
+    CheckEmergencyGates,
+    PersistCompletedLevel,
+    IssueNextLevel,
+    ExactOwnedCleanup,
+}
+
+pub fn next_level_action_order(emergency_crossed: bool) -> Vec<PressureExecutorAction> {
+    if emergency_crossed {
+        vec![
+            PressureExecutorAction::CheckEmergencyGates,
+            PressureExecutorAction::PersistCompletedLevel,
+            PressureExecutorAction::ExactOwnedCleanup,
+        ]
+    } else {
+        vec![
+            PressureExecutorAction::CheckEmergencyGates,
+            PressureExecutorAction::PersistCompletedLevel,
+            PressureExecutorAction::IssueNextLevel,
+        ]
+    }
 }
 
 impl PressureMetric {
@@ -382,6 +496,31 @@ pub enum HealthGate {
     RestoreOwnership,
 }
 
+pub fn required_level_health_gates(variant: BenchmarkVariant) -> BTreeSet<HealthGate> {
+    let mut gates = BTreeSet::from([
+        HealthGate::WorkerAlive,
+        HealthGate::WorkerIdentity,
+        HealthGate::HeartbeatFresh,
+        HealthGate::WorkerIntegrity,
+        HealthGate::CgroupMembership,
+        HealthGate::MemoryLimitContract,
+        HealthGate::HostPsi,
+        HealthGate::CgroupPsi,
+        HealthGate::MajorFaults,
+        HealthGate::SwapIn,
+        HealthGate::SwapOut,
+        HealthGate::BlockWrites,
+        HealthGate::WorkerCpu,
+        HealthGate::RunnerCpu,
+        HealthGate::ElapsedDuration,
+        HealthGate::RestoreOwnership,
+    ]);
+    if variant == BenchmarkVariant::NemorObserve {
+        gates.insert(HealthGate::ObserverContract);
+    }
+    gates
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthGateResult {
     pub passed: bool,
@@ -408,31 +547,50 @@ pub enum SafetyAbortClass {
 pub enum LevelClassification {
     Sustainable,
     UnsustainableHealth,
+    InvalidLevelEvidence,
     SafetyAbort,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLevelAcknowledgement {
+    pub experiment_id: String,
+    pub run_id: String,
     pub level_index: usize,
+    pub seed: u64,
     pub prior_touched_bytes: u64,
     pub requested_delta_bytes: u64,
     pub actual_touched_bytes: u64,
     pub worker_pid: u32,
     pub worker_start_ticks: u64,
+    pub generator_id: String,
+    pub generator_version: u32,
+    pub integrity_identity: String,
     pub acknowledged_monotonic_ns: u64,
 }
 
 impl WorkerLevelAcknowledgement {
-    pub fn validate(&self, level: &PlannedPressureLevel, prior_touched_bytes: u64) -> Result<()> {
+    pub fn validate(
+        &self,
+        evidence: &LevelEvidence,
+        level: &PlannedPressureLevel,
+        prior_touched_bytes: u64,
+    ) -> Result<()> {
         let expected_delta = level
             .target_touched_bytes
             .checked_sub(prior_touched_bytes)
             .ok_or_else(|| anyhow::anyhow!("pressure level cannot shrink the touched payload"))?;
-        if self.level_index != level.level_index
+        if self.experiment_id != evidence.experiment_id
+            || self.run_id != evidence.run_id
+            || self.level_index != level.level_index
+            || self.seed != level.seed
             || self.prior_touched_bytes != prior_touched_bytes
             || self.requested_delta_bytes != expected_delta
             || self.worker_pid == 0
             || self.worker_start_ticks == 0
+            || self.generator_id != evidence.generator_id
+            || self.generator_version != evidence.generator_version
+            || self.integrity_identity != evidence.payload_integrity_identity
+            || self.acknowledged_monotonic_ns > evidence.started_monotonic_ns
         {
             bail!("worker level acknowledgement does not match the planned delta");
         }
@@ -458,6 +616,7 @@ pub struct LevelEvidence {
     pub payload_integrity_identity: String,
     pub started_monotonic_ns: u64,
     pub ended_monotonic_ns: u64,
+    pub stabilization_completed_ms: u64,
     pub duration_ms: u64,
     pub sample_count: usize,
     pub memory_mean_bytes: Option<f64>,
@@ -488,9 +647,9 @@ impl LevelEvidence {
             || self.worker_memory_max_bytes != plan.worker_memory_max_bytes
             || self.generator_id != plan.generator_id
             || self.generator_version != plan.generator_version
-            || self.ended_monotonic_ns < self.started_monotonic_ns
+            || self.ended_monotonic_ns <= self.started_monotonic_ns
             || self.duration_ms > plan.watchdog.level_timeout_ms
-            || self.sample_count == 0
+            || self.stabilization_completed_ms < plan.stabilization_duration_ms
             || self.workload_identity.is_empty()
             || self.payload_integrity_identity.is_empty()
         {
@@ -502,21 +661,50 @@ impl LevelEvidence {
             plan.levels[level.level_index - 1].target_touched_bytes
         };
         self.worker_acknowledgement
-            .validate(level, prior_touched_bytes)?;
+            .validate(self, level, prior_touched_bytes)?;
         if self.actual_touched_bytes != self.worker_acknowledgement.actual_touched_bytes {
             bail!("level evidence and worker acknowledgement disagree");
         }
-        if self.classification == LevelClassification::Sustainable
-            && (self.actual_touched_bytes != level.target_touched_bytes
+        let elapsed_ms = self
+            .ended_monotonic_ns
+            .checked_sub(self.started_monotonic_ns)
+            .ok_or_else(|| anyhow::anyhow!("level monotonic duration underflow"))?
+            / 1_000_000;
+        let minimum_samples = plan
+            .hold_duration_ms
+            .checked_add(plan.sample_interval_ms - 1)
+            .ok_or_else(|| anyhow::anyhow!("sample coverage overflow"))?
+            / plan.sample_interval_ms;
+        let minimum_duration_ms = plan
+            .hold_duration_ms
+            .saturating_sub(plan.sample_interval_ms.min(plan.hold_duration_ms));
+        if self.duration_ms < minimum_duration_ms
+            || elapsed_ms < minimum_duration_ms
+            || elapsed_ms.abs_diff(self.duration_ms) > plan.sample_interval_ms
+            || u64::try_from(self.sample_count).unwrap_or(u64::MAX) < minimum_samples
+        {
+            bail!("completed level has insufficient timing or sample coverage");
+        }
+        if self.classification == LevelClassification::Sustainable {
+            let required = required_level_health_gates(self.variant);
+            let present = self.health_gates.keys().copied().collect::<BTreeSet<_>>();
+            if present != required
+                || self.actual_touched_bytes != level.target_touched_bytes
                 || self.watchdog_triggered
                 || self.oom != 0
                 || self.oom_kill != 0
                 || self
                     .health_gates
                     .values()
-                    .any(|gate| gate.mandatory && !gate.passed))
+                    .any(|gate| !gate.mandatory || !gate.passed)
+            {
+                bail!("sustainable level did not pass its complete mandatory contract");
+            }
+        }
+        if self.classification == LevelClassification::UnsustainableHealth
+            && self.actual_touched_bytes != level.target_touched_bytes
         {
-            bail!("sustainable level did not pass its declared contract");
+            bail!("unsustainable capacity evidence must reach the exact planned target");
         }
         if self.classification == LevelClassification::SafetyAbort && self.safety_abort.is_none() {
             bail!("safety abort evidence requires an explicit abort class");
@@ -547,7 +735,8 @@ pub fn next_refinement(
     tested: &BTreeSet<u64>,
     refinements_completed: usize,
 ) -> Result<RefinementDecision> {
-    if sustainable_lower_bytes == 0
+    if policy.mode != RefinementMode::DeterministicBracket
+        || sustainable_lower_bytes == 0
         || sustainable_lower_bytes >= unsustainable_upper_bytes
         || policy.granularity_bytes == 0
         || !tested.contains(&sustainable_lower_bytes)
@@ -588,6 +777,81 @@ pub struct CapacityResult {
     pub search_complete: bool,
     pub safety_abort: Option<SafetyAbortClass>,
     pub capacity_gain_percent: EvaluationState,
+    contract_digest: String,
+}
+
+impl CapacityResult {
+    fn digest(
+        highest: Option<u64>,
+        lowest: Option<u64>,
+        search_complete: bool,
+        safety_abort: Option<SafetyAbortClass>,
+    ) -> String {
+        hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&(highest, lowest, search_complete, safety_abort))
+                .expect("capacity digest tuple is serializable"),
+        ))
+    }
+
+    fn from_summary(
+        highest: Option<u64>,
+        lowest: Option<u64>,
+        search_complete: bool,
+        safety_abort: Option<SafetyAbortClass>,
+    ) -> Self {
+        Self {
+            highest_tested_sustainable_bytes: highest,
+            lowest_tested_unsustainable_bytes: lowest,
+            search_complete,
+            safety_abort,
+            capacity_gain_percent: EvaluationState::NotEvaluated,
+            contract_digest: Self::digest(highest, lowest, search_complete, safety_abort),
+        }
+    }
+
+    fn internally_consistent(&self) -> bool {
+        self.contract_digest
+            == Self::digest(
+                self.highest_tested_sustainable_bytes,
+                self.lowest_tested_unsustainable_bytes,
+                self.search_complete,
+                self.safety_abort,
+            )
+    }
+
+    pub fn validate(&self, levels: &[LevelEvidence]) -> Result<()> {
+        let highest = levels
+            .iter()
+            .filter(|level| {
+                level.classification == LevelClassification::Sustainable
+                    && level.actual_touched_bytes == level.planned_logical_bytes
+            })
+            .map(|level| level.actual_touched_bytes)
+            .max();
+        let lowest = levels
+            .iter()
+            .filter(|level| {
+                level.classification == LevelClassification::UnsustainableHealth
+                    && level.actual_touched_bytes == level.planned_logical_bytes
+            })
+            .map(|level| level.planned_logical_bytes)
+            .min();
+        let invalid = levels
+            .iter()
+            .any(|level| level.classification == LevelClassification::InvalidLevelEvidence);
+        if !self.internally_consistent()
+            || self.highest_tested_sustainable_bytes != highest
+            || self.lowest_tested_unsustainable_bytes != lowest
+            || (self.search_complete
+                && (self.safety_abort.is_some()
+                    || invalid
+                    || highest.is_none()
+                    || lowest.is_none()))
+        {
+            bail!("capacity result is inconsistent with actually tested valid levels");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -601,6 +865,7 @@ pub struct ProgressiveRunEvidence {
     pub highest_tested_sustainable_bytes: Option<u64>,
     pub lowest_tested_unsustainable_bytes: Option<u64>,
     pub refinement_eligible: bool,
+    pub invalid_level_evidence: bool,
     pub safety_abort: Option<SafetyAbortClass>,
     pub stopped_reason: String,
     pub capacity: CapacityResult,
@@ -623,12 +888,18 @@ impl ProgressiveRunEvidence {
             .max();
         let lowest = levels
             .iter()
-            .filter(|level| level.classification == LevelClassification::UnsustainableHealth)
-            .map(|level| level.actual_touched_bytes)
+            .filter(|level| {
+                level.classification == LevelClassification::UnsustainableHealth
+                    && level.actual_touched_bytes == level.planned_logical_bytes
+            })
+            .map(|level| level.planned_logical_bytes)
             .min();
         let safety_abort = levels.iter().find_map(|level| level.safety_abort);
+        let invalid_level_evidence = levels
+            .iter()
+            .any(|level| level.classification == LevelClassification::InvalidLevelEvidence);
         let refinement_eligible =
-            safety_abort.is_none() && highest.zip(lowest).is_some_and(|(lo, hi)| lo < hi);
+            plan_refinement_eligible(safety_abort, invalid_level_evidence, highest, lowest);
         Self {
             experiment_id: experiment_id.into(),
             run_id: run_id.into(),
@@ -639,17 +910,23 @@ impl ProgressiveRunEvidence {
             highest_tested_sustainable_bytes: highest,
             lowest_tested_unsustainable_bytes: lowest,
             refinement_eligible,
+            invalid_level_evidence,
             safety_abort,
             stopped_reason,
-            capacity: CapacityResult {
-                highest_tested_sustainable_bytes: highest,
-                lowest_tested_unsustainable_bytes: lowest,
-                search_complete: false,
-                safety_abort,
-                capacity_gain_percent: EvaluationState::NotEvaluated,
-            },
+            capacity: CapacityResult::from_summary(highest, lowest, false, safety_abort),
         }
     }
+}
+
+fn plan_refinement_eligible(
+    safety_abort: Option<SafetyAbortClass>,
+    invalid_level_evidence: bool,
+    highest: Option<u64>,
+    lowest: Option<u64>,
+) -> bool {
+    safety_abort.is_none()
+        && !invalid_level_evidence
+        && highest.zip(lowest).is_some_and(|(lo, hi)| lo < hi)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -704,9 +981,9 @@ impl SimulatedPressureBackend {
                 level.target_touched_bytes,
             ),
             SimulatedLevelOutcome::TouchedBytesMismatch(actual) => (
-                LevelClassification::UnsustainableHealth,
+                LevelClassification::InvalidLevelEvidence,
                 None,
-                Some("actual_touched_bytes_mismatch".into()),
+                Some("worker_level_contract_failure".into()),
                 actual,
             ),
         };
@@ -724,38 +1001,20 @@ impl SimulatedPressureBackend {
             Some(SafetyAbortClass::RestoreFailure) => HealthGate::RestoreOwnership,
             None => HealthGate::WorkerIntegrity,
         };
-        let health_gates = [
-            HealthGate::WorkerAlive,
-            HealthGate::WorkerIdentity,
-            HealthGate::HeartbeatFresh,
-            HealthGate::WorkerIntegrity,
-            HealthGate::CgroupMembership,
-            HealthGate::MemoryLimitContract,
-            HealthGate::HostPsi,
-            HealthGate::CgroupPsi,
-            HealthGate::MajorFaults,
-            HealthGate::SwapIn,
-            HealthGate::SwapOut,
-            HealthGate::BlockWrites,
-            HealthGate::WorkerCpu,
-            HealthGate::RunnerCpu,
-            HealthGate::ObserverContract,
-            HealthGate::ElapsedDuration,
-            HealthGate::RestoreOwnership,
-        ]
-        .into_iter()
-        .map(|gate| {
-            let passed = mandatory_pass || gate != failed_gate;
-            (
-                gate,
-                HealthGateResult {
-                    passed,
-                    mandatory: true,
-                    reason: (!passed).then(|| "simulated outcome".into()),
-                },
-            )
-        })
-        .collect();
+        let health_gates = required_level_health_gates(variant)
+            .into_iter()
+            .map(|gate| {
+                let passed = mandatory_pass || gate != failed_gate;
+                (
+                    gate,
+                    HealthGateResult {
+                        passed,
+                        mandatory: true,
+                        reason: (!passed).then(|| "simulated outcome".into()),
+                    },
+                )
+            })
+            .collect();
         LevelEvidence {
             version: LEVEL_EVIDENCE_VERSION,
             experiment_id: "simulated-3c".into(),
@@ -766,7 +1025,10 @@ impl SimulatedPressureBackend {
             planned_logical_bytes: level.target_logical_bytes,
             actual_touched_bytes: touched,
             worker_acknowledgement: WorkerLevelAcknowledgement {
+                experiment_id: "simulated-3c".into(),
+                run_id: format!("simulated-{variant:?}-{repetition_index}"),
                 level_index: level.level_index,
+                seed: level.seed,
                 prior_touched_bytes: if level.level_index == 0 {
                     0
                 } else {
@@ -781,6 +1043,9 @@ impl SimulatedPressureBackend {
                 actual_touched_bytes: touched,
                 worker_pid: 4242,
                 worker_start_ticks: 31337,
+                generator_id: plan.generator_id.clone(),
+                generator_version: plan.generator_version,
+                integrity_identity: format!("integrity-{}-{}", level.seed, touched),
                 acknowledged_monotonic_ns: level.level_index as u64 * 1_000_000,
             },
             worker_memory_max_bytes: plan.worker_memory_max_bytes,
@@ -789,7 +1054,9 @@ impl SimulatedPressureBackend {
             workload_identity: format!("workload-{}-{}", level.seed, touched),
             payload_integrity_identity: format!("integrity-{}-{}", level.seed, touched),
             started_monotonic_ns: level.level_index as u64 * 1_000_000,
-            ended_monotonic_ns: level.level_index as u64 * 1_000_000 + 500_000,
+            ended_monotonic_ns: level.level_index as u64 * 1_000_000
+                + plan.hold_duration_ms * 1_000_000,
+            stabilization_completed_ms: plan.stabilization_duration_ms,
             duration_ms: plan.hold_duration_ms,
             sample_count: usize::try_from(plan.hold_duration_ms / plan.sample_interval_ms)
                 .unwrap_or(1)
@@ -848,7 +1115,13 @@ pub fn simulate_pressure_run(
             .unwrap_or(SimulatedLevelOutcome::Sustainable);
         let result = backend.level_evidence(plan, level, variant, repetition_index, outcome);
         result.validate(level, plan)?;
-        let stop = result.classification != LevelClassification::Sustainable;
+        let stop = match result.classification {
+            LevelClassification::Sustainable => false,
+            LevelClassification::UnsustainableHealth => {
+                plan.stop_policy.stop_after_first_unsustainable
+            }
+            LevelClassification::InvalidLevelEvidence | LevelClassification::SafetyAbort => true,
+        };
         stopped_reason = result
             .failure_reason
             .clone()
@@ -861,11 +1134,26 @@ pub fn simulate_pressure_run(
         {
             LevelClassification::Sustainable => PlannedLevelState::CompletedSustainable,
             LevelClassification::UnsustainableHealth => PlannedLevelState::CompletedUnsustainable,
+            LevelClassification::InvalidLevelEvidence => PlannedLevelState::InvalidLevelEvidence,
             LevelClassification::SafetyAbort => PlannedLevelState::SafetyAbort,
         };
         if stop {
+            let later_state = match evidence
+                .last()
+                .expect("just pushed level evidence")
+                .classification
+            {
+                LevelClassification::UnsustainableHealth => {
+                    PlannedLevelState::NotExecutedAfterUnsustainable
+                }
+                LevelClassification::InvalidLevelEvidence => {
+                    PlannedLevelState::NotExecutedAfterInvalid
+                }
+                LevelClassification::SafetyAbort => PlannedLevelState::NotExecutedAfterSafetyAbort,
+                LevelClassification::Sustainable => unreachable!("sustainable level does not stop"),
+            };
             for later in planned_levels.iter_mut().skip(level.level_index + 1) {
-                later.state = PlannedLevelState::NotExecutedAfterAbort;
+                later.state = later_state;
             }
             break;
         }
@@ -913,11 +1201,20 @@ pub fn capacity_gain(
         || !candidate.search_complete
         || baseline.safety_abort.is_some()
         || candidate.safety_abort.is_some()
+        || baseline.capacity_gain_percent != EvaluationState::NotEvaluated
+        || candidate.capacity_gain_percent != EvaluationState::NotEvaluated
+        || !baseline.internally_consistent()
+        || !candidate.internally_consistent()
     {
         return None;
     }
     let baseline_bytes = baseline.highest_tested_sustainable_bytes?;
     let candidate_bytes = candidate.highest_tested_sustainable_bytes?;
+    if baseline.lowest_tested_unsustainable_bytes? <= baseline_bytes
+        || candidate.lowest_tested_unsustainable_bytes? <= candidate_bytes
+    {
+        return None;
+    }
     (baseline_bytes != 0).then(|| (candidate_bytes as f64 / baseline_bytes as f64 - 1.0) * 100.0)
 }
 
@@ -942,7 +1239,8 @@ impl ConservativePilotPolicy {
         {
             bail!("invalid conservative pressure pilot policy");
         }
-        self.level_permille_of_effective_maximum
+        let levels = self
+            .level_permille_of_effective_maximum
             .iter()
             .enumerate()
             .map(|(level_index, fraction)| {
@@ -960,7 +1258,15 @@ impl ConservativePilotPolicy {
                     state: PlannedLevelState::Planned,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if levels.iter().any(|level| level.target_logical_bytes == 0)
+            || !levels
+                .windows(2)
+                .all(|pair| pair[0].target_logical_bytes < pair[1].target_logical_bytes)
+        {
+            bail!("pilot fractions collapse to zero, duplicate, or unordered levels");
+        }
+        Ok(levels)
     }
 }
 
@@ -1013,7 +1319,7 @@ mod tests {
             watchdog: PressureWatchdogPolicy {
                 heartbeat_timeout_ms: 2_000,
                 level_timeout_ms: 10_000,
-                total_timeout_ms: 60_000,
+                total_timeout_ms: 90_000,
             },
             health: PressureHealthPolicy {
                 version: PRESSURE_HEALTH_POLICY_VERSION,
@@ -1025,6 +1331,7 @@ mod tests {
                 max_block_writes_bytes_per_level: 128 * MIB,
                 host_oom_forbidden: true,
                 request_oom: false,
+                zero_limits_mean_zero_tolerance: true,
             },
             stop_policy: StopPolicy {
                 stop_after_first_unsustainable: true,
@@ -1032,11 +1339,12 @@ mod tests {
                 never_use_safety_abort_as_capacity_bound: true,
             },
             refinement: RefinementPolicy {
+                mode: RefinementMode::DeterministicBracket,
                 granularity_bytes: 16 * MIB,
                 maximum_refinements: 3,
             },
             maximum_levels: 6,
-            maximum_total_duration_ms: 60_000,
+            maximum_total_duration_ms: 90_000,
             headroom,
             systemd_transient_scope_required: true,
             exact_owned_worker_required: true,
@@ -1187,7 +1495,7 @@ mod tests {
         );
         assert_eq!(
             run.planned_levels[2].state,
-            PlannedLevelState::NotExecutedAfterAbort
+            PlannedLevelState::NotExecutedAfterUnsustainable
         );
         assert_eq!(run.lowest_tested_unsustainable_bytes, Some(256 * MIB));
         assert!(run.refinement_eligible);
@@ -1218,7 +1526,7 @@ mod tests {
             assert!(!run.refinement_eligible);
             assert_eq!(
                 run.planned_levels[2].state,
-                PlannedLevelState::NotExecutedAfterAbort
+                PlannedLevelState::NotExecutedAfterSafetyAbort
             );
             assert_eq!(
                 run.capacity.capacity_gain_percent,
@@ -1238,17 +1546,20 @@ mod tests {
             simulate_pressure_run(&plan, BenchmarkVariant::CachyosBaseline, 0, &backend).unwrap();
         assert_eq!(
             run.levels[0].classification,
-            LevelClassification::UnsustainableHealth
+            LevelClassification::InvalidLevelEvidence
         );
         assert_eq!(
             run.levels[0].failure_reason.as_deref(),
-            Some("actual_touched_bytes_mismatch")
+            Some("worker_level_contract_failure")
         );
+        assert_eq!(run.lowest_tested_unsustainable_bytes, None);
+        assert!(!run.refinement_eligible);
     }
 
     #[test]
     fn refinement_requires_tested_bracket_is_internal_unique_and_deterministic() {
         let policy = RefinementPolicy {
+            mode: RefinementMode::DeterministicBracket,
             granularity_bytes: 16,
             maximum_refinements: 3,
         };
@@ -1331,24 +1642,17 @@ mod tests {
 
     #[test]
     fn capacity_gain_waits_for_complete_comparable_non_abort_searches() {
-        let incomplete = CapacityResult {
-            highest_tested_sustainable_bytes: Some(100),
-            lowest_tested_unsustainable_bytes: Some(200),
-            search_complete: false,
-            safety_abort: None,
-            capacity_gain_percent: EvaluationState::NotEvaluated,
-        };
-        let complete = CapacityResult {
-            search_complete: true,
-            ..incomplete.clone()
-        };
+        let incomplete = CapacityResult::from_summary(Some(100), Some(200), false, None);
+        let complete = CapacityResult::from_summary(Some(100), Some(200), true, None);
         assert_eq!(capacity_gain(&incomplete, &complete, true), None);
         assert_eq!(capacity_gain(&complete, &complete, false), None);
         assert_eq!(capacity_gain(&complete, &complete, true), Some(0.0));
-        let aborted = CapacityResult {
-            safety_abort: Some(SafetyAbortClass::HostOomDetected),
-            ..complete.clone()
-        };
+        let aborted = CapacityResult::from_summary(
+            Some(100),
+            Some(200),
+            false,
+            Some(SafetyAbortClass::HostOomDetected),
+        );
         assert_eq!(capacity_gain(&complete, &aborted, true), None);
     }
 
@@ -1431,5 +1735,141 @@ mod tests {
         let mut live = manifest;
         live.live_execution_enabled = true;
         assert!(live.validate().is_err());
+    }
+
+    fn sustainable_level_fixture(
+        variant: BenchmarkVariant,
+    ) -> (ProgressivePressurePlan, LevelEvidence) {
+        let plan = fixture_plan();
+        let evidence = SimulatedPressureBackend::new(BTreeMap::new()).level_evidence(
+            &plan,
+            &plan.levels[0],
+            variant,
+            0,
+            SimulatedLevelOutcome::Sustainable,
+        );
+        (plan, evidence)
+    }
+
+    #[test]
+    fn sustainable_requires_complete_authoritative_gate_set() {
+        let (plan, mut evidence) = sustainable_level_fixture(BenchmarkVariant::CachyosBaseline);
+        evidence.health_gates.remove(&HealthGate::WorkerAlive);
+        assert!(evidence.validate(&plan.levels[0], &plan).is_err());
+        evidence.health_gates.clear();
+        assert!(evidence.validate(&plan.levels[0], &plan).is_err());
+    }
+
+    #[test]
+    fn sustainable_rejects_any_failed_or_nonmandatory_required_gate() {
+        let (plan, mut evidence) = sustainable_level_fixture(BenchmarkVariant::NemorObserve);
+        evidence
+            .health_gates
+            .get_mut(&HealthGate::ObserverContract)
+            .unwrap()
+            .passed = false;
+        assert!(evidence.validate(&plan.levels[0], &plan).is_err());
+        evidence
+            .health_gates
+            .get_mut(&HealthGate::ObserverContract)
+            .unwrap()
+            .passed = true;
+        evidence
+            .health_gates
+            .get_mut(&HealthGate::RunnerCpu)
+            .unwrap()
+            .mandatory = false;
+        assert!(evidence.validate(&plan.levels[0], &plan).is_err());
+    }
+
+    #[test]
+    fn completed_level_requires_full_sample_and_monotonic_duration_coverage() {
+        let (plan, mut evidence) = sustainable_level_fixture(BenchmarkVariant::CachyosBaseline);
+        evidence.sample_count = 1;
+        assert!(evidence.validate(&plan.levels[0], &plan).is_err());
+        let (_, mut evidence) = sustainable_level_fixture(BenchmarkVariant::CachyosBaseline);
+        evidence.duration_ms = 0;
+        evidence.ended_monotonic_ns = evidence.started_monotonic_ns;
+        assert!(evidence.validate(&plan.levels[0], &plan).is_err());
+    }
+
+    #[test]
+    fn stop_policy_and_watchdog_cover_the_complete_frozen_path() {
+        let mut plan = fixture_plan();
+        plan.stop_policy.stop_after_first_unsustainable = false;
+        assert!(plan.validate().is_err());
+        let mut plan = fixture_plan();
+        plan.watchdog.total_timeout_ms = 0;
+        assert!(plan.validate().is_err());
+        let mut plan = fixture_plan();
+        plan.watchdog.total_timeout_ms = 10_000;
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn psi_thresholds_reject_nan_infinity_negative_and_out_of_range() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 100.1] {
+            let mut plan = fixture_plan();
+            plan.health.host_psi_full_avg10_emergency = invalid;
+            assert!(plan.validate().is_err());
+            let mut plan = fixture_plan();
+            plan.health.cgroup_psi_full_avg10_unsustainable = invalid;
+            assert!(plan.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn capacity_result_must_match_actual_valid_level_evidence() {
+        let plan = fixture_plan();
+        let run = simulate_pressure_run(
+            &plan,
+            BenchmarkVariant::CachyosBaseline,
+            0,
+            &SimulatedPressureBackend::new(BTreeMap::from([(
+                1,
+                SimulatedLevelOutcome::UnsustainableHealth("health".into()),
+            )])),
+        )
+        .unwrap();
+        assert!(run.capacity.validate(&run.levels).is_ok());
+        let mut fabricated = run.capacity;
+        fabricated.highest_tested_sustainable_bytes = Some(999);
+        fabricated.search_complete = true;
+        assert!(fabricated.validate(&run.levels).is_err());
+        assert_eq!(capacity_gain(&fabricated, &fabricated, true), None);
+    }
+
+    #[test]
+    fn host_oom_is_distinct_safety_abort_and_never_refines() {
+        let plan = fixture_plan();
+        let run = simulate_pressure_run(
+            &plan,
+            BenchmarkVariant::CachyosBaseline,
+            0,
+            &SimulatedPressureBackend::new(BTreeMap::from([(
+                1,
+                SimulatedLevelOutcome::SafetyAbort(SafetyAbortClass::HostOomDetected),
+            )])),
+        )
+        .unwrap();
+        assert_eq!(run.safety_abort, Some(SafetyAbortClass::HostOomDetected));
+        assert!(!run.refinement_eligible);
+        assert_eq!(run.lowest_tested_unsustainable_bytes, None);
+    }
+
+    #[test]
+    fn telemetry_sources_and_preallocation_emergency_order_are_explicit() {
+        let contract = LiveTelemetryContract::checkpoint3c_v1();
+        assert!(contract.host_oom_separate_from_cgroup_events);
+        assert!(contract.unavailable_is_not_zero);
+        let abort = next_level_action_order(true);
+        assert_eq!(abort[0], PressureExecutorAction::CheckEmergencyGates);
+        assert!(!abort.contains(&PressureExecutorAction::IssueNextLevel));
+        let proceed = next_level_action_order(false);
+        assert_eq!(proceed[0], PressureExecutorAction::CheckEmergencyGates);
+        assert_eq!(
+            proceed.last(),
+            Some(&PressureExecutorAction::IssueNextLevel)
+        );
     }
 }

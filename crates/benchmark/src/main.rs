@@ -135,6 +135,20 @@ enum Command {
         #[arg(long, default_value_t = 128 * 1024 * 1024)]
         payload_bytes: u64,
     },
+    PreparePressureExperiment {
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        #[arg(long, default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        observer_binary: PathBuf,
+        #[arg(long)]
+        prepared_dir: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     ExecuteExperiment {
         #[arg(long)]
         manifest: PathBuf,
@@ -512,6 +526,24 @@ fn run() -> Result<i32> {
                 &output_dir,
                 seed,
                 payload_bytes,
+            )?;
+            println!("manifest={}", path.display());
+        }
+        Command::PreparePressureExperiment {
+            repository,
+            config,
+            observer_binary,
+            prepared_dir,
+            output_dir,
+            seed,
+        } => {
+            let path = nemor_benchmark::pressure_prepare::prepare_pressure_experiment(
+                &repository,
+                &config,
+                &observer_binary,
+                &prepared_dir,
+                &output_dir,
+                seed,
             )?;
             println!("manifest={}", path.display());
         }
