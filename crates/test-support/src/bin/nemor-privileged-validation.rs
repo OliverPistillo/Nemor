@@ -192,6 +192,8 @@ enum KsmScenario {
 #[derive(Debug, Parser)]
 #[command(about = "Bounded CachyOS privileged validation harness")]
 struct Cli {
+    #[arg(long, hide = true)]
+    build_git_head: bool,
     #[arg(long)]
     preflight: bool,
     #[arg(long)]
@@ -1255,6 +1257,10 @@ impl Deadline {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.build_git_head {
+        println!("{}", nemor_test_support::BUILD_GIT_HEAD);
+        return Ok(());
+    }
     if let Some(worker) = cli.internal_worker {
         return run_internal_worker(worker);
     }

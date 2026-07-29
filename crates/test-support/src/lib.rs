@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tempfile::TempDir;
 
+/// Full source commit embedded by the shared Nemor build-provenance stamp.
+pub const BUILD_GIT_HEAD: &str = env!("NEMOR_BUILD_GIT_HEAD");
+
 #[derive(Debug, Clone)]
 pub struct ClassifierFixture {
     pub system: collector::SystemSample,

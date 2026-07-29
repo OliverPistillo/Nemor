@@ -22,6 +22,14 @@ the ordinary user and only the resulting binary is executed with root
 privileges. Its public modes are `--preflight`, `--cgroups`, `--zram`, and
 `--all`; it is not exposed by `nemorctl`.
 
+The validator uses the same shared build-time Git stamp as `nemor-benchmark`
+and `nemord`. Its hidden read-only `--build-git-head` identity query returns
+the full embedded commit, while preparation independently hashes the binary
+and requires that exact commit to occur in its bytes. The shared build script
+watches the worktree HEAD, active symbolic ref, packed refs, and the nearest
+ref directory, so a normal branch advance invalidates Cargo's cached stamp.
+Privileged execution never queries live Git state.
+
 The privileged surface is closed:
 
 - cgroups must match `nemor-validation-*.scope`;
