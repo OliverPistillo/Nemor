@@ -71,6 +71,208 @@ pub struct DamonCapability {
     pub dry_run: bool,
 }
 
+/// Result of a read-only capability probe.  In particular, permission denied
+/// is not the same observation as a missing kernel interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Observation<T> {
+    Observed(T),
+    PrivilegeHidden,
+    Absent,
+    InspectionError(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DamonObservability {
+    pub admin: Observation<bool>,
+    pub kdamonds: Observation<bool>,
+    pub nr_kdamonds: Observation<u32>,
+    pub readable: Observation<bool>,
+    pub writable: Observation<bool>,
+    pub tracefs: Observation<bool>,
+    pub aggregated_tracepoint: Observation<bool>,
+    pub available_operations: Observation<Vec<String>>,
+    pub vaddr: Observation<bool>,
+    pub active_external_session: Observation<bool>,
+    pub special_module_conflict: Observation<bool>,
+}
+
+fn classify_error(error: &std::io::Error) -> Observation<()> {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => Observation::PrivilegeHidden,
+        std::io::ErrorKind::NotFound => Observation::Absent,
+        _ => Observation::InspectionError(error.kind().to_string()),
+    }
+}
+
+fn metadata_presence(path: &Path) -> Observation<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Observation::Observed(metadata.is_dir()),
+        Err(error) => match classify_error(&error) {
+            Observation::PrivilegeHidden => Observation::PrivilegeHidden,
+            Observation::Absent => Observation::Absent,
+            Observation::InspectionError(reason) => Observation::InspectionError(reason),
+            Observation::Observed(_) => unreachable!(),
+        },
+    }
+}
+
+fn read_u32_observation(path: &Path) -> Observation<u32> {
+    match fs::read_to_string(path) {
+        Ok(value) => value.trim().parse::<u32>().map_or_else(
+            |error| Observation::InspectionError(error.to_string()),
+            Observation::Observed,
+        ),
+        Err(error) => match classify_error(&error) {
+            Observation::PrivilegeHidden => Observation::PrivilegeHidden,
+            Observation::Absent => Observation::Absent,
+            Observation::InspectionError(reason) => Observation::InspectionError(reason),
+            Observation::Observed(_) => unreachable!(),
+        },
+    }
+}
+
+/// Read-only DAMON inspection retaining the distinction between absence,
+/// permission hiding and an unrelated inspection error.
+pub fn inspect_linux_observability(root: &Path) -> DamonObservability {
+    let admin_path = resolve(root, "/sys/kernel/mm/damon/admin");
+    let kdamonds_path = admin_path.join("kdamonds");
+    let admin = metadata_presence(&admin_path);
+    let kdamonds = metadata_presence(&kdamonds_path);
+    let nr_path = kdamonds_path.join("nr_kdamonds");
+    let nr_kdamonds = match (&admin, &kdamonds) {
+        (Observation::Observed(true), Observation::Observed(true)) => {
+            read_u32_observation(&nr_path)
+        }
+        (Observation::PrivilegeHidden, _) | (_, Observation::PrivilegeHidden) => {
+            Observation::PrivilegeHidden
+        }
+        (Observation::Absent, _) | (_, Observation::Absent) => Observation::Absent,
+        _ => Observation::InspectionError("DAMON admin inspection failed".to_owned()),
+    };
+    let readable = match fs::read_to_string(&nr_path) {
+        Ok(_) => Observation::Observed(true),
+        Err(error) => match classify_error(&error) {
+            Observation::PrivilegeHidden => Observation::PrivilegeHidden,
+            Observation::Absent => Observation::Absent,
+            Observation::InspectionError(reason) => Observation::InspectionError(reason),
+            Observation::Observed(_) => unreachable!(),
+        },
+    };
+    let writable = match OpenOptions::new().write(true).open(&nr_path) {
+        Ok(_) => Observation::Observed(true),
+        Err(error) => match classify_error(&error) {
+            Observation::PrivilegeHidden => Observation::PrivilegeHidden,
+            Observation::Absent => Observation::Absent,
+            Observation::InspectionError(reason) => Observation::InspectionError(reason),
+            Observation::Observed(_) => unreachable!(),
+        },
+    };
+    let tracefs_candidates = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"]
+        .into_iter()
+        .map(|path| resolve(root, path));
+    let mut tracefs_path = None;
+    let mut tracefs = Observation::Absent;
+    for path in tracefs_candidates {
+        match metadata_presence(&path) {
+            Observation::Observed(true) => {
+                tracefs_path = Some(path);
+                tracefs = Observation::Observed(true);
+                break;
+            }
+            Observation::PrivilegeHidden => tracefs = Observation::PrivilegeHidden,
+            Observation::InspectionError(reason) => tracefs = Observation::InspectionError(reason),
+            Observation::Observed(false) | Observation::Absent => {}
+        }
+    }
+    let aggregated_tracepoint = match tracefs_path {
+        Some(path) => metadata_presence(&path.join("events/damon/damon_aggregated")),
+        None => match &tracefs {
+            Observation::PrivilegeHidden => Observation::PrivilegeHidden,
+            Observation::InspectionError(reason) => Observation::InspectionError(reason.clone()),
+            _ => Observation::Absent,
+        },
+    };
+    let available_operations = match &nr_kdamonds {
+        Observation::Observed(count) => {
+            let mut values = Vec::new();
+            for index in 0..*count {
+                let path = kdamonds_path
+                    .join(index.to_string())
+                    .join("contexts/0/avail_operations");
+                match fs::read_to_string(path) {
+                    Ok(value) => values.extend(value.split_whitespace().map(str::to_owned)),
+                    Err(error) => match classify_error(&error) {
+                        Observation::PrivilegeHidden => {
+                            return DamonObservability {
+                                admin,
+                                kdamonds,
+                                nr_kdamonds,
+                                readable,
+                                writable,
+                                tracefs,
+                                aggregated_tracepoint,
+                                available_operations: Observation::PrivilegeHidden,
+                                vaddr: Observation::PrivilegeHidden,
+                                active_external_session: Observation::PrivilegeHidden,
+                                special_module_conflict: Observation::PrivilegeHidden,
+                            }
+                        }
+                        Observation::Absent => continue,
+                        Observation::InspectionError(reason) => {
+                            return DamonObservability {
+                                admin,
+                                kdamonds,
+                                nr_kdamonds,
+                                readable,
+                                writable,
+                                tracefs,
+                                aggregated_tracepoint,
+                                available_operations: Observation::InspectionError(reason),
+                                vaddr: Observation::InspectionError(
+                                    "operations unavailable".into(),
+                                ),
+                                active_external_session: Observation::InspectionError(
+                                    "sessions unavailable".into(),
+                                ),
+                                special_module_conflict: Observation::InspectionError(
+                                    "conflicts unavailable".into(),
+                                ),
+                            }
+                        }
+                        Observation::Observed(_) => unreachable!(),
+                    },
+                }
+            }
+            values.sort();
+            values.dedup();
+            Observation::Observed(values)
+        }
+        Observation::PrivilegeHidden => Observation::PrivilegeHidden,
+        Observation::Absent => Observation::Absent,
+        Observation::InspectionError(reason) => Observation::InspectionError(reason.clone()),
+    };
+    let vaddr = match &available_operations {
+        Observation::Observed(values) => Observation::Observed(values.iter().any(|v| v == "vaddr")),
+        Observation::PrivilegeHidden => Observation::PrivilegeHidden,
+        Observation::Absent => Observation::Absent,
+        Observation::InspectionError(reason) => Observation::InspectionError(reason.clone()),
+    };
+    DamonObservability {
+        admin,
+        kdamonds,
+        nr_kdamonds,
+        readable,
+        writable,
+        tracefs,
+        aggregated_tracepoint,
+        available_operations,
+        vaddr,
+        active_external_session: Observation::PrivilegeHidden,
+        special_module_conflict: Observation::PrivilegeHidden,
+    }
+}
+
 pub fn inspect_linux(root: &Path, kernel: Option<String>) -> DamonCapability {
     let admin = resolve(root, "/sys/kernel/mm/damon/admin");
     let kdamonds = admin.join("kdamonds");

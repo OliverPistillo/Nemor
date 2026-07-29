@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 fn attrs() -> MonitoringAttrs {
@@ -28,6 +29,59 @@ fn capability_absent_and_present_are_safe() {
     .unwrap();
     let found = inspect_linux(root.path(), Some("test".to_owned()));
     assert!(found.supported && found.readable && !found.active_external_session);
+}
+
+#[test]
+fn observability_distinguishes_absent_hidden_and_inspection_error() {
+    assert!(matches!(
+        classify_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        Observation::PrivilegeHidden
+    ));
+    assert!(matches!(
+        classify_error(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Observation::Absent
+    ));
+    assert!(matches!(
+        classify_error(&std::io::Error::from(std::io::ErrorKind::InvalidData)),
+        Observation::InspectionError(_)
+    ));
+}
+
+#[test]
+fn observability_reports_tracepoint_presence_and_absence_without_boolean_collapse() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("sys/kernel/mm/damon/admin/kdamonds");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("nr_kdamonds"), "0\n").unwrap();
+    let tracepoint = root
+        .path()
+        .join("sys/kernel/tracing/events/damon/damon_aggregated");
+    fs::create_dir_all(&tracepoint).unwrap();
+    let observed = inspect_linux_observability(root.path());
+    assert_eq!(observed.tracefs, Observation::Observed(true));
+    assert_eq!(observed.aggregated_tracepoint, Observation::Observed(true));
+
+    fs::remove_dir_all(tracepoint).unwrap();
+    let absent = inspect_linux_observability(root.path());
+    assert_eq!(absent.aggregated_tracepoint, Observation::Absent);
+}
+
+#[test]
+fn observability_reports_permission_hidden_nr_and_tracepoint() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("sys/kernel/mm/damon/admin/kdamonds");
+    fs::create_dir_all(&base).unwrap();
+    let nr = base.join("nr_kdamonds");
+    fs::write(&nr, "0\n").unwrap();
+    fs::set_permissions(&nr, fs::Permissions::from_mode(0o000)).unwrap();
+    let tracefs = root.path().join("sys/kernel/tracing");
+    fs::create_dir_all(&tracefs).unwrap();
+    fs::set_permissions(&tracefs, fs::Permissions::from_mode(0o000)).unwrap();
+    let observed = inspect_linux_observability(root.path());
+    assert_eq!(observed.nr_kdamonds, Observation::PrivilegeHidden);
+    assert_eq!(observed.tracefs, Observation::Observed(true));
+    fs::set_permissions(&nr, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&tracefs, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]

@@ -25,7 +25,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const PREPARED_CAPACITY_COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_COMPATIBILITY_EXECUTION_SCHEMA_VERSION: u32 = 1;
-pub const CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION: u32 = 2;
+pub const CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION: u32 = 3;
 pub const CAPACITY_COMPATIBILITY_MAX_RUNTIME_MS: u64 = 180_000;
 pub const CAPACITY_COMPATIBILITY_MANIFEST_NAME: &str = "capacity-compatibility.manifest.json";
 const HARNESS_REPORT: &str = "/tmp/nemor-privileged-validation-report.json";
@@ -148,6 +148,7 @@ pub enum PrivilegeSensitiveCapabilityStatus {
     DeferredToPrivilegedPreflight,
     Verified,
     Unsupported,
+    InspectionError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +199,68 @@ fn privileged_runtime_capability(
     } else {
         PrivilegeSensitiveCapabilityStatus::Unsupported
     }
+}
+
+fn observability_status(
+    observation: &damon::DamonObservability,
+    damon: &damon::DamonCapability,
+    damos: &damos::DamosCapability,
+    privileged: bool,
+) -> PrivilegeSensitiveCapabilityStatus {
+    use damon::Observation;
+    let has_error = matches!(observation.admin, Observation::InspectionError(_))
+        || matches!(observation.kdamonds, Observation::InspectionError(_))
+        || matches!(observation.nr_kdamonds, Observation::InspectionError(_))
+        || matches!(observation.readable, Observation::InspectionError(_))
+        || matches!(observation.writable, Observation::InspectionError(_))
+        || matches!(observation.tracefs, Observation::InspectionError(_))
+        || matches!(
+            observation.aggregated_tracepoint,
+            Observation::InspectionError(_)
+        )
+        || matches!(
+            observation.available_operations,
+            Observation::InspectionError(_)
+        )
+        || matches!(observation.vaddr, Observation::InspectionError(_));
+    if has_error {
+        return PrivilegeSensitiveCapabilityStatus::InspectionError;
+    }
+    let has_absent = matches!(observation.admin, Observation::Absent)
+        || matches!(observation.kdamonds, Observation::Absent)
+        || matches!(observation.nr_kdamonds, Observation::Absent)
+        || matches!(observation.readable, Observation::Absent)
+        || matches!(observation.writable, Observation::Absent)
+        || matches!(observation.tracefs, Observation::Absent)
+        || matches!(observation.aggregated_tracepoint, Observation::Absent)
+        || matches!(observation.available_operations, Observation::Absent)
+        || matches!(observation.vaddr, Observation::Absent);
+    if has_absent {
+        return PrivilegeSensitiveCapabilityStatus::Unsupported;
+    }
+    let has_hidden = matches!(observation.admin, Observation::PrivilegeHidden)
+        || matches!(observation.kdamonds, Observation::PrivilegeHidden)
+        || matches!(observation.nr_kdamonds, Observation::PrivilegeHidden)
+        || matches!(observation.readable, Observation::PrivilegeHidden)
+        || matches!(observation.writable, Observation::PrivilegeHidden)
+        || matches!(observation.tracefs, Observation::PrivilegeHidden)
+        || matches!(
+            observation.aggregated_tracepoint,
+            Observation::PrivilegeHidden
+        )
+        || matches!(
+            observation.available_operations,
+            Observation::PrivilegeHidden
+        )
+        || matches!(observation.vaddr, Observation::PrivilegeHidden);
+    if has_hidden {
+        return if privileged {
+            PrivilegeSensitiveCapabilityStatus::InspectionError
+        } else {
+            PrivilegeSensitiveCapabilityStatus::DeferredToPrivilegedPreflight
+        };
+    }
+    privileged_runtime_capability(damon, damos, privileged)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +510,7 @@ pub fn capacity_compatibility_preflight(
     )?;
     let material_environment_match = loaded.sha256 == manifest.payload.config_sha256
         && current_environment.material_hash()? == manifest.payload.material_environment_hash;
+    let observability = damon::inspect_linux_observability(Path::new("/"));
     let damon = damon::inspect_linux(Path::new("/"), None);
     let damos = damos::observe_capability(&damon);
     let stale_resources_clear =
@@ -474,7 +538,7 @@ pub fn capacity_compatibility_preflight(
             CapacityComponent::DamonTelemetry,
             CapacityComponent::DamosReclaim,
         ]);
-    let privileged_runtime_capability = privileged_runtime_capability(&damon, &damos, root);
+    let privileged_runtime_capability = observability_status(&observability, &damon, &damos, root);
     let user_observable_gates_passed = current_runner_identity_verified
         && validator_identity_verified
         && material_environment_match
@@ -482,7 +546,11 @@ pub fn capacity_compatibility_preflight(
         && stale_resources_clear
         && output_fresh;
     let user_preflight_passed = user_observable_gates_passed
-        && privileged_runtime_capability != PrivilegeSensitiveCapabilityStatus::Unsupported;
+        && !matches!(
+            privileged_runtime_capability,
+            PrivilegeSensitiveCapabilityStatus::Unsupported
+                | PrivilegeSensitiveCapabilityStatus::InspectionError
+        );
     let execution_ready_except_authorization = user_observable_gates_passed
         && privileged_runtime_capability == PrivilegeSensitiveCapabilityStatus::Verified;
     Ok(CapacityCompatibilityPreflight {
