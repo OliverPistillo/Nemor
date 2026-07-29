@@ -25,7 +25,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const PREPARED_CAPACITY_COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_COMPATIBILITY_EXECUTION_SCHEMA_VERSION: u32 = 1;
-pub const CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION: u32 = 4;
+pub const CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION: u32 = 5;
 pub const CAPACITY_COMPATIBILITY_MAX_RUNTIME_MS: u64 = 180_000;
 pub const CAPACITY_COMPATIBILITY_MANIFEST_NAME: &str = "capacity-compatibility.manifest.json";
 const HARNESS_REPORT: &str = "/tmp/nemor-privileged-validation-report.json";
@@ -169,6 +169,7 @@ pub struct CapacityCompatibilityPreflight {
     pub requires_privileged_execution: bool,
     pub preflight_mutated: bool,
     pub execution_ready_except_authorization: bool,
+    pub bounded_validation_entry_ready: bool,
     pub execution_ready: bool,
 }
 
@@ -262,7 +263,20 @@ fn observability_status(
         };
     }
     if matches!(observation.nr_kdamonds, Observation::Observed(0)) {
-        return if privileged {
+        let non_context_safe = damon.supported
+            && damon.sysfs_admin_available
+            && damon.readable
+            && damon.writable
+            && damon.tracefs_available
+            && damon.aggregated_tracepoint_available
+            && !damon.active_external_session
+            && !damon.special_module_conflict
+            && damos.supported
+            && !damos.external_session_conflict
+            && !damos.special_module_conflict;
+        return if !non_context_safe {
+            PrivilegeSensitiveCapabilityStatus::Unsupported
+        } else if privileged {
             PrivilegeSensitiveCapabilityStatus::RequiresOwnedContextValidation
         } else {
             PrivilegeSensitiveCapabilityStatus::DeferredToPrivilegedPreflight
@@ -570,7 +584,10 @@ pub fn capacity_compatibility_preflight(
         PrivilegeSensitiveCapabilityStatus::Verified
             | PrivilegeSensitiveCapabilityStatus::RequiresOwnedContextValidation
     );
-    let execution_ready_except_authorization = user_observable_gates_passed && bounded_entry;
+    let execution_ready_except_authorization = user_observable_gates_passed
+        && privileged_runtime_capability == PrivilegeSensitiveCapabilityStatus::Verified;
+    let bounded_validation_entry_ready =
+        user_observable_gates_passed && current_identity_authorized && bounded_entry;
     Ok(CapacityCompatibilityPreflight {
         schema_version: CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION,
         manifest_verified: true,
@@ -587,6 +604,7 @@ pub fn capacity_compatibility_preflight(
         requires_privileged_execution: true,
         preflight_mutated: false,
         execution_ready_except_authorization,
+        bounded_validation_entry_ready,
         execution_ready: execution_ready_except_authorization && current_identity_authorized,
     })
 }
@@ -596,7 +614,7 @@ pub fn validate_capacity_compatibility(
 ) -> Result<CapacityCompatibilityExecutionReport> {
     let manifest = read_manifest(manifest_path)?;
     let preflight = capacity_compatibility_preflight(manifest_path)?;
-    if !preflight.execution_ready {
+    if !preflight.bounded_validation_entry_ready {
         bail!("capacity compatibility privileged execution preflight failed");
     }
     let started = Instant::now();
@@ -794,6 +812,23 @@ mod tests {
         }
     }
 
+    fn safe_zero_observation() -> damon::DamonObservability {
+        use damon::Observation;
+        damon::DamonObservability {
+            admin: Observation::Observed(true),
+            kdamonds: Observation::Observed(true),
+            nr_kdamonds: Observation::Observed(0),
+            readable: Observation::Observed(true),
+            writable: Observation::Observed(true),
+            tracefs: Observation::Observed(true),
+            aggregated_tracepoint: Observation::Observed(true),
+            available_operations: Observation::Observed(Vec::new()),
+            vaddr: Observation::Observed(false),
+            active_external_session: Observation::Observed(false),
+            special_module_conflict: Observation::Observed(false),
+        }
+    }
+
     fn damos_capability() -> damos::DamosCapability {
         damos::DamosCapability {
             supported: true,
@@ -957,6 +992,17 @@ mod tests {
     }
 
     #[test]
+    fn zero_kdamonds_conflicts_cannot_authorize_owned_entry() {
+        let observation = safe_zero_observation();
+        let mut damon = damon_capability();
+        damon.special_module_conflict = true;
+        assert_eq!(
+            observability_status(&observation, &damon, &damos_capability(), true),
+            PrivilegeSensitiveCapabilityStatus::Unsupported
+        );
+    }
+
+    #[test]
     fn privileged_missing_vaddr_or_tracepoint_is_unsupported() {
         let mut damon = damon_capability();
         damon.vaddr_supported = false;
@@ -1017,6 +1063,7 @@ mod tests {
             requires_privileged_execution: true,
             preflight_mutated: false,
             execution_ready_except_authorization: false,
+            bounded_validation_entry_ready: false,
             execution_ready: false,
         };
         let encoded = serde_json::to_vec(&report).unwrap();
