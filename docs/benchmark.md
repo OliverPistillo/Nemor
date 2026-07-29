@@ -877,3 +877,14 @@ workflow is `prepare-capacity-compatibility`,
 `validate-capacity-compatibility`. It produces compatibility evidence only:
 production activation remains false and capacity/effectiveness remain
 `not_evaluated`.
+
+Preflight schema version 2 separates static contract support from
+privilege-sensitive runtime capability. An unprivileged report may pass all
+user-observable gates while returning
+`deferred_to_privileged_preflight`; that state never means verified and keeps
+`execution_ready=false`. A root preflight with the exact preparing
+`SUDO_UID:SUDO_GID` repeats the inspection and may set runtime capability to
+`verified` only when current DAMON/DAMOS support, access, conflicts, identities,
+environment, ownership, freshness, and authorization all pass. The command
+can exit successfully after emitting a negative report; readiness is defined
+only by its typed fields.

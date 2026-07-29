@@ -25,6 +25,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const PREPARED_CAPACITY_COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_COMPATIBILITY_EXECUTION_SCHEMA_VERSION: u32 = 1;
+pub const CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION: u32 = 2;
 pub const CAPACITY_COMPATIBILITY_MAX_RUNTIME_MS: u64 = 180_000;
 pub const CAPACITY_COMPATIBILITY_MANIFEST_NAME: &str = "capacity-compatibility.manifest.json";
 const HARNESS_REPORT: &str = "/tmp/nemor-privileged-validation-report.json";
@@ -142,20 +143,61 @@ impl PreparedCapacityCompatibilityManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegeSensitiveCapabilityStatus {
+    DeferredToPrivilegedPreflight,
+    Verified,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityCompatibilityPreflight {
+    pub schema_version: u32,
     pub manifest_verified: bool,
     pub current_runner_identity_verified: bool,
     pub validator_identity_verified: bool,
     pub material_environment_match: bool,
-    pub component_set_supported: bool,
+    pub contract_component_set_supported: bool,
+    pub privileged_runtime_capability: PrivilegeSensitiveCapabilityStatus,
     pub exact_ownership_planned: bool,
     pub stale_resources_clear: bool,
     pub output_fresh: bool,
+    pub user_preflight_passed: bool,
     pub current_identity_authorized: bool,
     pub requires_privileged_execution: bool,
     pub preflight_mutated: bool,
     pub execution_ready_except_authorization: bool,
     pub execution_ready: bool,
+}
+
+fn privileged_runtime_capability(
+    damon: &damon::DamonCapability,
+    damos: &damos::DamosCapability,
+    privileged: bool,
+) -> PrivilegeSensitiveCapabilityStatus {
+    if !damon.supported
+        || !damon.sysfs_admin_available
+        || !damon.tracefs_available
+        || !damon.aggregated_tracepoint_available
+    {
+        return PrivilegeSensitiveCapabilityStatus::Unsupported;
+    }
+    if !privileged && (!damon.readable || !damon.writable) {
+        return PrivilegeSensitiveCapabilityStatus::DeferredToPrivilegedPreflight;
+    }
+    if damon.readable
+        && damon.writable
+        && damon.vaddr_supported
+        && !damon.active_external_session
+        && !damon.special_module_conflict
+        && damos.supported
+        && !damos.external_session_conflict
+        && !damos.special_module_conflict
+    {
+        PrivilegeSensitiveCapabilityStatus::Verified
+    } else {
+        PrivilegeSensitiveCapabilityStatus::Unsupported
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,16 +449,6 @@ pub fn capacity_compatibility_preflight(
         && current_environment.material_hash()? == manifest.payload.material_environment_hash;
     let damon = damon::inspect_linux(Path::new("/"), None);
     let damos = damos::observe_capability(&damon);
-    let component_set_supported = damon.supported
-        && damon.readable
-        && damon.writable
-        && damon.vaddr_supported
-        && damon.aggregated_tracepoint_available
-        && !damon.active_external_session
-        && !damon.special_module_conflict
-        && damos.supported
-        && !damos.external_session_conflict
-        && !damos.special_module_conflict;
     let stale_resources_clear =
         !Path::new(HARNESS_REPORT).exists() && !Path::new(HARNESS_STATE).exists();
     let output_fresh = fs::read_dir(&manifest.payload.output_root)?
@@ -437,21 +469,34 @@ pub fn capacity_compatibility_preflight(
                 manifest.payload.preparing_uid,
                 manifest.payload.preparing_gid,
             ));
-    let execution_ready_except_authorization = current_runner_identity_verified
+    let contract_component_set_supported = manifest.payload.components
+        == BTreeSet::from([
+            CapacityComponent::DamonTelemetry,
+            CapacityComponent::DamosReclaim,
+        ]);
+    let privileged_runtime_capability = privileged_runtime_capability(&damon, &damos, root);
+    let user_observable_gates_passed = current_runner_identity_verified
         && validator_identity_verified
         && material_environment_match
-        && component_set_supported
+        && contract_component_set_supported
         && stale_resources_clear
         && output_fresh;
+    let user_preflight_passed = user_observable_gates_passed
+        && privileged_runtime_capability != PrivilegeSensitiveCapabilityStatus::Unsupported;
+    let execution_ready_except_authorization = user_observable_gates_passed
+        && privileged_runtime_capability == PrivilegeSensitiveCapabilityStatus::Verified;
     Ok(CapacityCompatibilityPreflight {
+        schema_version: CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION,
         manifest_verified: true,
         current_runner_identity_verified,
         validator_identity_verified,
         material_environment_match,
-        component_set_supported,
+        contract_component_set_supported,
+        privileged_runtime_capability,
         exact_ownership_planned: true,
         stale_resources_clear,
         output_fresh,
+        user_preflight_passed,
         current_identity_authorized,
         requires_privileged_execution: true,
         preflight_mutated: false,
@@ -637,6 +682,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn damon_capability() -> damon::DamonCapability {
+        damon::DamonCapability {
+            supported: true,
+            sysfs_admin_available: true,
+            tracefs_available: true,
+            aggregated_tracepoint_available: true,
+            available_operations: vec!["vaddr".into()],
+            vaddr_supported: true,
+            fvaddr_supported: false,
+            paddr_supported: false,
+            existing_kdamond_count: Some(0),
+            existing_kdamond_pids: Vec::new(),
+            active_external_session: false,
+            special_module_conflict: false,
+            optional_features: BTreeMap::new(),
+            readable: true,
+            writable: true,
+            kernel: None,
+            notes: Vec::new(),
+            dry_run: true,
+        }
+    }
+
+    fn damos_capability() -> damos::DamosCapability {
+        damos::DamosCapability {
+            supported: true,
+            vaddr: Some(true),
+            ..damos::DamosCapability::default()
+        }
+    }
+
     fn report(check_overrides: &[(&str, bool)]) -> Value {
         let mut checks = BTreeMap::from([
             ("cleanup", true),
@@ -718,5 +794,115 @@ mod tests {
     fn compatibility_harness_never_changes_evaluation_states() {
         assert_eq!(EvaluationState::NotEvaluated, EvaluationState::NotEvaluated);
         assert_eq!(CAPACITY_COMPATIBILITY_MAX_RUNTIME_MS, 180_000);
+    }
+
+    #[test]
+    fn unprivileged_unreadable_admin_is_deferred_not_unsupported() {
+        let mut damon = damon_capability();
+        damon.readable = false;
+        damon.writable = false;
+        assert_eq!(
+            privileged_runtime_capability(&damon, &damos_capability(), false),
+            PrivilegeSensitiveCapabilityStatus::DeferredToPrivilegedPreflight
+        );
+    }
+
+    #[test]
+    fn observably_absent_admin_is_unsupported_not_deferred() {
+        let mut damon = damon_capability();
+        damon.supported = false;
+        damon.sysfs_admin_available = false;
+        damon.readable = false;
+        damon.writable = false;
+        assert_eq!(
+            privileged_runtime_capability(&damon, &damos_capability(), false),
+            PrivilegeSensitiveCapabilityStatus::Unsupported
+        );
+    }
+
+    #[test]
+    fn privileged_complete_capability_is_verified() {
+        assert_eq!(
+            privileged_runtime_capability(&damon_capability(), &damos_capability(), true),
+            PrivilegeSensitiveCapabilityStatus::Verified
+        );
+    }
+
+    #[test]
+    fn privileged_missing_vaddr_or_tracepoint_is_unsupported() {
+        let mut damon = damon_capability();
+        damon.vaddr_supported = false;
+        assert_eq!(
+            privileged_runtime_capability(&damon, &damos_capability(), true),
+            PrivilegeSensitiveCapabilityStatus::Unsupported
+        );
+        damon.vaddr_supported = true;
+        damon.aggregated_tracepoint_available = false;
+        assert_eq!(
+            privileged_runtime_capability(&damon, &damos_capability(), true),
+            PrivilegeSensitiveCapabilityStatus::Unsupported
+        );
+    }
+
+    #[test]
+    fn privileged_external_session_or_module_conflict_is_unsupported() {
+        let mut damon = damon_capability();
+        damon.active_external_session = true;
+        assert_eq!(
+            privileged_runtime_capability(&damon, &damos_capability(), true),
+            PrivilegeSensitiveCapabilityStatus::Unsupported
+        );
+        damon.active_external_session = false;
+        damon.special_module_conflict = true;
+        assert_eq!(
+            privileged_runtime_capability(&damon, &damos_capability(), true),
+            PrivilegeSensitiveCapabilityStatus::Unsupported
+        );
+    }
+
+    #[test]
+    fn deferred_status_cannot_authorize_execution() {
+        let status = PrivilegeSensitiveCapabilityStatus::DeferredToPrivilegedPreflight;
+        assert_ne!(status, PrivilegeSensitiveCapabilityStatus::Verified);
+        assert!(!matches!(
+            status,
+            PrivilegeSensitiveCapabilityStatus::Verified
+        ));
+    }
+
+    #[test]
+    fn preflight_v2_round_trips_and_old_boolean_shape_is_not_reinterpreted() {
+        let report = CapacityCompatibilityPreflight {
+            schema_version: CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION,
+            manifest_verified: true,
+            current_runner_identity_verified: true,
+            validator_identity_verified: true,
+            material_environment_match: true,
+            contract_component_set_supported: true,
+            privileged_runtime_capability:
+                PrivilegeSensitiveCapabilityStatus::DeferredToPrivilegedPreflight,
+            exact_ownership_planned: true,
+            stale_resources_clear: true,
+            output_fresh: true,
+            user_preflight_passed: true,
+            current_identity_authorized: false,
+            requires_privileged_execution: true,
+            preflight_mutated: false,
+            execution_ready_except_authorization: false,
+            execution_ready: false,
+        };
+        let encoded = serde_json::to_vec(&report).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<CapacityCompatibilityPreflight>(&encoded).unwrap(),
+            report
+        );
+        assert!(
+            serde_json::from_value::<CapacityCompatibilityPreflight>(json!({
+                "manifest_verified": true,
+                "component_set_supported": false,
+                "execution_ready": false
+            }))
+            .is_err()
+        );
     }
 }

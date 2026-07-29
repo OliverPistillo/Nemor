@@ -579,3 +579,12 @@ structural host comparison. The resulting version-1 evidence cannot authorize
 another component set, ownership, contract version, source, binary,
 configuration or material environment. It never evaluates capacity or
 effectiveness and never enables production `nemord`.
+
+Compatibility preflight schema version 2 treats the DAMON admin access probe
+as privilege-sensitive. Opening `nr_kdamonds` with write access is an
+open-only readiness probe: it writes no bytes and changes no sysfs value.
+When an ordinary user can observe the admin and trace interfaces but cannot
+open that node, the report defers runtime capability to the root read-only
+preflight instead of declaring the kernel unsupported. Deferred capability
+cannot authorize execution; root must repeat the complete current inspection
+and produce `verified`.
