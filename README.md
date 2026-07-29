@@ -34,8 +34,8 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 610 / 610 (current local workspace suite) |
-| Passed / failed / ignored | 610 / 0 / 0 locally; exact-commit GitHub CI required for each integrated change |
+| Tests defined / executed | 630 / 630 (current local workspace suite) |
+| Passed / failed / ignored | 630 / 0 / 0 locally; exact-commit GitHub CI required for each integrated change |
 | Phase 10 validation | 3A/3B/3C CLOSED / PASS; capacity/effectiveness still not evaluated |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
@@ -159,9 +159,11 @@ production performance claims.
   incompressible baseline/observe and controlled progressive-pressure
   framework validation are complete.
 - a versioned, deterministic, plan-only `nemor_capacity` orchestration
-  contract with explicit capability/evidence prerequisites, exact ownership,
-  dependencies, incompatibilities, apply/rollback order and permanently
-  disabled activation/evaluation fields.
+  contract with exact combined-compatibility evidence binding, explicit
+  capability/evidence prerequisites, exact ownership, dependencies,
+  incompatibilities, apply/rollback order and permanently disabled
+  activation/evaluation fields. A separate bounded DAMON+DAMOS compatibility
+  harness exists; live validation remains a distinct privileged gate.
 - an explicit Checkpoint 2 owned-cgroup harness with dirty-source provenance,
   evidence-kind isolation, effective-state variant resolution, audited
   PID/start-ticks ownership, a 64 MiB steady worker, watchdog and restore

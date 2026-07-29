@@ -841,7 +841,7 @@ validation only within their specific ownership boundaries; DAMOS/KSM live
 paths remain controlled harness capabilities, not a production combined
 profile.
 
-Contract version 1 is implemented in the benchmark crate as a pure,
+Contract version 2 is implemented in the benchmark crate as a pure,
 serializable planner/validator. It models cgroup protection, zram compression,
 zswap/tiering, DAMON telemetry, DAMOS reclaim and KSM eligibility without
 calling Linux or authorizing execution. Components are explicitly Eligible,
@@ -851,7 +851,12 @@ capability, evidence, dependency or exact ownership is missing.
 Apply order is canonical and rollback is its exact reverse. DAMOS depends on
 DAMON, DAMOS and KSM cannot share the same exact-owned target, and more than
 one mutating component requires independent combined-profile compatibility
-evidence—isolated harness results alone are insufficient. The contract
+evidence—isolated harness results alone are insufficient. That evidence is a
+versioned integrity-bound artifact tied to the exact component set, component
+contract versions, ownership identities, capabilities, prerequisite evidence,
+apply/rollback order, source state, binary, configuration and material
+environment. A caller-provided enum flag cannot authorize a combination. The
+contract
 requires production mode `observe`, requires
 `allow_automatic_actions=false`, prohibits host OOM, invalidates results on
 restore failure and always emits `activation_authorized=false` with capacity
@@ -861,3 +866,14 @@ This foundation does not make `NemorCapacity` executable in variant
 resolution, does not add a combined live executor and does not alter normal
 `nemord`. A separate bounded owned-host orchestration validation remains
 required before activation or any capacity/effectiveness claim.
+
+The first compatibility harness freezes only `DamonTelemetry` plus
+`DamosReclaim`, because the existing bounded DAMOS validation already owns and
+restores the dependent DAMON session. `StorageTiering` is unavailable while
+`ZswapNvmeBoot` evidence remains pending; cgroup, zram and KSM are deferred
+until their combined lifecycle/target ownership is separately proven. The
+workflow is `prepare-capacity-compatibility`,
+`capacity-compatibility-preflight`, then one privileged
+`validate-capacity-compatibility`. It produces compatibility evidence only:
+production activation remains false and capacity/effectiveness remain
+`not_evaluated`.

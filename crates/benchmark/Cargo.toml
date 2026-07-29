@@ -8,6 +8,8 @@ rust-version.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 common = { package = "nemor-common", path = "../common" }
+damon = { package = "nemor-damon", path = "../damon" }
+damos = { package = "nemor-damos", path = "../damos" }
 futures-lite.workspace = true
 hex.workspace = true
 nix.workspace = true

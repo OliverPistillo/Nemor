@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-pub const CAPACITY_ORCHESTRATION_CONTRACT_VERSION: u32 = 1;
+pub const CAPACITY_ORCHESTRATION_CONTRACT_VERSION: u32 = 2;
+pub const CAPACITY_COMBINED_COMPATIBILITY_EVIDENCE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,7 +100,142 @@ pub enum CapacityEvidencePrerequisite {
     DamonMonitor,
     DamosReclaim,
     KsmSelective,
-    CombinedProfileCompatibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityComponentContractIdentity {
+    pub component: CapacityComponent,
+    pub contract_id: String,
+    pub contract_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityCompatibilityClassification {
+    Pass,
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityCombinedCompatibilityPayload {
+    pub evidence_version: u32,
+    pub validation_id: String,
+    pub source_commit: String,
+    pub source_state_id: String,
+    pub benchmark_binary_sha256: String,
+    pub config_sha256: String,
+    pub material_environment_hash: String,
+    pub components: BTreeSet<CapacityComponent>,
+    pub component_contracts: Vec<CapacityComponentContractIdentity>,
+    pub ownership: BTreeMap<CapacityComponent, CapacityOwnershipBoundary>,
+    pub validated_resource_identities: BTreeMap<String, String>,
+    pub capabilities: BTreeSet<CapacityCapability>,
+    pub individual_evidence: BTreeSet<CapacityEvidencePrerequisite>,
+    pub apply_order: Vec<CapacityComponent>,
+    pub rollback_order: Vec<CapacityComponent>,
+    pub incompatibility_assumptions: Vec<String>,
+    pub started_monotonic_ns: u64,
+    pub ended_monotonic_ns: u64,
+    pub bounded_execution_passed: bool,
+    pub cleanup_passed: bool,
+    pub restore_passed: bool,
+    pub host_oom_observed: bool,
+    pub component_safety_passed: BTreeMap<CapacityComponent, bool>,
+    pub classification: CapacityCompatibilityClassification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityCombinedCompatibilityEvidence {
+    pub payload: CapacityCombinedCompatibilityPayload,
+    pub payload_sha256: String,
+}
+
+impl CapacityCombinedCompatibilityEvidence {
+    pub fn seal(
+        payload: CapacityCombinedCompatibilityPayload,
+    ) -> Result<Self, CapacityContractError> {
+        let payload_sha256 = hash_serialized(&payload)?;
+        let evidence = Self {
+            payload,
+            payload_sha256,
+        };
+        evidence.validate_integrity()?;
+        Ok(evidence)
+    }
+
+    pub fn validate_integrity(&self) -> Result<(), CapacityContractError> {
+        if self.payload_sha256 != hash_serialized(&self.payload)? {
+            return Err(CapacityContractError::CombinedEvidenceIntegrity);
+        }
+        if self.payload.evidence_version != CAPACITY_COMBINED_COMPATIBILITY_EVIDENCE_VERSION {
+            return Err(CapacityContractError::CombinedEvidenceVersion);
+        }
+        let pass = self.payload.classification == CapacityCompatibilityClassification::Pass;
+        let contract_components = self
+            .payload
+            .component_contracts
+            .iter()
+            .map(|contract| contract.component)
+            .collect::<BTreeSet<_>>();
+        let safety_components = self
+            .payload
+            .component_safety_passed
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if self.payload.validation_id.is_empty()
+            || self.payload.source_commit.is_empty()
+            || self.payload.source_state_id.is_empty()
+            || self.payload.benchmark_binary_sha256.is_empty()
+            || self.payload.config_sha256.is_empty()
+            || self.payload.material_environment_hash.is_empty()
+            || self.payload.components.len() < 2
+            || self.payload.ended_monotonic_ns < self.payload.started_monotonic_ns
+            || self
+                .payload
+                .apply_order
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != self.payload.components
+            || self.payload.rollback_order
+                != self
+                    .payload
+                    .apply_order
+                    .iter()
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>()
+            || self.payload.component_contracts.len() != self.payload.components.len()
+            || self.payload.ownership.len() != self.payload.components.len()
+            || self.payload.component_safety_passed.len() != self.payload.components.len()
+            || self.payload.validated_resource_identities.is_empty()
+            || contract_components != self.payload.components
+            || safety_components != self.payload.components
+            || self.payload.component_contracts != component_contracts_for(&self.payload.components)
+            || self.payload.individual_evidence.is_empty()
+            || self.payload.ownership.values().any(|boundary| {
+                !matches!(
+                    boundary,
+                    CapacityOwnershipBoundary::ExactOwned { resource_id }
+                        if !resource_id.is_empty()
+                )
+            })
+            || (pass
+                && (!self.payload.bounded_execution_passed
+                    || !self.payload.cleanup_passed
+                    || !self.payload.restore_passed
+                    || self.payload.host_oom_observed
+                    || self
+                        .payload
+                        .component_safety_passed
+                        .values()
+                        .any(|passed| !passed)))
+        {
+            return Err(CapacityContractError::CombinedEvidenceInvalid);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +287,12 @@ pub struct CapacityOrchestrationInput {
     pub allow_automatic_actions: bool,
     pub capabilities: BTreeSet<CapacityCapability>,
     pub evidence: BTreeSet<CapacityEvidencePrerequisite>,
+    pub source_commit: String,
+    pub source_state_id: String,
+    pub benchmark_binary_sha256: String,
+    pub config_sha256: String,
+    pub material_environment_hash: String,
+    pub combined_compatibility: Option<CapacityCombinedCompatibilityEvidence>,
     pub components: BTreeMap<CapacityComponent, CapacityComponentRequest>,
 }
 
@@ -163,6 +305,13 @@ pub struct CapacityOrchestrationPlan {
     pub activation_authorized: bool,
     pub available_capabilities: BTreeSet<CapacityCapability>,
     pub evidence_prerequisites: BTreeSet<CapacityEvidencePrerequisite>,
+    pub combined_compatibility_validation_id: Option<String>,
+    pub source_commit: String,
+    pub source_state_id: String,
+    pub benchmark_binary_sha256: String,
+    pub config_sha256: String,
+    pub material_environment_hash: String,
+    pub combined_compatibility: Option<CapacityCombinedCompatibilityEvidence>,
     pub components: Vec<CapacityComponentPlan>,
     pub apply_order: Vec<CapacityComponent>,
     pub rollback_order: Vec<CapacityComponent>,
@@ -204,6 +353,14 @@ pub enum CapacityContractError {
     IncompatibleOwnedTarget,
     #[error("multiple eligible mutating components require combined-profile evidence")]
     CombinedEvidenceMissing,
+    #[error("combined-profile evidence integrity mismatch")]
+    CombinedEvidenceIntegrity,
+    #[error("unsupported combined-profile evidence version")]
+    CombinedEvidenceVersion,
+    #[error("combined-profile evidence is not a valid PASS artifact")]
+    CombinedEvidenceInvalid,
+    #[error("combined-profile evidence does not bind the exact requested plan")]
+    CombinedEvidenceBindingMismatch,
     #[error("capacity apply ordering is invalid")]
     InvalidApplyOrder,
     #[error("capacity rollback ordering is not the reverse apply order")]
@@ -218,6 +375,13 @@ pub enum CapacityContractError {
     SafetyInvariantViolated,
     #[error("capacity plan component set is incomplete or duplicated")]
     InvalidComponentSet,
+}
+
+fn hash_serialized<T: Serialize>(value: &T) -> Result<String, CapacityContractError> {
+    use sha2::{Digest, Sha256};
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| CapacityContractError::CombinedEvidenceInvalid)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 pub fn plan_capacity_orchestration(
@@ -318,13 +482,16 @@ pub fn plan_capacity_orchestration(
         .iter()
         .filter(|component| component.mutates())
         .count();
-    if mutating_count > 1
-        && !input
-            .evidence
-            .contains(&CapacityEvidencePrerequisite::CombinedProfileCompatibility)
-    {
-        return Err(CapacityContractError::CombinedEvidenceMissing);
-    }
+    let combined_compatibility_validation_id = if mutating_count > 1 {
+        let combined = input
+            .combined_compatibility
+            .as_ref()
+            .ok_or(CapacityContractError::CombinedEvidenceMissing)?;
+        validate_combined_binding(input, &components, &apply_order, combined)?;
+        Some(combined.payload.validation_id.clone())
+    } else {
+        None
+    };
     let rollback_order = apply_order.iter().rev().copied().collect();
     let plan = CapacityOrchestrationPlan {
         contract_version: CAPACITY_ORCHESTRATION_CONTRACT_VERSION,
@@ -334,6 +501,13 @@ pub fn plan_capacity_orchestration(
         activation_authorized: false,
         available_capabilities: input.capabilities.clone(),
         evidence_prerequisites: input.evidence.clone(),
+        combined_compatibility_validation_id,
+        source_commit: input.source_commit.clone(),
+        source_state_id: input.source_state_id.clone(),
+        benchmark_binary_sha256: input.benchmark_binary_sha256.clone(),
+        config_sha256: input.config_sha256.clone(),
+        material_environment_hash: input.material_environment_hash.clone(),
+        combined_compatibility: input.combined_compatibility.clone(),
         components,
         apply_order,
         rollback_order,
@@ -442,13 +616,110 @@ pub fn validate_capacity_orchestration_plan(
         .filter(|component| component.mutates())
         .count()
         > 1
-        && !plan
-            .evidence_prerequisites
-            .contains(&CapacityEvidencePrerequisite::CombinedProfileCompatibility)
+        && plan.combined_compatibility_validation_id.is_none()
     {
         return Err(CapacityContractError::CombinedEvidenceMissing);
     }
+    if eligible
+        .iter()
+        .filter(|component| component.mutates())
+        .count()
+        > 1
+    {
+        let input = CapacityOrchestrationInput {
+            contract_version: plan.contract_version,
+            production_mode: plan.production_mode.clone(),
+            allow_automatic_actions: plan.allow_automatic_actions,
+            capabilities: plan.available_capabilities.clone(),
+            evidence: plan.evidence_prerequisites.clone(),
+            source_commit: plan.source_commit.clone(),
+            source_state_id: plan.source_state_id.clone(),
+            benchmark_binary_sha256: plan.benchmark_binary_sha256.clone(),
+            config_sha256: plan.config_sha256.clone(),
+            material_environment_hash: plan.material_environment_hash.clone(),
+            combined_compatibility: plan.combined_compatibility.clone(),
+            components: BTreeMap::new(),
+        };
+        let combined = plan
+            .combined_compatibility
+            .as_ref()
+            .ok_or(CapacityContractError::CombinedEvidenceMissing)?;
+        validate_combined_binding(&input, &plan.components, &plan.apply_order, combined)?;
+        if plan.combined_compatibility_validation_id.as_deref()
+            != Some(combined.payload.validation_id.as_str())
+        {
+            return Err(CapacityContractError::CombinedEvidenceBindingMismatch);
+        }
+    } else if plan.combined_compatibility_validation_id.is_some()
+        || plan.combined_compatibility.is_some()
+    {
+        return Err(CapacityContractError::CombinedEvidenceBindingMismatch);
+    }
     Ok(())
+}
+
+fn validate_combined_binding(
+    input: &CapacityOrchestrationInput,
+    components: &[CapacityComponentPlan],
+    apply_order: &[CapacityComponent],
+    evidence: &CapacityCombinedCompatibilityEvidence,
+) -> Result<(), CapacityContractError> {
+    evidence.validate_integrity()?;
+    let payload = &evidence.payload;
+    let eligible = apply_order.iter().copied().collect::<BTreeSet<_>>();
+    let ownership = components
+        .iter()
+        .filter(|item| item.state == CapacityComponentState::Eligible)
+        .map(|item| (item.component, item.ownership.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let contracts = component_contracts_for(&eligible);
+    if payload.classification != CapacityCompatibilityClassification::Pass
+        || payload.components != eligible
+        || payload.ownership != ownership
+        || payload.component_contracts != contracts
+        || payload.capabilities != input.capabilities
+        || payload.individual_evidence != input.evidence
+        || payload.apply_order != apply_order
+        || payload.rollback_order != apply_order.iter().rev().copied().collect::<Vec<_>>()
+        || payload.source_commit != input.source_commit
+        || payload.source_state_id != input.source_state_id
+        || payload.benchmark_binary_sha256 != input.benchmark_binary_sha256
+        || payload.config_sha256 != input.config_sha256
+        || payload.material_environment_hash != input.material_environment_hash
+    {
+        return Err(CapacityContractError::CombinedEvidenceBindingMismatch);
+    }
+    Ok(())
+}
+
+pub fn component_contracts_for(
+    components: &BTreeSet<CapacityComponent>,
+) -> Vec<CapacityComponentContractIdentity> {
+    CapacityComponent::ORDER
+        .into_iter()
+        .filter(|component| components.contains(component))
+        .map(|component| CapacityComponentContractIdentity {
+            component,
+            contract_id: match component {
+                CapacityComponent::DamonTelemetry => "nemor.damon.monitor",
+                CapacityComponent::CgroupProtection => "nemor.cgroup.protection",
+                CapacityComponent::CompressionZram => "nemor.zram.lifecycle",
+                CapacityComponent::StorageTiering => "nemor.zswap.tiering",
+                CapacityComponent::DamosReclaim => "nemor.damos.controlled_reclaim",
+                CapacityComponent::KsmEligibility => "nemor.ksm.selective",
+            }
+            .into(),
+            contract_version: match component {
+                CapacityComponent::DamonTelemetry => "damon-labels-v1",
+                CapacityComponent::CgroupProtection => "checkpoint2-v1",
+                CapacityComponent::CompressionZram => "zram-lifecycle-v1",
+                CapacityComponent::StorageTiering => "tiering-v1",
+                CapacityComponent::DamosReclaim => "damos-controlled-reclaim-v1",
+                CapacityComponent::KsmEligibility => "selective-ksm-v1",
+            }
+            .into(),
+        })
+        .collect()
 }
 
 fn validate_input(input: &CapacityOrchestrationInput) -> Result<(), CapacityContractError> {
@@ -540,7 +811,6 @@ mod tests {
             CapacityEvidencePrerequisite::DamonMonitor,
             CapacityEvidencePrerequisite::DamosReclaim,
             CapacityEvidencePrerequisite::KsmSelective,
-            CapacityEvidencePrerequisite::CombinedProfileCompatibility,
         ]
         .into_iter()
         .collect()
@@ -556,13 +826,19 @@ mod tests {
         }
     }
 
-    fn full_input() -> CapacityOrchestrationInput {
+    fn full_input_without_combined() -> CapacityOrchestrationInput {
         CapacityOrchestrationInput {
             contract_version: CAPACITY_ORCHESTRATION_CONTRACT_VERSION,
             production_mode: "observe".into(),
             allow_automatic_actions: false,
             capabilities: all_capabilities(),
             evidence: all_evidence(),
+            source_commit: "commit".into(),
+            source_state_id: "source".into(),
+            benchmark_binary_sha256: "binary".into(),
+            config_sha256: "config".into(),
+            material_environment_hash: "environment".into(),
+            combined_compatibility: None,
             components: BTreeMap::from([
                 (
                     CapacityComponent::DamonTelemetry,
@@ -578,6 +854,74 @@ mod tests {
                 (CapacityComponent::KsmEligibility, request("capacity-ksm")),
             ]),
         }
+    }
+
+    fn bind_combined(input: &mut CapacityOrchestrationInput) {
+        let components = CapacityComponent::ORDER
+            .into_iter()
+            .filter(|component| {
+                input.components.get(component).is_some_and(|request| {
+                    request.desired
+                        && component
+                            .required_capabilities()
+                            .is_subset(&input.capabilities)
+                        && input.evidence.contains(&component.required_evidence())
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let apply_order = CapacityComponent::ORDER
+            .into_iter()
+            .filter(|component| components.contains(component))
+            .collect::<Vec<_>>();
+        let ownership = input
+            .components
+            .iter()
+            .filter(|(component, _)| components.contains(component))
+            .map(|(component, request)| (*component, request.ownership.clone()))
+            .collect();
+        input.combined_compatibility = Some(
+            CapacityCombinedCompatibilityEvidence::seal(CapacityCombinedCompatibilityPayload {
+                evidence_version: CAPACITY_COMBINED_COMPATIBILITY_EVIDENCE_VERSION,
+                validation_id: "validation".into(),
+                source_commit: input.source_commit.clone(),
+                source_state_id: input.source_state_id.clone(),
+                benchmark_binary_sha256: input.benchmark_binary_sha256.clone(),
+                config_sha256: input.config_sha256.clone(),
+                material_environment_hash: input.material_environment_hash.clone(),
+                components: components.clone(),
+                component_contracts: component_contracts_for(&components),
+                ownership,
+                validated_resource_identities: BTreeMap::from([
+                    ("damon_session".into(), "owned-session".into()),
+                    ("damos_target".into(), "pid:1:start:1".into()),
+                ]),
+                capabilities: input.capabilities.clone(),
+                individual_evidence: input.evidence.clone(),
+                apply_order: apply_order.clone(),
+                rollback_order: apply_order.iter().rev().copied().collect(),
+                incompatibility_assumptions: vec![
+                    "DAMOS and KSM use distinct exact-owned targets".into()
+                ],
+                started_monotonic_ns: 1,
+                ended_monotonic_ns: 2,
+                bounded_execution_passed: true,
+                cleanup_passed: true,
+                restore_passed: true,
+                host_oom_observed: false,
+                component_safety_passed: components
+                    .iter()
+                    .map(|component| (*component, true))
+                    .collect(),
+                classification: CapacityCompatibilityClassification::Pass,
+            })
+            .unwrap(),
+        );
+    }
+
+    fn full_input() -> CapacityOrchestrationInput {
+        let mut input = full_input_without_combined();
+        bind_combined(&mut input);
+        input
     }
 
     #[test]
@@ -788,6 +1132,7 @@ mod tests {
         input
             .capabilities
             .remove(&CapacityCapability::ValidatedBootTiering);
+        bind_combined(&mut input);
         let plan = plan_capacity_orchestration(&input).unwrap();
         assert_eq!(
             plan.components
@@ -819,10 +1164,7 @@ mod tests {
 
     #[test]
     fn isolated_component_evidence_does_not_prove_combination() {
-        let mut input = full_input();
-        input
-            .evidence
-            .remove(&CapacityEvidencePrerequisite::CombinedProfileCompatibility);
+        let input = full_input_without_combined();
         assert_eq!(
             plan_capacity_orchestration(&input),
             Err(CapacityContractError::CombinedEvidenceMissing)
@@ -871,5 +1213,211 @@ mod tests {
             plan_capacity_orchestration(&input),
             Err(CapacityContractError::UnsupportedVersion(_))
         ));
+    }
+
+    #[test]
+    fn combined_evidence_integrity_is_verified() {
+        let mut evidence = full_input().combined_compatibility.unwrap();
+        evidence.payload_sha256.push('0');
+        assert_eq!(
+            evidence.validate_integrity(),
+            Err(CapacityContractError::CombinedEvidenceIntegrity)
+        );
+    }
+
+    #[test]
+    fn combined_evidence_is_bound_to_exact_component_set() {
+        let mut input = full_input();
+        input
+            .components
+            .get_mut(&CapacityComponent::CompressionZram)
+            .unwrap()
+            .desired = false;
+        assert_eq!(
+            plan_capacity_orchestration(&input),
+            Err(CapacityContractError::CombinedEvidenceBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn combined_evidence_cannot_authorize_different_subset() {
+        let mut input = full_input();
+        input
+            .components
+            .get_mut(&CapacityComponent::CompressionZram)
+            .unwrap()
+            .desired = false;
+        input
+            .components
+            .get_mut(&CapacityComponent::KsmEligibility)
+            .unwrap()
+            .desired = false;
+        assert_eq!(
+            plan_capacity_orchestration(&input),
+            Err(CapacityContractError::CombinedEvidenceBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn combined_evidence_version_mismatch_is_rejected() {
+        let mut input = full_input();
+        let evidence = input.combined_compatibility.as_mut().unwrap();
+        evidence.payload.evidence_version += 1;
+        evidence.payload_sha256 = hash_serialized(&evidence.payload).unwrap();
+        assert_eq!(
+            plan_capacity_orchestration(&input),
+            Err(CapacityContractError::CombinedEvidenceVersion)
+        );
+    }
+
+    #[test]
+    fn combined_evidence_ownership_mismatch_is_rejected() {
+        let mut input = full_input();
+        input
+            .components
+            .get_mut(&CapacityComponent::CompressionZram)
+            .unwrap()
+            .ownership = CapacityOwnershipBoundary::ExactOwned {
+            resource_id: "different-owned-zram".into(),
+        };
+        assert_eq!(
+            plan_capacity_orchestration(&input),
+            Err(CapacityContractError::CombinedEvidenceBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn combined_evidence_environment_and_provenance_are_bound() {
+        for field in ["source", "binary", "config", "environment"] {
+            let mut input = full_input();
+            match field {
+                "source" => input.source_state_id = "other".into(),
+                "binary" => input.benchmark_binary_sha256 = "other".into(),
+                "config" => input.config_sha256 = "other".into(),
+                "environment" => input.material_environment_hash = "other".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                plan_capacity_orchestration(&input),
+                Err(CapacityContractError::CombinedEvidenceBindingMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_combined_evidence_never_authorizes_planning() {
+        let mut input = full_input();
+        let mut payload = input.combined_compatibility.take().unwrap().payload;
+        payload.classification = CapacityCompatibilityClassification::Fail;
+        input.combined_compatibility =
+            Some(CapacityCombinedCompatibilityEvidence::seal(payload).unwrap());
+        assert_eq!(
+            plan_capacity_orchestration(&input),
+            Err(CapacityContractError::CombinedEvidenceBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn restore_failure_or_host_oom_cannot_be_sealed_as_pass() {
+        let input = full_input();
+        for host_oom in [false, true] {
+            let mut payload = input
+                .combined_compatibility
+                .as_ref()
+                .unwrap()
+                .payload
+                .clone();
+            payload.restore_passed = host_oom;
+            payload.host_oom_observed = host_oom;
+            if !host_oom {
+                payload.restore_passed = false;
+            }
+            assert_eq!(
+                CapacityCombinedCompatibilityEvidence::seal(payload),
+                Err(CapacityContractError::CombinedEvidenceInvalid)
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_hashing_is_deterministic_and_round_trips() {
+        let evidence = full_input().combined_compatibility.unwrap();
+        let duplicate =
+            CapacityCombinedCompatibilityEvidence::seal(evidence.payload.clone()).unwrap();
+        assert_eq!(evidence, duplicate);
+        let bytes = serde_json::to_vec(&evidence).unwrap();
+        let decoded: CapacityCombinedCompatibilityEvidence =
+            serde_json::from_slice(&bytes).unwrap();
+        decoded.validate_integrity().unwrap();
+        assert_eq!(decoded, evidence);
+    }
+
+    #[test]
+    fn serialized_plan_revalidates_embedded_combined_evidence() {
+        let mut plan = plan_capacity_orchestration(&full_input()).unwrap();
+        plan.combined_compatibility
+            .as_mut()
+            .unwrap()
+            .payload_sha256
+            .push('0');
+        assert_eq!(
+            validate_capacity_orchestration_plan(&plan),
+            Err(CapacityContractError::CombinedEvidenceIntegrity)
+        );
+    }
+
+    #[test]
+    fn combined_evidence_apply_and_rollback_order_are_exact() {
+        let mut input = full_input();
+        let mut payload = input.combined_compatibility.take().unwrap().payload;
+        payload.apply_order.swap(0, 1);
+        payload.rollback_order = payload.apply_order.iter().rev().copied().collect();
+        input.combined_compatibility =
+            Some(CapacityCombinedCompatibilityEvidence::seal(payload).unwrap());
+        assert_eq!(
+            plan_capacity_orchestration(&input),
+            Err(CapacityContractError::CombinedEvidenceBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn combined_evidence_capability_snapshot_is_exact() {
+        let mut input = full_input();
+        let mut payload = input.combined_compatibility.take().unwrap().payload;
+        payload
+            .capabilities
+            .remove(&CapacityCapability::SystemdTransientUnits);
+        input.combined_compatibility =
+            Some(CapacityCombinedCompatibilityEvidence::seal(payload).unwrap());
+        assert_eq!(
+            plan_capacity_orchestration(&input),
+            Err(CapacityContractError::CombinedEvidenceBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn combined_evidence_individual_prerequisites_are_exact() {
+        let mut input = full_input();
+        let mut payload = input.combined_compatibility.take().unwrap().payload;
+        payload
+            .individual_evidence
+            .remove(&CapacityEvidencePrerequisite::ZramLifecycle);
+        input.combined_compatibility =
+            Some(CapacityCombinedCompatibilityEvidence::seal(payload).unwrap());
+        assert_eq!(
+            plan_capacity_orchestration(&input),
+            Err(CapacityContractError::CombinedEvidenceBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn component_contract_identity_cannot_be_rewritten() {
+        let mut input = full_input();
+        let mut payload = input.combined_compatibility.take().unwrap().payload;
+        payload.component_contracts[0].contract_version = "future".into();
+        assert_eq!(
+            CapacityCombinedCompatibilityEvidence::seal(payload),
+            Err(CapacityContractError::CombinedEvidenceInvalid)
+        );
     }
 }

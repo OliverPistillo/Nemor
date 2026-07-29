@@ -560,3 +560,14 @@ it is not capacity or effectiveness evidence:
 remain immutable history. The new `nemor_capacity` orchestration contract is
 plan-only and cannot invoke these privileged paths or activate normal
 `nemord`.
+
+The capacity compatibility boundary is separate from production and from the
+pressure executor. Its first frozen component set is exact-owned
+`DamonTelemetry` plus `DamosReclaim`, using the existing bounded DAMOS
+validator and its dependent DAMON session. Preparation is unprivileged,
+preflight is read-only, execution requires the preparing `SUDO_UID:SUDO_GID`,
+and the validator remains bounded to 180 seconds with reverse cleanup and
+structural host comparison. The resulting version-1 evidence cannot authorize
+another component set, ownership, contract version, source, binary,
+configuration or material environment. It never evaluates capacity or
+effectiveness and never enables production `nemord`.

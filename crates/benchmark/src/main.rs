@@ -149,6 +149,28 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
+    PrepareCapacityCompatibility {
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        #[arg(long, default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        validator_binary: PathBuf,
+        #[arg(long)]
+        prepared_dir: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    CapacityCompatibilityPreflight {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    ValidateCapacityCompatibility {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     PressurePreflight {
         #[arg(long)]
         manifest: PathBuf,
@@ -567,6 +589,41 @@ fn run() -> Result<i32> {
                 seed,
             )?;
             println!("manifest={}", path.display());
+        }
+        Command::PrepareCapacityCompatibility {
+            repository,
+            config,
+            validator_binary,
+            prepared_dir,
+            output_dir,
+        } => {
+            let path = nemor_benchmark::capacity_compatibility::prepare_capacity_compatibility(
+                &repository,
+                &config,
+                &validator_binary,
+                &prepared_dir,
+                &output_dir,
+            )?;
+            println!("manifest={}", path.display());
+        }
+        Command::CapacityCompatibilityPreflight { manifest, json } => {
+            let report = nemor_benchmark::capacity_compatibility::capacity_compatibility_preflight(
+                &manifest,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::ValidateCapacityCompatibility { manifest } => {
+            let report = nemor_benchmark::capacity_compatibility::validate_capacity_compatibility(
+                &manifest,
+            )?;
+            println!(
+                "validation_id={} state={:?} capacity=not_evaluated effectiveness=not_evaluated",
+                report.validation_id, report.state
+            );
         }
         Command::PressurePreflight { manifest, json } => {
             let report = nemor_benchmark::pressure_live::pressure_preflight(&manifest)?;
