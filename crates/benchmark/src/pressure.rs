@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const PRESSURE_SCENARIO: &str = "progressive_memory_pressure";
 pub const PRESSURE_SCENARIO_VERSION: u32 = 1;
-pub const PRESSURE_PLAN_VERSION: u32 = 1;
+pub const PRESSURE_PLAN_VERSION: u32 = 2;
 pub const PRESSURE_HEALTH_POLICY_VERSION: u32 = 1;
 pub const LEVEL_EVIDENCE_VERSION: u32 = 2;
 pub const MAX_PRESSURE_LEVELS: usize = 12;
@@ -114,6 +114,7 @@ pub struct PlannedPressureLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureWatchdogPolicy {
     pub heartbeat_timeout_ms: u64,
+    pub level_transition_timeout_ms: u64,
     pub level_timeout_ms: u64,
     pub total_timeout_ms: u64,
 }
@@ -272,6 +273,7 @@ impl ProgressivePressurePlan {
             || self.sample_interval_ms == 0
             || self.sample_interval_ms > self.hold_duration_ms
             || self.watchdog.heartbeat_timeout_ms == 0
+            || self.watchdog.level_transition_timeout_ms == 0
             || self.watchdog.level_timeout_ms == 0
             || self.watchdog.total_timeout_ms == 0
             || self.watchdog.total_timeout_ms > self.maximum_total_duration_ms
@@ -298,8 +300,10 @@ impl ProgressivePressurePlan {
             bail!("unsafe or unbounded Checkpoint 3C pressure plan");
         }
         let per_level_lifecycle = self
-            .hold_duration_ms
+            .watchdog
+            .level_transition_timeout_ms
             .checked_add(self.stabilization_duration_ms)
+            .and_then(|value| value.checked_add(self.hold_duration_ms))
             .and_then(|value| value.checked_add(self.watchdog.heartbeat_timeout_ms))
             .ok_or_else(|| anyhow::anyhow!("level lifecycle overflow"))?;
         if self.watchdog.level_timeout_ms < per_level_lifecycle {
@@ -672,13 +676,21 @@ impl LevelEvidence {
             || self.worker_memory_max_bytes != plan.worker_memory_max_bytes
             || self.generator_id != plan.generator_id
             || self.generator_version != plan.generator_version
-            || self.ended_monotonic_ns <= self.started_monotonic_ns
             || self.duration_ms > plan.watchdog.level_timeout_ms
-            || self.stabilization_completed_ms < plan.stabilization_duration_ms
             || self.workload_identity.is_empty()
             || self.payload_integrity_identity.is_empty()
         {
             bail!("level evidence does not match frozen pressure contract");
+        }
+        if self.classification == LevelClassification::InvalidLevelEvidence {
+            if self.stabilization_completed_ms != 0 {
+                bail!("protocol-invalid level must not claim stabilization");
+            }
+        } else if self.stabilization_completed_ms < plan.stabilization_duration_ms {
+            bail!("completed level did not satisfy stabilization contract");
+        }
+        if self.ended_monotonic_ns <= self.started_monotonic_ns {
+            bail!("level evidence monotonic timestamps are incoherent");
         }
         let prior_touched_bytes = if level.level_index == 0 {
             0
@@ -703,12 +715,16 @@ impl LevelEvidence {
         let minimum_duration_ms = plan
             .hold_duration_ms
             .saturating_sub(plan.sample_interval_ms.min(plan.hold_duration_ms));
-        if self.duration_ms < minimum_duration_ms
-            || elapsed_ms < minimum_duration_ms
-            || elapsed_ms.abs_diff(self.duration_ms) > plan.sample_interval_ms
-            || u64::try_from(self.sample_count).unwrap_or(u64::MAX) < minimum_samples
-        {
-            bail!("completed level has insufficient timing or sample coverage");
+        if self.classification != LevelClassification::InvalidLevelEvidence {
+            if self.duration_ms < minimum_duration_ms
+                || elapsed_ms < minimum_duration_ms
+                || elapsed_ms.abs_diff(self.duration_ms) > plan.sample_interval_ms
+                || u64::try_from(self.sample_count).unwrap_or(u64::MAX) < minimum_samples
+            {
+                bail!("completed level has insufficient timing or sample coverage");
+            }
+        } else if self.duration_ms != 0 || self.sample_count != 0 || !self.raw_samples.is_empty() {
+            bail!("protocol-invalid level must not claim a completed measurement hold");
         }
         if !self.raw_samples.is_empty() && self.raw_samples.len() != self.sample_count {
             bail!("raw pressure sample count differs from level sample contract");
@@ -1083,12 +1099,30 @@ impl SimulatedPressureBackend {
             payload_integrity_identity: format!("integrity-{}-{}", level.seed, touched),
             started_monotonic_ns: level.level_index as u64 * 1_000_000,
             ended_monotonic_ns: level.level_index as u64 * 1_000_000
-                + plan.hold_duration_ms * 1_000_000,
-            stabilization_completed_ms: plan.stabilization_duration_ms,
-            duration_ms: plan.hold_duration_ms,
-            sample_count: usize::try_from(plan.hold_duration_ms / plan.sample_interval_ms)
-                .unwrap_or(1)
-                .max(1),
+                + if classification == LevelClassification::InvalidLevelEvidence {
+                    1
+                } else {
+                    plan.hold_duration_ms * 1_000_000
+                },
+            stabilization_completed_ms: if classification
+                == LevelClassification::InvalidLevelEvidence
+            {
+                0
+            } else {
+                plan.stabilization_duration_ms
+            },
+            duration_ms: if classification == LevelClassification::InvalidLevelEvidence {
+                0
+            } else {
+                plan.hold_duration_ms
+            },
+            sample_count: if classification == LevelClassification::InvalidLevelEvidence {
+                0
+            } else {
+                usize::try_from(plan.hold_duration_ms / plan.sample_interval_ms)
+                    .unwrap_or(1)
+                    .max(1)
+            },
             raw_samples: Vec::new(),
             memory_mean_bytes: Some(touched as f64),
             memory_peak_bytes: Some(touched),
@@ -1347,6 +1381,7 @@ mod tests {
             worker_memory_max_bytes: 512 * MIB,
             watchdog: PressureWatchdogPolicy {
                 heartbeat_timeout_ms: 2_000,
+                level_transition_timeout_ms: 1_000,
                 level_timeout_ms: 10_000,
                 total_timeout_ms: 90_000,
             },
@@ -1581,6 +1616,8 @@ mod tests {
             run.levels[0].failure_reason.as_deref(),
             Some("worker_level_contract_failure")
         );
+        assert_eq!(run.levels[0].stabilization_completed_ms, 0);
+        assert_eq!(run.levels[0].sample_count, 0);
         assert_eq!(run.lowest_tested_unsustainable_bytes, None);
         assert!(!run.refinement_eligible);
     }
@@ -1832,6 +1869,18 @@ mod tests {
         assert!(plan.validate().is_err());
         let mut plan = fixture_plan();
         plan.watchdog.total_timeout_ms = 10_000;
+        assert!(plan.validate().is_err());
+        let mut plan = fixture_plan();
+        plan.watchdog.level_transition_timeout_ms = 0;
+        assert!(plan.validate().is_err());
+        let mut plan = fixture_plan();
+        plan.watchdog.level_transition_timeout_ms = 8_000;
+        plan.watchdog.level_timeout_ms = 16_999;
+        assert!(plan.validate().is_err());
+        let mut plan = fixture_plan();
+        plan.watchdog.level_transition_timeout_ms = 8_000;
+        plan.watchdog.level_timeout_ms = 17_000;
+        plan.watchdog.total_timeout_ms = 50_999;
         assert!(plan.validate().is_err());
     }
 

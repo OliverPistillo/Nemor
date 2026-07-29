@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C live path implemented, V2 preparation next |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C final live hardening implemented, V3 preparation next |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -36,11 +36,11 @@ development; ⚪ planned.
 | Workspace crates | 15 |
 | Tests defined / executed | 547 / 547 |
 | Passed / failed / ignored | 547 / 0 / 0 |
-| Phase 10 validation | 3A/3B CLOSED / PASS; 3C live path implemented / no pressure run |
+| Phase 10 validation | 3A/3B CLOSED / PASS; 3C final live hardening implemented / no pressure run |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
-| Checkpoint 3C | V1 static preparation preserved as non-executable; pressure preflight/executor and scoped worker implemented; V2 preparation next |
+| Checkpoint 3C | V1 static-only; V2 static reviewed and not authorized; final runner/watchdog/restore hardening implemented; V3 preparation next |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -244,6 +244,22 @@ production performance claims.
   PID/start-ticks identity to the frozen scope and verifies `MemoryMax` before
   level zero. Evidence is persisted after each level, emergency gates precede
   every next allocation, and cleanup targets only owned resources.
+- V2 is **STATIC REVIEWED / LIVE EXECUTOR HARDENING REQUIRED**. It was never
+  preflighted or executed and remains unchanged. The final live contract
+  verifies the canonical current executable path, SHA-256 and embedded clean
+  release identity before readiness and again before execution; the worker is
+  spawned only from that frozen executable.
+- Every AF_UNIX exchange has a frozen deadline. The version-2 pressure plan
+  explicitly budgets transition/allocation separately from stabilization and
+  hold, and derives the level, total, worker-scope and observer RuntimeMax
+  bounds from that lifecycle. Exact touched-byte mismatch persists an invalid
+  zero-hold level and immediately cleans up.
+- Run continuation now requires successful exact-owned cleanup, absence of
+  every owned worker/scope/observer/runtime directory, and structural
+  before/after equality. Workload errors retain cleanup evidence; cleanup or
+  structural failure escalates to `RESTORE_FAILURE`. Health gates are
+  populated from their individual observations rather than copied from the
+  final classification.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process

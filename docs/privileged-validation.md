@@ -439,9 +439,36 @@ percentage units directly (`0.20` means 0.20%). Restore is a post-cleanup run
 gate. Observer `RuntimeMaxUSec` is derived from all three level lifecycles plus
 bounded startup/cleanup margins under a hard maximum.
 
-Checkpoint 3C is **LIVE PATH IMPLEMENTED / V2 PREPARATION NEXT**, not PASS.
-After exact CI success V2 may be prepared once unprivileged. Static review
-must precede separately authorized user/root pressure preflight.
+At that point Checkpoint 3C was **LIVE PATH IMPLEMENTED / V2 PREPARATION
+NEXT**, not PASS. V2 was then prepared once unprivileged and statically
+reviewed; no preflight followed.
+
+V2 is subsequently classified **STATIC REVIEWED / LIVE EXECUTOR HARDENING
+REQUIRED**. It was never preflighted or executed and remains immutable. The
+final hardening uses a new prepared schema/pressure-plan version so V1/V2 are
+not silently reinterpreted.
+
+Pressure readiness and the final execution freeze check now verify canonical
+`current_exe` path equality, exact executable SHA-256, embedded Git commit,
+release profile, schema and frozen source/provenance linkage. No live Git
+query is used in the privileged path, and the worker is spawned from the
+verified manifest runner.
+
+AF_UNIX HELLO, boundary, transition acknowledgement, hold, heartbeat,
+integrity and STOP exchanges use real bounded socket deadlines. The frozen
+level lifecycle is transition/allocation (8 seconds), stabilization (2
+seconds), hold (5 seconds) and IPC/heartbeat allowance (2 seconds), producing
+a 17-second level bound and 51-second three-level run bound. Observer runtime
+derivation includes transition time and is 58 seconds, below the fixed
+60-second hard ceiling.
+
+Continuation requires exact-owned cleanup, absence of the worker, scope,
+observer and RuntimeDirectory, plus structural before/after equality.
+Workload errors preserve cleanup results; cleanup failure or structural drift
+is `RESTORE_FAILURE`/safety abort. Touched-byte mismatch persists invalid
+zero-hold evidence and cleans up immediately. Mandatory health gates are
+derived independently from their actual liveness, identity, integrity,
+cgroup, `MemoryMax`, PSI, fault, swap, I/O, CPU, observer and timing evidence.
 
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,

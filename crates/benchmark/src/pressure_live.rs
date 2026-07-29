@@ -3,8 +3,9 @@
 use crate::observer_service::ObserverServiceBackend;
 use crate::performance::{detect_nemord_processes, reject_foreign_nemord};
 use crate::pressure::{
-    next_level_action_order, required_level_health_gates, HealthGateResult, LevelClassification,
-    LevelEvidence, PressureExecutorAction, PressureMetric, PressureMetricScope, SafetyAbortClass,
+    next_level_action_order, required_level_health_gates, HealthGate, HealthGateResult,
+    LevelClassification, LevelEvidence, PressureExecutorAction, PressureMetric,
+    PressureMetricScope, SafetyAbortClass,
 };
 use crate::pressure_prepare::{
     verify_prepared_pressure_manifest, PlannedPressureRun, PreparedPressureManifest,
@@ -36,12 +37,15 @@ pub struct PressurePreflightHost {
     pub observer_contract_supported: bool,
     pub output_fresh: bool,
     pub effective_uid: u32,
+    pub current_runner_identity_verified: bool,
+    pub release_binary_provenance_verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressurePreflightReport {
     pub manifest_verified: bool,
     pub release_binary_provenance_verified: bool,
+    pub current_runner_identity_verified: bool,
     pub performance_claim_eligible: bool,
     pub scenario_contract_verified: bool,
     pub run_plan_verified: bool,
@@ -89,6 +93,8 @@ pub fn evaluate_pressure_preflight(
         host.material_environment_hash == payload.material_environment_hash;
     let current_identity_authorized = host.effective_uid == 0;
     let non_authorization_ready = payload.performance_source_eligible
+        && host.current_runner_identity_verified
+        && host.release_binary_provenance_verified
         && host.observer_contract_supported
         && host.cgroup_memory_controller_available
         && host.host_psi_available
@@ -101,7 +107,8 @@ pub fn evaluate_pressure_preflight(
         && frozen_headroom_contract_safe;
     PressurePreflightReport {
         manifest_verified: true,
-        release_binary_provenance_verified: true,
+        release_binary_provenance_verified: host.release_binary_provenance_verified,
+        current_runner_identity_verified: host.current_runner_identity_verified,
         performance_claim_eligible: payload.performance_source_eligible,
         scenario_contract_verified: true,
         run_plan_verified: true,
@@ -125,6 +132,53 @@ pub fn evaluate_pressure_preflight(
         current_available_memory_bytes: host.current_available_memory_bytes,
         required_current_memory_bytes,
     }
+}
+
+pub fn verify_current_runner_identity_at(
+    manifest: &PreparedPressureManifest,
+    current_executable: &Path,
+    embedded_git_head: &str,
+    embedded_build_profile: &str,
+    embedded_schema_version: u32,
+) -> Result<()> {
+    let current = current_executable.canonicalize()?;
+    let frozen = manifest.payload.runner_path.canonicalize()?;
+    let current_sha256 = hex::encode(Sha256::digest(fs::read(&current)?));
+    let payload = &manifest.payload;
+    if current != frozen
+        || current_sha256 != payload.runner_binary.sha256
+        || current_sha256 != payload.provenance.binary_sha256
+        || embedded_git_head != payload.runner_binary.embedded_git_head
+        || embedded_git_head != payload.provenance.git_head
+        || embedded_build_profile != payload.runner_binary.build_profile
+        || embedded_build_profile != payload.provenance.build_profile
+        || embedded_schema_version != payload.provenance.benchmark_schema_version
+        || payload.runner_binary.source_state_id != payload.provenance.source_state_id
+        || !payload.provenance.clean_release_eligible()
+    {
+        bail!("current pressure runner identity differs from frozen clean release");
+    }
+    Ok(())
+}
+
+fn current_embedded_build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+pub fn pressure_worker_executable(manifest: &PreparedPressureManifest) -> Result<PathBuf> {
+    let executable = manifest.payload.runner_path.canonicalize()?;
+    if executable != manifest.payload.worker_executable_path.canonicalize()? {
+        bail!("pressure worker executable differs from frozen runner");
+    }
+    Ok(executable)
+}
+
+pub fn touched_ack_allows_hold(actual_touched_bytes: u64, target_touched_bytes: u64) -> bool {
+    actual_touched_bytes == target_touched_bytes
 }
 
 fn mem_available_bytes() -> Result<u64> {
@@ -162,6 +216,18 @@ pub fn capture_pressure_preflight_host(
         .and_then(|backend| backend.list_owned_benchmark_units())
         .map(|units| units.is_empty())
         .unwrap_or(false);
+    let current_executable = std::env::current_exe()?;
+    let current_runner_identity_verified = verify_current_runner_identity_at(
+        manifest,
+        &current_executable,
+        crate::BUILD_GIT_HEAD,
+        current_embedded_build_profile(),
+        crate::BENCHMARK_SCHEMA_VERSION,
+    )
+    .is_ok();
+    let release_binary_provenance_verified = current_runner_identity_verified
+        && payload.performance_source_eligible
+        && payload.provenance.clean_release_eligible();
     Ok(PressurePreflightHost {
         material_environment_hash: environment.material_hash()?,
         current_available_memory_bytes: mem_available_bytes()?,
@@ -178,6 +244,8 @@ pub fn capture_pressure_preflight_host(
                 .is_ok(),
         output_fresh: output_is_fresh(manifest),
         effective_uid: nix::unistd::geteuid().as_raw(),
+        current_runner_identity_verified,
+        release_binary_provenance_verified,
     })
 }
 
@@ -322,7 +390,36 @@ pub trait PressureExecutionBackend {
         manifest: &PreparedPressureManifest,
         order_index: usize,
         persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
-    ) -> Result<(PressureRunState, String, bool)>;
+    ) -> Result<PressureBackendRunResult>;
+
+    fn structural_snapshot(&mut self) -> StructuralSnapshot {
+        StructuralSnapshot::capture()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PressureCleanupEvidence {
+    pub worker_absent: bool,
+    pub worker_scope_absent: bool,
+    pub observer_absent: bool,
+    pub observer_runtime_directory_absent: bool,
+}
+
+impl PressureCleanupEvidence {
+    pub fn passed(&self) -> bool {
+        self.worker_absent
+            && self.worker_scope_absent
+            && self.observer_absent
+            && self.observer_runtime_directory_absent
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PressureBackendRunResult {
+    pub state: PressureRunState,
+    pub reason: String,
+    pub execution_error: Option<String>,
+    pub cleanup: PressureCleanupEvidence,
 }
 
 pub fn execute_pressure_with_backend(
@@ -333,7 +430,7 @@ pub fn execute_pressure_with_backend(
     let mut evidence = PressureExecutionEvidence::planned(manifest);
     store.persist(&evidence)?;
     for order in 0..evidence.runs.len() {
-        evidence.runs[order].structural_before = Some(StructuralSnapshot::capture());
+        evidence.runs[order].structural_before = Some(backend.structural_snapshot());
         store.persist(&evidence)?;
         let mut collected = Vec::new();
         let result = backend.execute_run(manifest, order, &mut |level| {
@@ -342,29 +439,49 @@ pub fn execute_pressure_with_backend(
             store.persist(&evidence)
         });
         match result {
-            Ok((state, reason, restore_passed)) => {
-                evidence.runs[order].state = state;
-                evidence.runs[order].stop_reason = Some(reason);
+            Ok(result) => {
+                evidence.runs[order].state = result.state;
+                evidence.runs[order].stop_reason = Some(result.reason.clone());
+                evidence.runs[order].structural_after = Some(backend.structural_snapshot());
+                let structural_restore = evidence.runs[order]
+                    .structural_before
+                    .as_ref()
+                    .zip(evidence.runs[order].structural_after.as_ref())
+                    .is_some_and(|(before, after)| before.matches(after));
+                let restore_passed = result.cleanup.passed() && structural_restore;
                 evidence.runs[order].restore_passed = Some(restore_passed);
-                evidence.runs[order].structural_after = Some(StructuralSnapshot::capture());
                 store.persist(&evidence)?;
                 if !restore_passed {
                     evidence.runs[order].state = PressureRunState::SafetyAbort;
-                    evidence.runs[order].stop_reason =
-                        Some("RESTORE_FAILURE after exact-owned cleanup".into());
+                    evidence.runs[order].stop_reason = Some(format!(
+                        "RESTORE_FAILURE cleanup={:?} structural_match={structural_restore}; original={}",
+                        result.cleanup, result.reason
+                    ));
                     evidence.state = PressureExperimentState::SafetyAbort;
+                    if let Some(error) = result.execution_error {
+                        evidence.execution_error = Some(error);
+                    }
                     store.persist(&evidence)?;
                     break;
                 }
-                if matches!(state, PressureRunState::SafetyAbort) {
+                if let Some(error) = result.execution_error {
+                    evidence.runs[order].state = PressureRunState::Invalid;
+                    evidence.runs[order].stop_reason =
+                        Some(format!("execution_error_cleanup_passed: {error}"));
+                    evidence.state = PressureExperimentState::ExecutionError;
+                    evidence.execution_error = Some(error);
+                    store.persist(&evidence)?;
+                    break;
+                }
+                if matches!(result.state, PressureRunState::SafetyAbort) {
                     evidence.state = PressureExperimentState::SafetyAbort;
                     break;
                 }
-                if matches!(state, PressureRunState::Invalid) {
+                if matches!(result.state, PressureRunState::Invalid) {
                     evidence.state = PressureExperimentState::InvalidRun;
                     break;
                 }
-                if matches!(state, PressureRunState::UnsustainableBoundary) {
+                if matches!(result.state, PressureRunState::UnsustainableBoundary) {
                     evidence.state = PressureExperimentState::UnsustainableHealth;
                     break;
                 }
@@ -437,7 +554,7 @@ impl PressureExecutionBackend for RealPressureExecutionBackend {
         manifest: &PreparedPressureManifest,
         order_index: usize,
         persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
-    ) -> Result<(PressureRunState, String, bool)> {
+    ) -> Result<PressureBackendRunResult> {
         execute_real_pressure_run(manifest, order_index, persist_level)
     }
 }
@@ -494,6 +611,64 @@ fn relative_counter(before: Option<u64>, after: Option<u64>) -> Option<u64> {
     before.zip(after).and_then(|(a, b)| b.checked_sub(a))
 }
 
+#[derive(Debug, Clone)]
+struct LevelGateObservations {
+    worker_alive: bool,
+    worker_identity: bool,
+    heartbeat_fresh: bool,
+    worker_integrity: bool,
+    cgroup_membership: bool,
+    memory_limit_contract: bool,
+    host_psi: bool,
+    cgroup_psi: bool,
+    major_faults: bool,
+    swap_in: bool,
+    swap_out: bool,
+    block_writes: bool,
+    worker_cpu: bool,
+    runner_cpu: bool,
+    observer_contract: bool,
+    elapsed_duration: bool,
+}
+
+fn granular_health_gates(
+    variant: crate::BenchmarkVariant,
+    observed: &LevelGateObservations,
+) -> std::collections::BTreeMap<HealthGate, HealthGateResult> {
+    required_level_health_gates(variant)
+        .into_iter()
+        .map(|gate| {
+            let passed = match gate {
+                HealthGate::WorkerAlive => observed.worker_alive,
+                HealthGate::WorkerIdentity => observed.worker_identity,
+                HealthGate::HeartbeatFresh => observed.heartbeat_fresh,
+                HealthGate::WorkerIntegrity => observed.worker_integrity,
+                HealthGate::CgroupMembership => observed.cgroup_membership,
+                HealthGate::MemoryLimitContract => observed.memory_limit_contract,
+                HealthGate::HostPsi => observed.host_psi,
+                HealthGate::CgroupPsi => observed.cgroup_psi,
+                HealthGate::MajorFaults => observed.major_faults,
+                HealthGate::SwapIn => observed.swap_in,
+                HealthGate::SwapOut => observed.swap_out,
+                HealthGate::BlockWrites => observed.block_writes,
+                HealthGate::WorkerCpu => observed.worker_cpu,
+                HealthGate::RunnerCpu => observed.runner_cpu,
+                HealthGate::ObserverContract => observed.observer_contract,
+                HealthGate::ElapsedDuration => observed.elapsed_duration,
+                HealthGate::RestoreOwnership => false,
+            };
+            (
+                gate,
+                HealthGateResult {
+                    passed,
+                    mandatory: true,
+                    reason: (!passed).then(|| format!("{gate:?} evidence missing or failed")),
+                },
+            )
+        })
+        .collect()
+}
+
 fn timestamp_ns() -> u64 {
     fs::read_to_string("/proc/uptime")
         .ok()
@@ -524,23 +699,30 @@ fn send_stop(
     run_id: &str,
     pid: u32,
     start_ticks: u64,
-) {
+    timeout: Duration,
+) -> bool {
     let (version, experiment_id, run_id, pid, start_ticks) =
         worker_message_identity(experiment_id, run_id, pid, start_ticks);
-    let _ = client.send(&crate::pressure_worker::WorkerIpcMessage::Stop {
-        version,
-        experiment_id,
-        run_id,
-        pid,
-        start_ticks,
-    });
+    client
+        .send_with_timeout(
+            &crate::pressure_worker::WorkerIpcMessage::Stop {
+                version,
+                experiment_id,
+                run_id,
+                pid,
+                start_ticks,
+            },
+            timeout,
+            "STOP",
+        )
+        .is_ok()
 }
 
 fn execute_real_pressure_run(
     manifest: &PreparedPressureManifest,
     order_index: usize,
     persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
-) -> Result<(PressureRunState, String, bool)> {
+) -> Result<PressureBackendRunResult> {
     use crate::systemd::TransientScopeBackend;
     let payload = &manifest.payload;
     let planned = payload
@@ -552,6 +734,9 @@ fn execute_real_pressure_run(
         .pressure_plans
         .get(order_index)
         .context("pressure plan absent")?;
+    let heartbeat_timeout = Duration::from_millis(plan.watchdog.heartbeat_timeout_ms);
+    let transition_timeout = Duration::from_millis(plan.watchdog.level_transition_timeout_ms);
+    let total_timeout = Duration::from_millis(plan.watchdog.total_timeout_ms);
     let run_id = format!(
         "c3c-run-o{}-r{}-{}",
         order_index, planned.repetition_index, payload.experiment_id
@@ -560,7 +745,14 @@ fn execute_real_pressure_run(
     if socket.exists() {
         bail!("pressure worker socket collision");
     }
-    let executable = std::env::current_exe()?;
+    verify_current_runner_identity_at(
+        manifest,
+        &std::env::current_exe()?,
+        crate::BUILD_GIT_HEAD,
+        current_embedded_build_profile(),
+        crate::BENCHMARK_SCHEMA_VERSION,
+    )?;
+    let executable = pressure_worker_executable(manifest)?;
     let mut child = Command::new(&executable)
         .arg("pressure-worker")
         .arg("--socket")
@@ -593,7 +785,7 @@ fn execute_real_pressure_run(
             return Err(error);
         }
     };
-    let hello = match client.receive() {
+    let hello = match client.receive_with_timeout(heartbeat_timeout, "HELLO") {
         Ok(value) => value,
         Err(error) => {
             let _ = child.kill();
@@ -657,14 +849,18 @@ fn execute_real_pressure_run(
         scope.verify(&scope_plan)?;
         let (version, experiment_id, ipc_run_id, ipc_pid, ipc_ticks) =
             worker_message_identity(&payload.experiment_id, &run_id, pid, start_ticks);
-        let boundary = client.send(&crate::pressure_worker::WorkerIpcMessage::VerifyBoundary {
-            version,
-            experiment_id,
-            run_id: ipc_run_id,
-            pid: ipc_pid,
-            start_ticks: ipc_ticks,
-            memory_max_bytes: plan.worker_memory_max_bytes,
-        })?;
+        let boundary = client.send_with_timeout(
+            &crate::pressure_worker::WorkerIpcMessage::VerifyBoundary {
+                version,
+                experiment_id,
+                run_id: ipc_run_id,
+                pid: ipc_pid,
+                start_ticks: ipc_ticks,
+                memory_max_bytes: plan.worker_memory_max_bytes,
+            },
+            heartbeat_timeout,
+            "VERIFY_BOUNDARY",
+        )?;
         if !matches!(
             boundary,
             crate::pressure_worker::WorkerIpcMessage::BoundaryVerified { .. }
@@ -684,7 +880,13 @@ fn execute_real_pressure_run(
                 &frozen.prepared_config_sha256,
             )?);
         }
+        let total_deadline = Instant::now() + total_timeout;
         for level in &plan.levels {
+            if Instant::now() >= total_deadline {
+                final_state = PressureRunState::SafetyAbort;
+                reason = "WATCHDOG_TIMEOUT before next level".into();
+                break;
+            }
             let host_psi = fs::read_to_string("/proc/pressure/memory")
                 .ok()
                 .and_then(|value| crate::parse_psi(&value).ok());
@@ -704,6 +906,8 @@ fn execute_real_pressure_run(
                 break;
             }
             let vm_before = counter_map(Path::new("/proc/vmstat")).ok();
+            let level_deadline =
+                Instant::now() + Duration::from_millis(plan.watchdog.level_timeout_ms);
             let major_fault_before = vm_before
                 .as_ref()
                 .and_then(|values| values.get("pgmajfault").copied());
@@ -724,8 +928,9 @@ fn execute_real_pressure_run(
             )?;
             let (version, experiment_id, ipc_run_id, ipc_pid, ipc_ticks) =
                 worker_message_identity(&payload.experiment_id, &run_id, pid, start_ticks);
-            let ack_message =
-                client.send(&crate::pressure_worker::WorkerIpcMessage::LevelRequest {
+            let transition_started = Instant::now();
+            let ack_message = client.send_with_timeout(
+                &crate::pressure_worker::WorkerIpcMessage::LevelRequest {
                     version,
                     experiment_id,
                     run_id: ipc_run_id,
@@ -733,45 +938,137 @@ fn execute_real_pressure_run(
                     start_ticks: ipc_ticks,
                     command,
                     monotonic_ns: timestamp_ns(),
-                })?;
+                },
+                transition_timeout,
+                "LEVEL_REQUEST/LEVEL_ACK",
+            )?;
+            if transition_started.elapsed() > transition_timeout {
+                final_state = PressureRunState::SafetyAbort;
+                reason = "WATCHDOG_TIMEOUT during level transition".into();
+                break;
+            }
             let acknowledgement = match ack_message {
                 crate::pressure_worker::WorkerIpcMessage::LevelAck {
                     acknowledgement, ..
                 } => acknowledgement,
                 _ => bail!("worker LEVEL_ACK missing"),
             };
-            if acknowledgement.actual_touched_bytes != level.target_touched_bytes {
+            if !touched_ack_allows_hold(
+                acknowledgement.actual_touched_bytes,
+                level.target_touched_bytes,
+            ) {
                 final_state = PressureRunState::Invalid;
                 reason = "worker touched-byte contract mismatch".into();
+                let observed = LevelGateObservations {
+                    worker_alive: process_start_ticks(pid).ok() == Some(start_ticks),
+                    worker_identity: acknowledgement.worker_pid == pid
+                        && acknowledgement.worker_start_ticks == start_ticks,
+                    heartbeat_fresh: false,
+                    worker_integrity: false,
+                    cgroup_membership: fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                        .is_ok_and(|membership| membership.contains(&scope.control_group)),
+                    memory_limit_contract: scalar(&cgroup.join("memory.max"))
+                        == Some(plan.worker_memory_max_bytes),
+                    host_psi: true,
+                    cgroup_psi: true,
+                    major_faults: false,
+                    swap_in: false,
+                    swap_out: false,
+                    block_writes: false,
+                    worker_cpu: process_cpu_ticks(pid).is_some(),
+                    runner_cpu: process_cpu_ticks(std::process::id()).is_some(),
+                    observer_contract: planned.variant == crate::BenchmarkVariant::CachyosBaseline
+                        || observer.is_some(),
+                    elapsed_duration: false,
+                };
+                let started = acknowledgement.acknowledged_monotonic_ns;
+                let payload_integrity_identity = acknowledgement.integrity_identity.clone();
+                let invalid = LevelEvidence {
+                    version: crate::pressure::LEVEL_EVIDENCE_VERSION,
+                    experiment_id: payload.experiment_id.clone(),
+                    run_id: run_id.clone(),
+                    variant: planned.variant,
+                    repetition_index: planned.repetition_index,
+                    level_index: level.level_index,
+                    planned_logical_bytes: level.target_logical_bytes,
+                    actual_touched_bytes: acknowledgement.actual_touched_bytes,
+                    worker_acknowledgement: acknowledgement,
+                    worker_memory_max_bytes: plan.worker_memory_max_bytes,
+                    generator_id: plan.generator_id.clone(),
+                    generator_version: plan.generator_version,
+                    workload_identity: crate::performance::workload_identity(
+                        &plan.scenario,
+                        &plan.generator_id,
+                        plan.generator_version,
+                        level.seed,
+                        level.target_logical_bytes,
+                    )?,
+                    payload_integrity_identity,
+                    started_monotonic_ns: started,
+                    ended_monotonic_ns: started.saturating_add(1),
+                    stabilization_completed_ms: 0,
+                    duration_ms: 0,
+                    sample_count: 0,
+                    raw_samples: Vec::new(),
+                    memory_mean_bytes: None,
+                    memory_peak_bytes: None,
+                    metrics: Vec::new(),
+                    major_fault_delta: None,
+                    swap_in_bytes_delta: None,
+                    swap_out_bytes_delta: None,
+                    block_write_bytes_delta: None,
+                    watchdog_triggered: false,
+                    oom: 0,
+                    oom_kill: 0,
+                    health_gates: granular_health_gates(planned.variant, &observed),
+                    classification: LevelClassification::InvalidLevelEvidence,
+                    safety_abort: None,
+                    failure_reason: Some("worker_level_contract_failure".into()),
+                };
+                invalid.validate(level, plan)?;
+                persist_level(invalid)?;
+                break;
             }
             thread::sleep(Duration::from_millis(plan.stabilization_duration_ms));
+            if Instant::now() >= level_deadline || Instant::now() >= total_deadline {
+                final_state = PressureRunState::SafetyAbort;
+                reason = "WATCHDOG_TIMEOUT before measurement hold".into();
+                break;
+            }
             let (version, experiment_id, ipc_run_id, ipc_pid, ipc_ticks) =
                 worker_message_identity(&payload.experiment_id, &run_id, pid, start_ticks);
-            let first_integrity =
-                client.send(&crate::pressure_worker::WorkerIpcMessage::BeginHold {
+            let first_integrity = client.send_with_timeout(
+                &crate::pressure_worker::WorkerIpcMessage::BeginHold {
                     version,
                     experiment_id,
                     run_id: ipc_run_id,
                     pid: ipc_pid,
                     start_ticks: ipc_ticks,
-                })?;
+                },
+                heartbeat_timeout,
+                "BEGIN_HOLD",
+            )?;
             if !matches!(
                 first_integrity,
                 crate::pressure_worker::WorkerIpcMessage::IntegrityResult { .. }
             ) {
                 bail!("worker integrity result missing at hold start");
             }
-            let _initial_heartbeat = client.receive()?;
+            let _initial_heartbeat =
+                client.receive_with_timeout(heartbeat_timeout, "BEGIN_HOLD heartbeat")?;
             let measurement_start = Instant::now();
             let mut memory_values = Vec::new();
             let mut peak = 0;
             let mut sample_count = 0usize;
             let mut raw_samples = Vec::new();
             while measurement_start.elapsed() < Duration::from_millis(plan.hold_duration_ms) {
+                if Instant::now() >= level_deadline || Instant::now() >= total_deadline {
+                    bail!("pressure worker IPC timeout/failure during level lifecycle watchdog");
+                }
                 thread::sleep(Duration::from_millis(plan.sample_interval_ms));
                 let (version, experiment_id, ipc_run_id, ipc_pid, ipc_ticks) =
                     worker_message_identity(&payload.experiment_id, &run_id, pid, start_ticks);
-                let heartbeat = client.send(
+                let heartbeat = client.send_with_timeout(
                     &crate::pressure_worker::WorkerIpcMessage::HeartbeatRequest {
                         version,
                         experiment_id,
@@ -779,6 +1076,8 @@ fn execute_real_pressure_run(
                         pid: ipc_pid,
                         start_ticks: ipc_ticks,
                     },
+                    heartbeat_timeout,
+                    "HEARTBEAT",
                 )?;
                 let heartbeat_touched = match heartbeat {
                     crate::pressure_worker::WorkerIpcMessage::Heartbeat {
@@ -786,7 +1085,9 @@ fn execute_real_pressure_run(
                     } if touched_bytes == level.target_touched_bytes => touched_bytes,
                     _ => bail!("worker heartbeat identity or touched total mismatch"),
                 };
-                let integrity_identity = match client.receive()? {
+                let integrity_identity = match client
+                    .receive_with_timeout(heartbeat_timeout, "INTEGRITY_RESULT")?
+                {
                     crate::pressure_worker::WorkerIpcMessage::IntegrityResult {
                         identity, ..
                     } => Some(identity),
@@ -884,44 +1185,74 @@ fn execute_real_pressure_run(
                     && sample.heartbeat_touched_bytes == level.target_touched_bytes
                     && sample.integrity_identity.is_some()
             });
-            let classification =
-                if host_oom_delta.is_some_and(|value| value > 0) || !host_psi_healthy {
-                    LevelClassification::SafetyAbort
-                } else if acknowledgement.actual_touched_bytes != level.target_touched_bytes {
-                    LevelClassification::InvalidLevelEvidence
-                } else if oom > 0
-                    || oom_kill > 0
-                    || !cgroup_psi_healthy
-                    || !runtime_healthy
-                    || !identity_healthy
-                    || worker_cpu_delta.is_none()
-                    || runner_cpu_delta.is_none()
-                {
-                    LevelClassification::UnsustainableHealth
-                } else {
-                    LevelClassification::Sustainable
-                };
+            let cgroup_membership_healthy = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                .is_ok_and(|membership| membership.contains(&scope.control_group));
+            let memory_limit_healthy =
+                scalar(&cgroup.join("memory.max")) == Some(plan.worker_memory_max_bytes);
+            let observer_contract_healthy =
+                planned.variant == crate::BenchmarkVariant::CachyosBaseline || observer.is_some();
+            let elapsed_healthy = ended.as_millis() as u64
+                >= plan
+                    .hold_duration_ms
+                    .saturating_sub(plan.sample_interval_ms)
+                && sample_count as u64 >= plan.hold_duration_ms.div_ceil(plan.sample_interval_ms);
+            let observed = LevelGateObservations {
+                worker_alive: raw_samples.iter().all(|sample| sample.worker_alive),
+                worker_identity: process_start_ticks(pid).ok() == Some(start_ticks),
+                heartbeat_fresh: raw_samples
+                    .iter()
+                    .all(|sample| sample.heartbeat_touched_bytes == level.target_touched_bytes),
+                worker_integrity: raw_samples
+                    .iter()
+                    .all(|sample| sample.integrity_identity.is_some()),
+                cgroup_membership: cgroup_membership_healthy,
+                memory_limit_contract: memory_limit_healthy,
+                host_psi: host_psi_healthy,
+                cgroup_psi: cgroup_psi_healthy,
+                major_faults: major_fault_delta
+                    .is_some_and(|value| value <= plan.health.max_major_faults_per_level),
+                swap_in: swap_in_bytes_delta
+                    .is_some_and(|value| value <= plan.health.max_swap_in_bytes_per_level),
+                swap_out: swap_out_bytes_delta
+                    .is_some_and(|value| value <= plan.health.max_swap_out_bytes_per_level),
+                block_writes: block_write_bytes_delta
+                    .is_some_and(|value| value <= plan.health.max_block_writes_bytes_per_level),
+                worker_cpu: worker_cpu_delta.is_some(),
+                runner_cpu: runner_cpu_delta.is_some(),
+                observer_contract: observer_contract_healthy,
+                elapsed_duration: elapsed_healthy,
+            };
+            let health_gates = granular_health_gates(planned.variant, &observed);
+            let every_health_gate_passed = health_gates
+                .values()
+                .all(|gate| gate.mandatory && gate.passed);
             let safety_abort = if host_oom_delta.is_some_and(|value| value > 0) {
                 Some(SafetyAbortClass::HostOomDetected)
             } else if !host_psi_healthy {
                 Some(SafetyAbortClass::HostPsiEmergency)
+            } else if !observed.worker_alive || !observed.worker_identity {
+                Some(SafetyAbortClass::WorkerIdentityLost)
+            } else if !observed.cgroup_membership {
+                Some(SafetyAbortClass::CgroupOwnershipLost)
+            } else if !observed.memory_limit_contract {
+                Some(SafetyAbortClass::MemoryLimitContractBroken)
+            } else if !observed.observer_contract {
+                Some(SafetyAbortClass::ObserverContractBroken)
             } else {
                 None
             };
-            let health_gates = required_level_health_gates(planned.variant)
-                .into_iter()
-                .map(|gate| {
-                    (
-                        gate,
-                        HealthGateResult {
-                            passed: classification == LevelClassification::Sustainable,
-                            mandatory: true,
-                            reason: (classification != LevelClassification::Sustainable)
-                                .then(|| "level classification did not pass".into()),
-                        },
-                    )
-                })
-                .collect();
+            let classification = if safety_abort.is_some() {
+                LevelClassification::SafetyAbort
+            } else if oom > 0
+                || oom_kill > 0
+                || !runtime_healthy
+                || !identity_healthy
+                || !every_health_gate_passed
+            {
+                LevelClassification::UnsustainableHealth
+            } else {
+                LevelClassification::Sustainable
+            };
             let payload_integrity_identity = acknowledgement.integrity_identity.clone();
             let level_evidence = LevelEvidence {
                 version: crate::pressure::LEVEL_EVIDENCE_VERSION,
@@ -1010,28 +1341,54 @@ fn execute_real_pressure_run(
         }
         Ok(())
     })();
-    send_stop(
+    let _stop_acknowledged = send_stop(
         &mut client,
         &payload.experiment_id,
         &run_id,
         pid,
         start_ticks,
+        heartbeat_timeout,
     );
-    let child_stopped = wait_child(&mut child, start_ticks, Duration::from_secs(4));
+    let child_stopped = wait_child(&mut child, start_ticks, heartbeat_timeout);
+    let observer_runtime_directory = observer
+        .as_ref()
+        .map(|handle| Path::new("/run").join(&handle.plan.runtime_directory));
     let observer_stopped = observer
         .take()
         .map(|handle| handle.stop_and_cleanup().is_ok())
         .unwrap_or(true);
     let scope_stopped = systemd
         .stop_owned_scope(&scope_plan)
-        .and_then(|_| {
-            systemd.wait_inactive_or_removed(&scope_plan.unit_name, Duration::from_secs(4))
-        })
+        .and_then(|_| systemd.wait_inactive_or_removed(&scope_plan.unit_name, heartbeat_timeout))
         .is_ok();
+    let worker_scope_absent = scope_stopped
+        && systemd
+            .list_owned_benchmark_units()
+            .is_ok_and(|units| !units.iter().any(|unit| unit == &scope_plan.unit_name));
     let _ = fs::remove_file(&socket);
-    run_result?;
-    let restore = child_stopped && observer_stopped && scope_stopped;
-    Ok((final_state, reason, restore))
+    let observer_runtime_directory_absent = observer_runtime_directory
+        .as_ref()
+        .is_none_or(|path| !path.exists());
+    let cleanup = PressureCleanupEvidence {
+        worker_absent: child_stopped && process_start_ticks(pid).is_err(),
+        worker_scope_absent,
+        observer_absent: observer_stopped,
+        observer_runtime_directory_absent,
+    };
+    let workload_error = run_result.err().map(|error| format!("{error:#}"));
+    let timed_out = workload_error
+        .as_deref()
+        .is_some_and(|error| error.contains("pressure worker IPC timeout/failure"));
+    if timed_out {
+        final_state = PressureRunState::SafetyAbort;
+        reason = "WATCHDOG_TIMEOUT during bounded worker IPC".into();
+    }
+    Ok(PressureBackendRunResult {
+        state: final_state,
+        reason,
+        execution_error: (!timed_out).then_some(workload_error).flatten(),
+        cleanup,
+    })
 }
 
 fn wait_child(child: &mut Child, expected_start_ticks: u64, timeout: Duration) -> bool {
@@ -1097,13 +1454,15 @@ mod tests {
             observer_contract_supported: true,
             output_fresh: true,
             effective_uid: uid,
+            current_runner_identity_verified: true,
+            release_binary_provenance_verified: true,
         }
     }
 
     fn manifest_fixture() -> PreparedPressureManifest {
         let value = serde_json::json!({
             "payload": {
-                "schema_version": 2,
+                "schema_version": 3,
                 "experiment_id": "checkpoint3c-test",
                 "scenario": "progressive_memory_pressure",
                 "scenario_version": 1,
@@ -1234,6 +1593,116 @@ mod tests {
         assert!(serde_json::from_value::<PreparedPressureManifest>(fixed).is_err());
     }
 
+    fn identity_fixture() -> (tempfile::TempDir, PreparedPressureManifest, PathBuf) {
+        let temporary = tempfile::tempdir().unwrap();
+        let runner = temporary.path().join("nemor-benchmark");
+        fs::copy(std::env::current_exe().unwrap(), &runner).unwrap();
+        let sha = hex::encode(Sha256::digest(fs::read(&runner).unwrap()));
+        let mut manifest = manifest_fixture();
+        manifest.payload.runner_path = runner.clone();
+        manifest.payload.worker_executable_path = runner.clone();
+        manifest.payload.runner_binary.sha256 = sha.clone();
+        manifest.payload.provenance.binary_sha256 = sha;
+        manifest.payload.runner_binary.embedded_git_head = "frozen-head".into();
+        manifest.payload.provenance.git_head = "frozen-head".into();
+        manifest.payload.runner_binary.build_profile = "release".into();
+        manifest.payload.provenance.build_profile = "release".into();
+        manifest.payload.provenance.git_dirty = false;
+        manifest.payload.provenance.development_build = false;
+        manifest.payload.provenance.benchmark_schema_version = crate::BENCHMARK_SCHEMA_VERSION;
+        (temporary, manifest, runner)
+    }
+
+    #[test]
+    fn current_executable_frozen_identity_passes_and_is_spawn_source() {
+        let (_temporary, manifest, runner) = identity_fixture();
+        verify_current_runner_identity_at(
+            &manifest,
+            &runner,
+            "frozen-head",
+            "release",
+            crate::BENCHMARK_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(
+            pressure_worker_executable(&manifest).unwrap(),
+            runner.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn current_executable_path_or_sha_mismatch_fails() {
+        let (temporary, mut manifest, runner) = identity_fixture();
+        let other = temporary.path().join("other-runner");
+        fs::copy(&runner, &other).unwrap();
+        assert!(verify_current_runner_identity_at(
+            &manifest,
+            &other,
+            "frozen-head",
+            "release",
+            crate::BENCHMARK_SCHEMA_VERSION,
+        )
+        .is_err());
+        manifest.payload.runner_binary.sha256 = "00".repeat(32);
+        assert!(verify_current_runner_identity_at(
+            &manifest,
+            &runner,
+            "frozen-head",
+            "release",
+            crate::BENCHMARK_SCHEMA_VERSION,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn readiness_and_release_provenance_require_current_runner_gate() {
+        let manifest = manifest_fixture();
+        let mut snapshot = host("material", 5_000, 0);
+        snapshot.current_runner_identity_verified = false;
+        let report = evaluate_pressure_preflight(&manifest, &snapshot);
+        assert!(!report.current_runner_identity_verified);
+        assert!(!report.execution_ready_except_authorization);
+        snapshot.current_runner_identity_verified = true;
+        snapshot.release_binary_provenance_verified = false;
+        let report = evaluate_pressure_preflight(&manifest, &snapshot);
+        assert!(!report.release_binary_provenance_verified);
+        assert!(!report.execution_ready_except_authorization);
+    }
+
+    #[test]
+    fn touched_byte_mismatch_never_enters_hold() {
+        assert!(touched_ack_allows_hold(4096, 4096));
+        assert!(!touched_ack_allows_hold(4095, 4096));
+    }
+
+    #[test]
+    fn granular_health_gates_preserve_individual_results() {
+        let observed = LevelGateObservations {
+            worker_alive: true,
+            worker_identity: true,
+            heartbeat_fresh: true,
+            worker_integrity: false,
+            cgroup_membership: true,
+            memory_limit_contract: true,
+            host_psi: true,
+            cgroup_psi: false,
+            major_faults: true,
+            swap_in: true,
+            swap_out: true,
+            block_writes: false,
+            worker_cpu: true,
+            runner_cpu: true,
+            observer_contract: true,
+            elapsed_duration: true,
+        };
+        let gates = granular_health_gates(crate::BenchmarkVariant::NemorObserve, &observed);
+        assert!(gates[&HealthGate::WorkerAlive].passed);
+        assert!(!gates[&HealthGate::WorkerIntegrity].passed);
+        assert!(!gates[&HealthGate::CgroupPsi].passed);
+        assert!(!gates[&HealthGate::BlockWrites].passed);
+        assert!(gates[&HealthGate::ObserverContract].passed);
+    }
+
     struct RestoreFailureBackend {
         calls: usize,
     }
@@ -1244,9 +1713,19 @@ mod tests {
             _manifest: &PreparedPressureManifest,
             _order_index: usize,
             _persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
-        ) -> Result<(PressureRunState, String, bool)> {
+        ) -> Result<PressureBackendRunResult> {
             self.calls += 1;
-            Ok((PressureRunState::Completed, "simulated".into(), false))
+            Ok(PressureBackendRunResult {
+                state: PressureRunState::Completed,
+                reason: "simulated".into(),
+                execution_error: None,
+                cleanup: PressureCleanupEvidence {
+                    worker_absent: false,
+                    worker_scope_absent: true,
+                    observer_absent: true,
+                    observer_runtime_directory_absent: true,
+                },
+            })
         }
     }
 
@@ -1285,5 +1764,121 @@ mod tests {
         let persisted: PressureExecutionEvidence =
             serde_json::from_slice(&fs::read(&manifest.payload.report_path).unwrap()).unwrap();
         assert_eq!(persisted.state, PressureExperimentState::SafetyAbort);
+    }
+
+    struct OutcomeBackend {
+        calls: usize,
+        execution_error: Option<String>,
+        cleanup_passes: bool,
+        before: StructuralSnapshot,
+        after: StructuralSnapshot,
+        snapshots: usize,
+    }
+
+    impl PressureExecutionBackend for OutcomeBackend {
+        fn execute_run(
+            &mut self,
+            _manifest: &PreparedPressureManifest,
+            _order_index: usize,
+            _persist_level: &mut dyn FnMut(LevelEvidence) -> Result<()>,
+        ) -> Result<PressureBackendRunResult> {
+            self.calls += 1;
+            Ok(PressureBackendRunResult {
+                state: PressureRunState::Completed,
+                reason: "simulated workload result".into(),
+                execution_error: self.execution_error.clone(),
+                cleanup: PressureCleanupEvidence {
+                    worker_absent: self.cleanup_passes,
+                    worker_scope_absent: self.cleanup_passes,
+                    observer_absent: self.cleanup_passes,
+                    observer_runtime_directory_absent: self.cleanup_passes,
+                },
+            })
+        }
+
+        fn structural_snapshot(&mut self) -> StructuralSnapshot {
+            let result = if self.snapshots == 0 {
+                self.before.clone()
+            } else {
+                self.after.clone()
+            };
+            self.snapshots += 1;
+            result
+        }
+    }
+
+    fn runnable_manifest(temporary: &tempfile::TempDir) -> PreparedPressureManifest {
+        let output = temporary.path().join("output");
+        fs::create_dir(&output).unwrap();
+        let mut manifest = manifest_fixture();
+        manifest.payload.output_root = output.clone();
+        manifest.payload.report_path = output.join("experiment.json");
+        manifest.payload.database_path = output.join("experiment.sqlite");
+        manifest.payload.runs_path = output.join("runs");
+        manifest.payload.run_plan.runs = (0..6)
+            .map(|order_index| PlannedPressureRun {
+                order_index,
+                variant: if order_index % 2 == 0 {
+                    crate::BenchmarkVariant::CachyosBaseline
+                } else {
+                    crate::BenchmarkVariant::NemorObserve
+                },
+                repetition_index: order_index / 2,
+                run_seed: 100 + (order_index / 2) as u64,
+                state: PressureRunState::Planned,
+            })
+            .collect();
+        manifest
+    }
+
+    #[test]
+    fn structural_mismatch_blocks_next_run_even_after_successful_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = runnable_manifest(&temporary);
+        let before = StructuralSnapshot::capture();
+        let mut after = before.clone();
+        after.zswap_enabled = Some("structural-mismatch".into());
+        let mut backend = OutcomeBackend {
+            calls: 0,
+            execution_error: None,
+            cleanup_passes: true,
+            before,
+            after,
+            snapshots: 0,
+        };
+        let store = IncrementalPressureStore::create(&manifest).unwrap();
+        let evidence = execute_pressure_with_backend(&manifest, &mut backend, &store).unwrap();
+        assert_eq!(backend.calls, 1);
+        assert_eq!(evidence.state, PressureExperimentState::SafetyAbort);
+        assert!(!evidence.runs[0].restore_passed.unwrap());
+    }
+
+    #[test]
+    fn execution_error_retains_cleanup_success_or_escalates_cleanup_failure() {
+        for cleanup_passes in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let manifest = runnable_manifest(&temporary);
+            let snapshot = StructuralSnapshot::capture();
+            let mut backend = OutcomeBackend {
+                calls: 0,
+                execution_error: Some("simulated IPC failure".into()),
+                cleanup_passes,
+                before: snapshot.clone(),
+                after: snapshot,
+                snapshots: 0,
+            };
+            let store = IncrementalPressureStore::create(&manifest).unwrap();
+            let evidence = execute_pressure_with_backend(&manifest, &mut backend, &store).unwrap();
+            assert_eq!(backend.calls, 1);
+            assert_eq!(
+                evidence.state,
+                if cleanup_passes {
+                    PressureExperimentState::ExecutionError
+                } else {
+                    PressureExperimentState::SafetyAbort
+                }
+            );
+            assert_eq!(evidence.runs[0].restore_passed, Some(cleanup_passes));
+        }
     }
 }

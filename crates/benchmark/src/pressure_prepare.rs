@@ -28,7 +28,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub const PREPARED_PRESSURE_SCHEMA_VERSION: u32 = 2;
+pub const PREPARED_PRESSURE_SCHEMA_VERSION: u32 = 3;
 pub const PRESSURE_RUN_PLAN_VERSION: u32 = 1;
 pub const CONSERVATIVE_PILOT_POLICY_VERSION: u32 = 1;
 pub const PRESSURE_WORKER_PROTOCOL_VERSION: u32 = 1;
@@ -422,16 +422,18 @@ fn pressure_observer_run_id(
 
 pub fn pressure_observer_runtime_max_usec(plan: &ProgressivePressurePlan) -> Result<u64> {
     let level_ms = plan
-        .stabilization_duration_ms
-        .checked_add(plan.hold_duration_ms)
+        .watchdog
+        .level_transition_timeout_ms
+        .checked_add(plan.stabilization_duration_ms)
+        .and_then(|value| value.checked_add(plan.hold_duration_ms))
         .context("pressure observer per-level duration overflow")?;
     let measured_ms = (plan.levels.len() as u64)
         .checked_mul(level_ms)
         .context("pressure observer measured duration overflow")?;
     let runtime_ms = measured_ms
-        .checked_add(10_000) // startup/readiness
-        .and_then(|value| value.checked_add(10_000)) // exact-owned cleanup
-        .and_then(|value| value.checked_add(5_000)) // scheduler margin
+        .checked_add(5_000) // bounded startup/readiness
+        .and_then(|value| value.checked_add(5_000)) // bounded exact-owned cleanup
+        .and_then(|value| value.checked_add(3_000)) // scheduler margin
         .context("pressure observer runtime overflow")?;
     let runtime_usec = runtime_ms
         .checked_mul(1_000)
@@ -525,8 +527,9 @@ pub fn prepare_pressure_experiment(
                 worker_memory_max_bytes: memory_max_derivation.shared_memory_max_bytes,
                 watchdog: PressureWatchdogPolicy {
                     heartbeat_timeout_ms: 2_000,
-                    level_timeout_ms: 10_000,
-                    total_timeout_ms: 45_000,
+                    level_transition_timeout_ms: 8_000,
+                    level_timeout_ms: 17_000,
+                    total_timeout_ms: 51_000,
                 },
                 health: PressureHealthPolicy {
                     version: PRESSURE_HEALTH_POLICY_VERSION,
@@ -551,7 +554,7 @@ pub fn prepare_pressure_experiment(
                     maximum_refinements: 0,
                 },
                 maximum_levels: 3,
-                maximum_total_duration_ms: 45_000,
+                maximum_total_duration_ms: 51_000,
                 headroom: headroom.clone(),
                 systemd_transient_scope_required: true,
                 exact_owned_worker_required: true,
@@ -818,8 +821,9 @@ mod tests {
             worker_memory_max_bytes: 1024 * MIB,
             watchdog: PressureWatchdogPolicy {
                 heartbeat_timeout_ms: 2_000,
-                level_timeout_ms: 10_000,
-                total_timeout_ms: 45_000,
+                level_transition_timeout_ms: 8_000,
+                level_timeout_ms: 17_000,
+                total_timeout_ms: 51_000,
             },
             health: PressureHealthPolicy {
                 version: PRESSURE_HEALTH_POLICY_VERSION,
@@ -844,14 +848,20 @@ mod tests {
                 maximum_refinements: 0,
             },
             maximum_levels: 3,
-            maximum_total_duration_ms: 45_000,
+            maximum_total_duration_ms: 51_000,
             headroom: reserve,
             systemd_transient_scope_required: true,
             exact_owned_worker_required: true,
         };
         assert_eq!(
             pressure_observer_runtime_max_usec(&plan).unwrap(),
-            46_000_000
+            58_000_000
         );
+        let mut excessive = plan;
+        excessive.watchdog.level_transition_timeout_ms = 9_000;
+        excessive.watchdog.level_timeout_ms = 18_000;
+        excessive.watchdog.total_timeout_ms = 54_000;
+        excessive.maximum_total_duration_ms = 54_000;
+        assert!(pressure_observer_runtime_max_usec(&excessive).is_err());
     }
 }

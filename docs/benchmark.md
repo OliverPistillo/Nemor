@@ -473,9 +473,33 @@ host-wide `/proc/vmstat` `oom_kill` delta, separately from cgroup-local
 Emergency checks precede the next level. Cleanup addresses only the owned
 PID/start ticks, scope and observer transaction.
 
-Next flow is fresh V2 preparation from the exact CI-approved commit, static
-review, user/root pressure preflight, then a separately approved pilot. No
-pressure execution occurs in implementation or CI.
+The earlier flow produced V2 from its exact CI-approved commit and completed
+static review. No pressure preflight or execution followed.
+
+V2 is now classified **STATIC REVIEWED / LIVE EXECUTOR HARDENING REQUIRED**.
+It was never preflighted or executed and is preserved unchanged. Final
+hardening versions the prepared manifest and pressure plan again rather than
+reinterpreting V1/V2. Readiness now requires the canonical current executable
+to equal the frozen runner path, its SHA-256 to equal the frozen runner and
+provenance hashes, and its embedded commit/schema/release profile to match the
+clean prepared identity. The worker is spawned from that verified frozen path.
+
+The frozen per-level lifecycle separately budgets transition/allocation,
+stabilization, measurement hold and IPC/heartbeat allowance. AF_UNIX HELLO,
+boundary verification, level acknowledgement, hold, heartbeat/integrity and
+STOP operations all have socket deadlines. For the conservative pilot the
+bounds are 8 seconds transition, 2 seconds stabilization, 5 seconds hold and
+2 seconds IPC margin: 17 seconds per level and 51 seconds for three levels.
+Observer `RuntimeMaxUSec` includes every transition plus bounded startup,
+cleanup and scheduler margins, yielding 58 seconds under the existing
+60-second hard maximum. The 10/20/30 policy therefore remains unchanged.
+
+Touched-byte mismatch produces protocol-invalid evidence with no
+stabilization or hold. Each health gate records its own observation. A later
+run is allowed only after backend cleanup, worker/scope/observer/runtime
+absence and structural snapshot equality all pass. Execution errors retain
+cleanup evidence; cleanup or structural failure becomes a restore safety
+failure instead of being hidden by the workload error.
 
 The external review is now incorporated. A sustainable level must contain the
 complete variant-applicable gate set, with every gate mandatory and passing;

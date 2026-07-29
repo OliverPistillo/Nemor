@@ -15,6 +15,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Duration;
 
 pub const PRESSURE_WORKER_PROTOCOL_VERSION: u32 = 1;
 
@@ -357,6 +358,37 @@ impl PressureWorkerClient {
     pub fn receive(&mut self) -> Result<WorkerIpcMessage> {
         read_message(&mut self.reader)
     }
+
+    pub fn set_deadline(&self, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() {
+            bail!("pressure worker IPC deadline must be nonzero");
+        }
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        self.reader.get_ref().set_read_timeout(Some(timeout))?;
+        Ok(())
+    }
+
+    pub fn send_with_timeout(
+        &mut self,
+        message: &WorkerIpcMessage,
+        timeout: Duration,
+        operation: &str,
+    ) -> Result<WorkerIpcMessage> {
+        self.set_deadline(timeout)?;
+        self.send(message)
+            .with_context(|| format!("pressure worker IPC timeout/failure during {operation}"))
+    }
+
+    pub fn receive_with_timeout(
+        &mut self,
+        timeout: Duration,
+        operation: &str,
+    ) -> Result<WorkerIpcMessage> {
+        self.set_deadline(timeout)?;
+        self.receive()
+            .with_context(|| format!("pressure worker IPC timeout/failure during {operation}"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,6 +587,7 @@ pub fn command_for_level(
 mod tests {
     use super::*;
     use crate::pressure::PlannedLevelState;
+    use std::time::Instant;
 
     fn level(bytes: u64) -> PlannedPressureLevel {
         PlannedPressureLevel {
@@ -629,5 +662,57 @@ mod tests {
         worker.apply_level(&first, 2).unwrap();
         assert!(worker.apply_level(&first, 3).is_err());
         assert_eq!(worker.touched_bytes(), 4096);
+    }
+
+    fn silent_peer_client() -> (PressureWorkerClient, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        (PressureWorkerClient { stream, reader }, peer)
+    }
+
+    #[test]
+    fn hello_receive_timeout_is_bounded() {
+        let (mut client, _peer) = silent_peer_client();
+        let started = Instant::now();
+        assert!(client
+            .receive_with_timeout(Duration::from_millis(20), "HELLO")
+            .is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn level_ack_and_heartbeat_timeouts_are_bounded() {
+        for operation in ["LEVEL_REQUEST/LEVEL_ACK", "HEARTBEAT"] {
+            let (mut client, _peer) = silent_peer_client();
+            let message = WorkerIpcMessage::HeartbeatRequest {
+                version: PRESSURE_WORKER_PROTOCOL_VERSION,
+                experiment_id: "exp".into(),
+                run_id: "run".into(),
+                pid: 42,
+                start_ticks: 99,
+            };
+            let started = Instant::now();
+            assert!(client
+                .send_with_timeout(&message, Duration::from_millis(20), operation)
+                .is_err());
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn stop_timeout_is_bounded() {
+        let (mut client, _peer) = silent_peer_client();
+        let message = WorkerIpcMessage::Stop {
+            version: PRESSURE_WORKER_PROTOCOL_VERSION,
+            experiment_id: "exp".into(),
+            run_id: "run".into(),
+            pid: 42,
+            start_ticks: 99,
+        };
+        let started = Instant::now();
+        assert!(client
+            .send_with_timeout(&message, Duration::from_millis(20), "STOP")
+            .is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
