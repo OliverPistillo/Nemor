@@ -10,8 +10,9 @@ use crate::{synthetic_byte, SyntheticPattern};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -19,6 +20,75 @@ use std::time::Duration;
 
 pub const PRESSURE_WORKER_PROTOCOL_VERSION: u32 = 1;
 const GENERATION_HASH_CHUNK_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureWorkerIpcErrorKind {
+    DeadlineExceeded,
+    Failure,
+}
+
+#[derive(Debug)]
+pub struct PressureWorkerIpcError {
+    kind: PressureWorkerIpcErrorKind,
+    operation: String,
+    detail: String,
+}
+
+impl PressureWorkerIpcError {
+    fn deadline_exceeded(operation: &str, error: &anyhow::Error) -> Self {
+        Self {
+            kind: PressureWorkerIpcErrorKind::DeadlineExceeded,
+            operation: operation.into(),
+            detail: format!("{error:#}"),
+        }
+    }
+
+    fn failure(operation: &str, error: &anyhow::Error) -> Self {
+        Self {
+            kind: PressureWorkerIpcErrorKind::Failure,
+            operation: operation.into(),
+            detail: format!("{error:#}"),
+        }
+    }
+
+    pub fn kind(&self) -> PressureWorkerIpcErrorKind {
+        self.kind
+    }
+
+    pub fn is_deadline_exceeded(&self) -> bool {
+        self.kind == PressureWorkerIpcErrorKind::DeadlineExceeded
+    }
+}
+
+impl fmt::Display for PressureWorkerIpcError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            PressureWorkerIpcErrorKind::DeadlineExceeded => write!(
+                formatter,
+                "pressure worker IPC deadline exceeded during {}: {}",
+                self.operation, self.detail
+            ),
+            PressureWorkerIpcErrorKind::Failure => write!(
+                formatter,
+                "pressure worker IPC failure during {}: {}",
+                self.operation, self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PressureWorkerIpcError {}
+
+fn operation_reached_deadline(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            )
+        })
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -375,20 +445,34 @@ impl PressureWorkerClient {
         message: &WorkerIpcMessage,
         timeout: Duration,
         operation: &str,
-    ) -> Result<WorkerIpcMessage> {
-        self.set_deadline(timeout)?;
-        self.send(message)
-            .with_context(|| format!("pressure worker IPC timeout/failure during {operation}"))
+    ) -> std::result::Result<WorkerIpcMessage, PressureWorkerIpcError> {
+        self.set_deadline(timeout).map_err(|error| {
+            PressureWorkerIpcError::failure(&format!("{operation} deadline setup"), &error)
+        })?;
+        self.send(message).map_err(|error| {
+            if operation_reached_deadline(&error) {
+                PressureWorkerIpcError::deadline_exceeded(operation, &error)
+            } else {
+                PressureWorkerIpcError::failure(operation, &error)
+            }
+        })
     }
 
     pub fn receive_with_timeout(
         &mut self,
         timeout: Duration,
         operation: &str,
-    ) -> Result<WorkerIpcMessage> {
-        self.set_deadline(timeout)?;
-        self.receive()
-            .with_context(|| format!("pressure worker IPC timeout/failure during {operation}"))
+    ) -> std::result::Result<WorkerIpcMessage, PressureWorkerIpcError> {
+        self.set_deadline(timeout).map_err(|error| {
+            PressureWorkerIpcError::failure(&format!("{operation} deadline setup"), &error)
+        })?;
+        self.receive().map_err(|error| {
+            if operation_reached_deadline(&error) {
+                PressureWorkerIpcError::deadline_exceeded(operation, &error)
+            } else {
+                PressureWorkerIpcError::failure(operation, &error)
+            }
+        })
     }
 }
 
@@ -756,9 +840,10 @@ mod tests {
     fn hello_receive_timeout_is_bounded() {
         let (mut client, _peer) = silent_peer_client();
         let started = Instant::now();
-        assert!(client
+        let error = client
             .receive_with_timeout(Duration::from_millis(20), "HELLO")
-            .is_err());
+            .unwrap_err();
+        assert_eq!(error.kind(), PressureWorkerIpcErrorKind::DeadlineExceeded);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -774,11 +859,34 @@ mod tests {
                 start_ticks: 99,
             };
             let started = Instant::now();
-            assert!(client
+            let error = client
                 .send_with_timeout(&message, Duration::from_millis(20), operation)
-                .is_err());
+                .unwrap_err();
+            assert_eq!(error.kind(), PressureWorkerIpcErrorKind::DeadlineExceeded);
             assert!(started.elapsed() < Duration::from_secs(1));
         }
+    }
+
+    #[test]
+    fn closed_peer_is_non_timeout_ipc_failure() {
+        let (mut client, peer) = silent_peer_client();
+        drop(peer);
+        let message = WorkerIpcMessage::HeartbeatRequest {
+            version: PRESSURE_WORKER_PROTOCOL_VERSION,
+            experiment_id: "exp".into(),
+            run_id: "run".into(),
+            pid: 42,
+            start_ticks: 99,
+        };
+        let error = client
+            .send_with_timeout(
+                &message,
+                Duration::from_millis(200),
+                "LEVEL_REQUEST/LEVEL_ACK",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), PressureWorkerIpcErrorKind::Failure);
+        assert!(!error.to_string().contains("deadline exceeded"));
     }
 
     #[test]
@@ -792,9 +900,10 @@ mod tests {
             start_ticks: 99,
         };
         let started = Instant::now();
-        assert!(client
+        let error = client
             .send_with_timeout(&message, Duration::from_millis(20), "STOP")
-            .is_err());
+            .unwrap_err();
+        assert_eq!(error.kind(), PressureWorkerIpcErrorKind::DeadlineExceeded);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

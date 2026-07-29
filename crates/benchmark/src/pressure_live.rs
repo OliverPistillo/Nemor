@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,18 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const PRESSURE_EXECUTION_SCHEMA_VERSION: u32 = 3;
+pub const PRESSURE_EXECUTION_SCHEMA_VERSION: u32 = 4;
+
+#[derive(Debug)]
+struct PressureWatchdogTimeout(&'static str);
+
+impl fmt::Display for PressureWatchdogTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "pressure watchdog deadline exceeded: {}", self.0)
+    }
+}
+
+impl std::error::Error for PressureWatchdogTimeout {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PressurePreflightHost {
@@ -292,11 +304,93 @@ pub struct PressureRunRecord {
 pub enum PressureLevelProgressStage {
     TransitionStarting,
     TransitionTimeout,
+    TransitionIpcFailure,
     LevelAcknowledged,
     StabilizationStarting,
     HoldStarting,
     Sampling,
     Completed,
+}
+
+fn transition_progress_stage_for_ipc_error(
+    error: &crate::pressure_worker::PressureWorkerIpcError,
+) -> PressureLevelProgressStage {
+    if error.is_deadline_exceeded() {
+        PressureLevelProgressStage::TransitionTimeout
+    } else {
+        PressureLevelProgressStage::TransitionIpcFailure
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_level_request_transition(
+    client: &mut crate::pressure_worker::PressureWorkerClient,
+    experiment_id: &str,
+    run_id: &str,
+    pid: u32,
+    start_ticks: u64,
+    command: crate::pressure_worker::WorkerLevelCommand,
+    expected_workload_identity: &str,
+    transition_timeout: Duration,
+    configured_transition_deadline_ms: u64,
+    persist_event: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
+) -> Result<(crate::pressure_worker::WorkerIpcMessage, u64)> {
+    let level_index = command.level_index;
+    let target_touched_bytes = command.target_touched_bytes;
+    let requested_delta_bytes = command.requested_delta_bytes;
+    persist_event(PressurePersistenceEvent::Progress(Box::new(
+        PressureLevelProgress {
+            level_index,
+            stage: PressureLevelProgressStage::TransitionStarting,
+            monotonic_ns: timestamp_ns(),
+            target_touched_bytes,
+            requested_delta_bytes,
+            expected_workload_identity: expected_workload_identity.into(),
+            acknowledgement: None,
+            transition_duration_ms: None,
+            configured_transition_deadline_ms: Some(configured_transition_deadline_ms),
+            sample: None,
+        },
+    )))?;
+    let transition_started = Instant::now();
+    let message = client.send_with_timeout(
+        &crate::pressure_worker::WorkerIpcMessage::LevelRequest {
+            version: crate::pressure_worker::PRESSURE_WORKER_PROTOCOL_VERSION,
+            experiment_id: experiment_id.into(),
+            run_id: run_id.into(),
+            pid,
+            start_ticks,
+            command,
+            monotonic_ns: timestamp_ns(),
+        },
+        transition_timeout,
+        "LEVEL_REQUEST/LEVEL_ACK",
+    );
+    let elapsed_ms = transition_started
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    match message {
+        Ok(message) => Ok((message, elapsed_ms)),
+        Err(error) => {
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index,
+                    stage: transition_progress_stage_for_ipc_error(&error),
+                    monotonic_ns: timestamp_ns(),
+                    target_touched_bytes,
+                    requested_delta_bytes,
+                    expected_workload_identity: expected_workload_identity.into(),
+                    acknowledgement: None,
+                    transition_duration_ms: Some(elapsed_ms),
+                    configured_transition_deadline_ms: Some(configured_transition_deadline_ms),
+                    sample: None,
+                },
+            )))?;
+            Err(error.into())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -593,6 +687,35 @@ pub struct PressureBackendRunResult {
     pub reason: String,
     pub execution_error: Option<String>,
     pub cleanup: PressureCleanupEvidence,
+}
+
+fn finalize_pressure_workload_result(
+    run_result: Result<()>,
+    mut final_state: PressureRunState,
+    mut reason: String,
+    cleanup: PressureCleanupEvidence,
+) -> PressureBackendRunResult {
+    let workload_error = run_result.err();
+    let timed_out = workload_error.as_ref().is_some_and(|error| {
+        error
+            .downcast_ref::<crate::pressure_worker::PressureWorkerIpcError>()
+            .is_some_and(|error| error.is_deadline_exceeded())
+            || error.downcast_ref::<PressureWatchdogTimeout>().is_some()
+    });
+    let workload_error = workload_error.map(|error| format!("{error:#}"));
+    if timed_out {
+        final_state = PressureRunState::SafetyAbort;
+        reason = "WATCHDOG_TIMEOUT during bounded worker IPC".into();
+    } else if let Some(error) = workload_error.as_deref() {
+        final_state = PressureRunState::Invalid;
+        reason = format!("pressure workload/executor error: {error}");
+    }
+    PressureBackendRunResult {
+        state: final_state,
+        reason,
+        execution_error: (!timed_out).then_some(workload_error).flatten(),
+        cleanup,
+    }
 }
 
 pub fn execute_pressure_with_backend(
@@ -1002,7 +1125,7 @@ fn execute_real_pressure_run(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error);
+            return Err(error.into());
         }
     };
     if hello
@@ -1163,77 +1286,24 @@ fn execute_real_pressure_run(
                 level,
                 prior,
             )?;
-            persist_event(PressurePersistenceEvent::Progress(Box::new(
-                PressureLevelProgress {
-                    level_index: level.level_index,
-                    stage: PressureLevelProgressStage::TransitionStarting,
-                    monotonic_ns: timestamp_ns(),
-                    target_touched_bytes: command.target_touched_bytes,
-                    requested_delta_bytes: command.requested_delta_bytes,
-                    expected_workload_identity: expected_workload_identity.clone(),
-                    acknowledgement: None,
-                    transition_duration_ms: None,
-                    configured_transition_deadline_ms: Some(
-                        plan.watchdog.level_transition_timeout_ms,
-                    ),
-                    sample: None,
-                },
-            )))?;
-            let (version, experiment_id, ipc_run_id, ipc_pid, ipc_ticks) =
-                worker_message_identity(&payload.experiment_id, &run_id, pid, start_ticks);
-            let transition_started = Instant::now();
-            let ack_message = match client.send_with_timeout(
-                &crate::pressure_worker::WorkerIpcMessage::LevelRequest {
-                    version,
-                    experiment_id,
-                    run_id: ipc_run_id,
-                    pid: ipc_pid,
-                    start_ticks: ipc_ticks,
-                    command,
-                    monotonic_ns: timestamp_ns(),
-                },
+            let (ack_message, transition_duration_ms) = execute_level_request_transition(
+                &mut client,
+                &payload.experiment_id,
+                &run_id,
+                pid,
+                start_ticks,
+                command,
+                &expected_workload_identity,
                 transition_timeout,
-                "LEVEL_REQUEST/LEVEL_ACK",
-            ) {
-                Ok(message) => message,
-                Err(_) => {
-                    let elapsed_ms = transition_started
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX);
-                    persist_event(PressurePersistenceEvent::Progress(Box::new(
-                        PressureLevelProgress {
-                            level_index: level.level_index,
-                            stage: PressureLevelProgressStage::TransitionTimeout,
-                            monotonic_ns: timestamp_ns(),
-                            target_touched_bytes: level.target_touched_bytes,
-                            requested_delta_bytes: level.target_touched_bytes.saturating_sub(prior),
-                            expected_workload_identity: expected_workload_identity.clone(),
-                            acknowledgement: None,
-                            transition_duration_ms: Some(elapsed_ms),
-                            configured_transition_deadline_ms: Some(
-                                plan.watchdog.level_transition_timeout_ms,
-                            ),
-                            sample: None,
-                        },
-                    )))?;
-                    final_state = PressureRunState::SafetyAbort;
-                    reason = "WATCHDOG_TIMEOUT during bounded worker level transition".into();
-                    break;
-                }
-            };
+                plan.watchdog.level_transition_timeout_ms,
+                persist_event,
+            )?;
             let acknowledgement = match ack_message {
                 crate::pressure_worker::WorkerIpcMessage::LevelAck {
                     acknowledgement, ..
                 } => acknowledgement,
                 _ => bail!("worker LEVEL_ACK missing"),
             };
-            let transition_duration_ms = transition_started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX);
             persist_event(PressurePersistenceEvent::Progress(Box::new(
                 PressureLevelProgress {
                     level_index: level.level_index,
@@ -1386,7 +1456,7 @@ fn execute_real_pressure_run(
             let mut raw_samples = Vec::new();
             while measurement_start.elapsed() < Duration::from_millis(plan.hold_duration_ms) {
                 if Instant::now() >= level_deadline || Instant::now() >= total_deadline {
-                    bail!("pressure worker IPC timeout/failure during level lifecycle watchdog");
+                    return Err(PressureWatchdogTimeout("level lifecycle").into());
                 }
                 thread::sleep(Duration::from_millis(plan.sample_interval_ms));
                 let (version, experiment_id, ipc_run_id, ipc_pid, ipc_ticks) =
@@ -1822,23 +1892,12 @@ fn execute_real_pressure_run(
         classification,
         failure_reason,
     };
-    let workload_error = run_result.err().map(|error| format!("{error:#}"));
-    let timed_out = workload_error
-        .as_deref()
-        .is_some_and(|error| error.contains("pressure worker IPC timeout/failure"));
-    if timed_out {
-        final_state = PressureRunState::SafetyAbort;
-        reason = "WATCHDOG_TIMEOUT during bounded worker IPC".into();
-    } else if let Some(error) = workload_error.as_deref() {
-        final_state = PressureRunState::Invalid;
-        reason = format!("pressure workload/executor error: {error}");
-    }
-    Ok(PressureBackendRunResult {
-        state: final_state,
+    Ok(finalize_pressure_workload_result(
+        run_result,
+        final_state,
         reason,
-        execution_error: (!timed_out).then_some(workload_error).flatten(),
         cleanup,
-    })
+    ))
 }
 
 fn wait_child(child: &mut Child, expected_start_ticks: u64, timeout: Duration) -> bool {
@@ -1912,7 +1971,7 @@ mod tests {
     fn manifest_fixture() -> PreparedPressureManifest {
         let value = serde_json::json!({
             "payload": {
-                "schema_version": 5,
+                "schema_version": 6,
                 "experiment_id": "checkpoint3c-test",
                 "scenario": "progressive_memory_pressure",
                 "scenario_version": 1,
@@ -1928,7 +1987,7 @@ mod tests {
                 "observer_binary":{"path_role":"nemord","sha256":"observer","build_profile":"release","source_state_id":"source","embedded_git_head":"head"},
                 "worker_implementation_identity":"worker",
                 "worker_protocol_version":1,
-                "pressure_executor_schema_version":3,
+                "pressure_executor_schema_version":4,
                 "worker_executable_path":"/runner",
                 "config_sha256":"config",
                 "environment":{
@@ -2470,6 +2529,324 @@ mod tests {
 
     struct TransitionTimeoutBackend;
 
+    fn transition_test_message() -> crate::pressure_worker::WorkerIpcMessage {
+        crate::pressure_worker::WorkerIpcMessage::HeartbeatRequest {
+            version: crate::pressure_worker::PRESSURE_WORKER_PROTOCOL_VERSION,
+            experiment_id: "exp".into(),
+            run_id: "run".into(),
+            pid: 42,
+            start_ticks: 99,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum IntegratedTransitionFailure {
+        Deadline,
+        PeerClosed,
+    }
+
+    struct IntegratedTransitionBackend {
+        failure: IntegratedTransitionFailure,
+    }
+
+    impl PressureExecutionBackend for IntegratedTransitionBackend {
+        fn execute_run(
+            &mut self,
+            manifest: &PreparedPressureManifest,
+            order_index: usize,
+            persist_event: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
+        ) -> Result<PressureBackendRunResult> {
+            let temporary = tempfile::tempdir()?;
+            let socket = temporary.path().join("transition.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let failure = self.failure;
+            let peer = std::thread::spawn(move || -> std::result::Result<(), String> {
+                let (stream, _) = listener.accept().map_err(|error| error.to_string())?;
+                ready_tx.send(()).map_err(|error| error.to_string())?;
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut line)
+                    .map_err(|error| error.to_string())?;
+                let message: crate::pressure_worker::WorkerIpcMessage =
+                    serde_json::from_str(&line).map_err(|error| error.to_string())?;
+                match message {
+                    crate::pressure_worker::WorkerIpcMessage::LevelRequest {
+                        version,
+                        experiment_id,
+                        run_id,
+                        pid,
+                        start_ticks,
+                        command,
+                        ..
+                    } if version == crate::pressure_worker::PRESSURE_WORKER_PROTOCOL_VERSION
+                        && experiment_id == "checkpoint3c-test"
+                        && run_id == "integrated-transition-run"
+                        && pid == 42
+                        && start_ticks == 99
+                        && command.protocol_version
+                            == crate::pressure_worker::PRESSURE_WORKER_PROTOCOL_VERSION
+                        && command.level_index == 0
+                        && command.prior_touched_bytes == 0
+                        && command.requested_delta_bytes == 1024
+                        && command.target_touched_bytes == 1024
+                        && command.generator_id
+                            == crate::performance::INCOMPRESSIBLE_GENERATOR_ID
+                        && command.generator_version
+                            == crate::performance::SYNTHETIC_GENERATOR_VERSION => {}
+                    _ => return Err("peer did not receive the exact LevelRequest contract".into()),
+                }
+                observed_tx.send(()).map_err(|error| error.to_string())?;
+                if matches!(failure, IntegratedTransitionFailure::Deadline) {
+                    release_rx.recv().map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            });
+            let mut client = crate::pressure_worker::PressureWorkerClient::connect(&socket)?;
+            ready_rx.recv_timeout(Duration::from_secs(1))?;
+            let command = crate::pressure_worker::WorkerLevelCommand {
+                protocol_version: crate::pressure_worker::PRESSURE_WORKER_PROTOCOL_VERSION,
+                experiment_id: manifest.payload.experiment_id.clone(),
+                run_id: "integrated-transition-run".into(),
+                level_index: 0,
+                seed: manifest.payload.run_plan.runs[order_index].run_seed,
+                prior_touched_bytes: 0,
+                requested_delta_bytes: 1024,
+                target_touched_bytes: 1024,
+                generator_id: crate::performance::INCOMPRESSIBLE_GENERATOR_ID.into(),
+                generator_version: crate::performance::SYNTHETIC_GENERATOR_VERSION,
+            };
+            let run_result = execute_level_request_transition(
+                &mut client,
+                &manifest.payload.experiment_id,
+                "integrated-transition-run",
+                42,
+                99,
+                command,
+                "integrated-frozen-workload",
+                Duration::from_millis(100),
+                100,
+                persist_event,
+            )
+            .map(|_| ());
+            observed_rx.recv_timeout(Duration::from_secs(1))?;
+            let _ = release_tx.send(());
+            peer.join()
+                .map_err(|_| anyhow::anyhow!("integrated transition peer panicked"))?
+                .map_err(anyhow::Error::msg)?;
+            Ok(finalize_pressure_workload_result(
+                run_result,
+                PressureRunState::Completed,
+                "all conservative framework levels sustainable".into(),
+                PressureCleanupEvidence::simulated(true),
+            ))
+        }
+    }
+
+    fn assert_integrated_transition_has_no_capacity_or_completed_level(
+        evidence: &PressureExecutionEvidence,
+    ) {
+        assert!(!evidence.search_complete);
+        assert_eq!(
+            evidence.capacity_gain_percent,
+            EvaluationState::NotEvaluated
+        );
+        assert!(evidence.runs[0].levels.is_empty());
+        assert!(!evidence.runs[0].level_progress.iter().any(|progress| {
+            matches!(
+                progress.stage,
+                PressureLevelProgressStage::LevelAcknowledged
+                    | PressureLevelProgressStage::StabilizationStarting
+                    | PressureLevelProgressStage::HoldStarting
+                    | PressureLevelProgressStage::Sampling
+                    | PressureLevelProgressStage::Completed
+            )
+        }));
+        assert_ne!(
+            evidence.runs[0].state,
+            PressureRunState::UnsustainableBoundary
+        );
+        assert_ne!(evidence.state, PressureExperimentState::UnsustainableHealth);
+    }
+
+    #[test]
+    fn integrated_real_level_request_timeout_reaches_persisted_final_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = runnable_manifest(&temporary);
+        let store = IncrementalPressureStore::create(&manifest).unwrap();
+        let started = Instant::now();
+        let evidence = execute_pressure_with_backend(
+            &manifest,
+            &mut IntegratedTransitionBackend {
+                failure: IntegratedTransitionFailure::Deadline,
+            },
+            &store,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            evidence.state,
+            PressureExperimentState::SafetyAbort,
+            "unexpected execution error: {:?}",
+            evidence.execution_error
+        );
+        assert_eq!(evidence.runs[0].state, PressureRunState::SafetyAbort);
+        assert!(evidence.runs[0]
+            .stop_reason
+            .as_deref()
+            .unwrap()
+            .contains("WATCHDOG_TIMEOUT"));
+        assert_eq!(
+            evidence.runs[0].level_progress[0].stage,
+            PressureLevelProgressStage::TransitionStarting
+        );
+        let terminal = &evidence.runs[0].level_progress[1];
+        assert_eq!(
+            terminal.stage,
+            PressureLevelProgressStage::TransitionTimeout
+        );
+        assert_eq!(terminal.target_touched_bytes, 1024);
+        assert_eq!(terminal.requested_delta_bytes, 1024);
+        assert_eq!(
+            terminal.expected_workload_identity,
+            "integrated-frozen-workload"
+        );
+        assert_eq!(terminal.configured_transition_deadline_ms, Some(100));
+        assert!(terminal
+            .transition_duration_ms
+            .is_some_and(|value| value >= 100));
+        assert!(terminal.acknowledgement.is_none());
+        assert!(evidence.execution_error.is_none());
+        assert!(!evidence.runs[0]
+            .level_progress
+            .iter()
+            .any(|progress| progress.stage == PressureLevelProgressStage::TransitionIpcFailure));
+        assert_integrated_transition_has_no_capacity_or_completed_level(&evidence);
+        let persisted: PressureExecutionEvidence =
+            serde_json::from_slice(&fs::read(&manifest.payload.report_path).unwrap()).unwrap();
+        assert_eq!(persisted.state, PressureExperimentState::SafetyAbort);
+        assert_eq!(
+            persisted.runs[0].level_progress[1].stage,
+            PressureLevelProgressStage::TransitionTimeout
+        );
+    }
+
+    #[test]
+    fn integrated_real_level_request_peer_failure_reaches_persisted_final_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = runnable_manifest(&temporary);
+        let store = IncrementalPressureStore::create(&manifest).unwrap();
+        let evidence = execute_pressure_with_backend(
+            &manifest,
+            &mut IntegratedTransitionBackend {
+                failure: IntegratedTransitionFailure::PeerClosed,
+            },
+            &store,
+        )
+        .unwrap();
+        assert_eq!(evidence.state, PressureExperimentState::ExecutionError);
+        assert_eq!(evidence.runs[0].state, PressureRunState::Invalid);
+        assert!(!evidence.runs[0]
+            .stop_reason
+            .as_deref()
+            .unwrap()
+            .contains("WATCHDOG_TIMEOUT"));
+        let diagnostic = evidence.execution_error.as_deref().unwrap();
+        assert!(diagnostic.contains("pressure worker IPC failure"));
+        assert!(!diagnostic.contains("deadline exceeded"));
+        let terminal = &evidence.runs[0].level_progress[1];
+        assert_eq!(
+            terminal.stage,
+            PressureLevelProgressStage::TransitionIpcFailure
+        );
+        assert_eq!(terminal.target_touched_bytes, 1024);
+        assert_eq!(terminal.requested_delta_bytes, 1024);
+        assert_eq!(
+            terminal.expected_workload_identity,
+            "integrated-frozen-workload"
+        );
+        assert_eq!(terminal.configured_transition_deadline_ms, Some(100));
+        assert!(terminal.acknowledgement.is_none());
+        assert!(!evidence.runs[0]
+            .level_progress
+            .iter()
+            .any(|progress| progress.stage == PressureLevelProgressStage::TransitionTimeout));
+        assert_integrated_transition_has_no_capacity_or_completed_level(&evidence);
+        let persisted: PressureExecutionEvidence =
+            serde_json::from_slice(&fs::read(&manifest.payload.report_path).unwrap()).unwrap();
+        assert_eq!(persisted.state, PressureExperimentState::ExecutionError);
+        assert_eq!(
+            persisted.runs[0].level_progress[1].stage,
+            PressureLevelProgressStage::TransitionIpcFailure
+        );
+        assert!(persisted
+            .execution_error
+            .as_deref()
+            .unwrap()
+            .contains("pressure worker IPC failure"));
+    }
+
+    #[test]
+    fn real_ipc_deadline_maps_only_to_transition_timeout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("timeout.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let mut client = crate::pressure_worker::PressureWorkerClient::connect(&socket).unwrap();
+        ready_rx.recv().unwrap();
+        let error = client
+            .send_with_timeout(
+                &transition_test_message(),
+                Duration::from_millis(20),
+                "LEVEL_REQUEST/LEVEL_ACK",
+            )
+            .unwrap_err();
+        assert!(error.is_deadline_exceeded());
+        assert_eq!(
+            transition_progress_stage_for_ipc_error(&error),
+            PressureLevelProgressStage::TransitionTimeout
+        );
+        assert!(error.to_string().contains("deadline exceeded"));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn real_non_timeout_ipc_failure_never_maps_to_watchdog_timeout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("closed.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+            closed_tx.send(()).unwrap();
+        });
+        let mut client = crate::pressure_worker::PressureWorkerClient::connect(&socket).unwrap();
+        closed_rx.recv().unwrap();
+        let error = client
+            .send_with_timeout(
+                &transition_test_message(),
+                Duration::from_millis(200),
+                "LEVEL_REQUEST/LEVEL_ACK",
+            )
+            .unwrap_err();
+        assert!(!error.is_deadline_exceeded());
+        assert_eq!(
+            transition_progress_stage_for_ipc_error(&error),
+            PressureLevelProgressStage::TransitionIpcFailure
+        );
+        assert!(!error.to_string().contains("WATCHDOG_TIMEOUT"));
+        assert!(!error.to_string().contains("deadline exceeded"));
+        peer.join().unwrap();
+    }
+
     impl PressureExecutionBackend for TransitionTimeoutBackend {
         fn execute_run(
             &mut self,
@@ -2523,6 +2900,90 @@ mod tests {
             evidence.capacity_gain_percent,
             EvaluationState::NotEvaluated
         );
+    }
+
+    struct TransitionIpcFailureBackend;
+
+    impl PressureExecutionBackend for TransitionIpcFailureBackend {
+        fn execute_run(
+            &mut self,
+            _manifest: &PreparedPressureManifest,
+            _order_index: usize,
+            persist_event: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
+        ) -> Result<PressureBackendRunResult> {
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index: 0,
+                    stage: PressureLevelProgressStage::TransitionIpcFailure,
+                    monotonic_ns: 10,
+                    target_touched_bytes: 1024,
+                    requested_delta_bytes: 1024,
+                    expected_workload_identity: "frozen-level-0".into(),
+                    acknowledgement: None,
+                    transition_duration_ms: Some(1),
+                    configured_transition_deadline_ms: Some(8_000),
+                    sample: None,
+                },
+            )))?;
+            Ok(PressureBackendRunResult {
+                state: PressureRunState::Invalid,
+                reason: "pressure workload/executor error: pressure worker IPC failure".into(),
+                execution_error: Some("peer terminated before LEVEL_ACK".into()),
+                cleanup: PressureCleanupEvidence::simulated(true),
+            })
+        }
+    }
+
+    #[test]
+    fn timeout_and_non_timeout_transition_evidence_remain_distinct_and_non_capacity() {
+        let timeout_root = tempfile::tempdir().unwrap();
+        let timeout_manifest = runnable_manifest(&timeout_root);
+        let timeout_store = IncrementalPressureStore::create(&timeout_manifest).unwrap();
+        let timeout = execute_pressure_with_backend(
+            &timeout_manifest,
+            &mut TransitionTimeoutBackend,
+            &timeout_store,
+        )
+        .unwrap();
+
+        let failure_root = tempfile::tempdir().unwrap();
+        let failure_manifest = runnable_manifest(&failure_root);
+        let failure_store = IncrementalPressureStore::create(&failure_manifest).unwrap();
+        let failure = execute_pressure_with_backend(
+            &failure_manifest,
+            &mut TransitionIpcFailureBackend,
+            &failure_store,
+        )
+        .unwrap();
+
+        assert_eq!(timeout.state, PressureExperimentState::SafetyAbort);
+        assert_eq!(failure.state, PressureExperimentState::ExecutionError);
+        assert_eq!(
+            timeout.runs[0].level_progress[0].stage,
+            PressureLevelProgressStage::TransitionTimeout
+        );
+        assert_eq!(
+            failure.runs[0].level_progress[0].stage,
+            PressureLevelProgressStage::TransitionIpcFailure
+        );
+        assert!(failure
+            .execution_error
+            .as_deref()
+            .unwrap()
+            .contains("peer terminated before LEVEL_ACK"));
+        assert!(!failure
+            .execution_error
+            .as_deref()
+            .unwrap()
+            .contains("WATCHDOG_TIMEOUT"));
+        for evidence in [&timeout, &failure] {
+            assert!(evidence.runs[0].levels.is_empty());
+            assert!(!evidence.search_complete);
+            assert_eq!(
+                evidence.capacity_gain_percent,
+                EvaluationState::NotEvaluated
+            );
+        }
     }
 
     struct PartialEvidenceBackend;

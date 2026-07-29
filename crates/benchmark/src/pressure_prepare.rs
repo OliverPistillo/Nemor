@@ -28,7 +28,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub const PREPARED_PRESSURE_SCHEMA_VERSION: u32 = 5;
+pub const PREPARED_PRESSURE_SCHEMA_VERSION: u32 = 6;
 pub const PRESSURE_RUN_PLAN_VERSION: u32 = 1;
 pub const CONSERVATIVE_PILOT_POLICY_VERSION: u32 = 1;
 pub const PRESSURE_WORKER_PROTOCOL_VERSION: u32 = 1;

@@ -514,6 +514,12 @@ full-payload-prefix digest without rescanning old bytes. The unchanged
 and timeout now persists target, delta, elapsed time, configured deadline and
 expected workload identity explicitly.
 
+Transition IPC evidence distinguishes a genuine socket deadline
+(`TimedOut`/`WouldBlock`) from non-timeout peer, framing, serialization, and
+read/write failures. Only the former is `transition_timeout` /
+`WATCHDOG_TIMEOUT`; the latter is a terminal `transition_ipc_failure` and
+incomplete execution error. Neither is an unsustainable or capacity boundary.
+
 V4 cleanup already proved worker absence, zero members, observer/runtime
 absence and structural equality, but the exact transient scope had naturally
 disappeared and `StopUnit` returned `NoSuchUnit`; this was incorrectly
@@ -527,10 +533,12 @@ database SHA-256 values are respectively
 and
 `dddf2a47a84f6a3c634d7d56c5837ed9078fad766a4e93d321356ba1d3d9f8f2`.
 
-ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
-gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
-worker/unit/cgroup final absence, structural restore and full host restore.
-The validation was a dirty development build and is explicitly
+Historical Checkpoint 2 ATTEMPT 5 validated this complete harness lifecycle on
+CachyOS; it is unrelated to the prepared-only Checkpoint 3C V5 lineage. It
+passed all required gates with no OOM, no watchdog trigger, exact-owned
+cleanup, scope collection, worker/unit/cgroup final absence, structural
+restore and full host restore. The validation was a dirty development build
+and is explicitly
 `harness_validation`; it is ineligible for performance claims. Attempts 1–4
 were safe harness-development iterations, not performance failures. Real
 Phase 10 A/B validation remains pending.
