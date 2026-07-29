@@ -540,5 +540,23 @@ cleanup, scope collection, worker/unit/cgroup final absence, structural
 restore and full host restore. The validation was a dirty development build
 and is explicitly
 `harness_validation`; it is ineligible for performance claims. Attempts 1–4
-were safe harness-development iterations, not performance failures. Real
-Phase 10 A/B validation remains pending.
+were safe harness-development iterations, not performance failures. At that
+historical point real Phase 10 A/B validation remained pending.
+
+Checkpoint 3C V6 experiment `checkpoint3c-1785334549398553284` subsequently
+completed pressure-framework validation and is **CLOSED / PASS**. Updated user
+and authenticated-root read-only preflights passed, then one execution
+completed all six planned runs and all eighteen conservative levels with
+restore PASS, zero watchdog, zero cgroup OOM and zero cgroup OOM-kill. The
+manifest, report, SQLite database, six run files and complete tar are preserved
+under
+`~/.local/share/nemor/validation-history/phase10-checkpoint3c-exp1-v6` with a
+verified `SHA256SUMS`.
+
+V6 positively validates the incremental transition and exact cleanup/restore
+paths for this framework pilot. It did not exercise an IPC failure branch, and
+it is not capacity or effectiveness evidence:
+`search_complete=false`, `capacity_gain_percent=not_evaluated`. V3/V4/V5
+remain immutable history. The new `nemor_capacity` orchestration contract is
+plan-only and cannot invoke these privileged paths or activate normal
+`nemord`.

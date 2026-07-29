@@ -809,7 +809,28 @@ followed by at least two seconds stabilization, at least twenty seconds
 measurement, cleanup and two seconds cooldown. Observer setup wall/CPU remains
 outside sustained measurement CPU.
 
-## `nemor_capacity` readiness gap
+## Checkpoint 3C closure
+
+Checkpoint 3C is **CLOSED / PASS** on V6 experiment
+`checkpoint3c-1785334549398553284`. The immutable execution returned
+`completed_framework_validation`: all six planned baseline/observe runs
+completed, all eighteen conservative levels were Sustainable, every run
+restored, and no watchdog, cgroup OOM or OOM-kill occurred. The durable local
+archive is
+`~/.local/share/nemor/validation-history/phase10-checkpoint3c-exp1-v6`;
+its `SHA256SUMS` verifies the frozen manifest, report, database, six run files
+and complete evidence tar.
+
+This is framework live-validation evidence, not a capacity result:
+`search_complete=false` and `capacity_gain_percent=not_evaluated`. The
+incremental transition and cleanup/restore positive paths are live validated;
+every level-2 transition acknowledged within the frozen eight-second bound.
+No IPC failure occurred, so timeout versus non-timeout failure taxonomy
+remains implemented, locally tested, static-accepted and exact-commit
+CI-tested, but not live-exercised. V3, V4 and V5 retain their immutable
+historical classifications.
+
+## `nemor_capacity` orchestration contract
 
 The policy engine and cgroup actuator expose deterministic planning and owned
 apply/rollback/recovery primitives. Zram and tiering expose owned
@@ -820,11 +841,23 @@ validation only within their specific ownership boundaries; DAMOS/KSM live
 paths remain controlled harness capabilities, not a production combined
 profile.
 
-What is missing is one versioned `nemor_capacity` orchestration contract that
-selects an evidence-backed subset, proves compatible ownership and ordering,
-defines a single audit/rollback/recovery transaction, resolves the resulting
-effective state, and validates it live before becoming executable. Arbitrarily
-enabling every optimizer would violate the existing boundaries. The minimum
-next step is a plan-only candidate manifest and simulated failure matrix for
-one conservative component set, followed by a separate bounded owned-host
-orchestration validation. Checkpoint 3A does not implement that candidate.
+Contract version 1 is implemented in the benchmark crate as a pure,
+serializable planner/validator. It models cgroup protection, zram compression,
+zswap/tiering, DAMON telemetry, DAMOS reclaim and KSM eligibility without
+calling Linux or authorizing execution. Components are explicitly Eligible,
+Unavailable, Disallowed or Deferred; a required component fails closed when
+capability, evidence, dependency or exact ownership is missing.
+
+Apply order is canonical and rollback is its exact reverse. DAMOS depends on
+DAMON, DAMOS and KSM cannot share the same exact-owned target, and more than
+one mutating component requires independent combined-profile compatibility
+evidence—isolated harness results alone are insufficient. The contract
+requires production mode `observe`, requires
+`allow_automatic_actions=false`, prohibits host OOM, invalidates results on
+restore failure and always emits `activation_authorized=false` with capacity
+and effectiveness `not_evaluated`.
+
+This foundation does not make `NemorCapacity` executable in variant
+resolution, does not add a combined live executor and does not alter normal
+`nemord`. A separate bounded owned-host orchestration validation remains
+required before activation or any capacity/effectiveness claim.

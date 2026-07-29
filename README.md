@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C OPEN — IPC-taxonomy remediation integrated and CI-tested, not live-validated |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B/3C CLOSED / PASS; `nemor_capacity` orchestration contract implemented, activation pending |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -34,13 +34,13 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 589 / 589 (accepted local integration suite) |
-| Passed / failed / ignored | 589 / 0 / 0 locally; exact-commit GitHub CI test step PASS |
-| Phase 10 validation | 3A/3B CLOSED / PASS; 3C OPEN — no post-remediation live validation or new pressure lineage |
+| Tests defined / executed | 610 / 610 (current local workspace suite) |
+| Passed / failed / ignored | 610 / 0 / 0 locally; exact-commit GitHub CI required for each integrated change |
+| Phase 10 validation | 3A/3B/3C CLOSED / PASS; capacity/effectiveness still not evaluated |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
-| Checkpoint 3C | V4 immutable partial evidence; IPC taxonomy integrated at `96dc1b4` with exact-commit CI PASS; V5 frozen/non-reusable |
+| Checkpoint 3C | CLOSED / PASS — V6 `checkpoint3c-1785334549398553284` completed framework validation; 6/6 restored runs, 18/18 Sustainable pilot levels |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -156,8 +156,12 @@ production performance claims.
   variants, anonymized host comparability, scoped metrics, deterministic
   statistics, bounded SQLite/JSON evidence, restore proof and an explicit
   non-privileged owned-synthetic smoke runner. Fixed-load compressible and
-  incompressible baseline/observe validation is complete; controlled
-  progressive pressure remains future work.
+  incompressible baseline/observe and controlled progressive-pressure
+  framework validation are complete.
+- a versioned, deterministic, plan-only `nemor_capacity` orchestration
+  contract with explicit capability/evidence prerequisites, exact ownership,
+  dependencies, incompatibilities, apply/rollback order and permanently
+  disabled activation/evaluation fields.
 - an explicit Checkpoint 2 owned-cgroup harness with dirty-source provenance,
   evidence-kind isolation, effective-state variant resolution, audited
   PID/start-ticks ownership, a 64 MiB steady worker, watchdog and restore
