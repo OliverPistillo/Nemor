@@ -23,7 +23,7 @@ use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const PRESSURE_EXECUTION_SCHEMA_VERSION: u32 = 2;
+pub const PRESSURE_EXECUTION_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PressurePreflightHost {
@@ -291,6 +291,7 @@ pub struct PressureRunRecord {
 #[serde(rename_all = "snake_case")]
 pub enum PressureLevelProgressStage {
     TransitionStarting,
+    TransitionTimeout,
     LevelAcknowledged,
     StabilizationStarting,
     HoldStarting,
@@ -303,9 +304,12 @@ pub struct PressureLevelProgress {
     pub level_index: usize,
     pub stage: PressureLevelProgressStage,
     pub monotonic_ns: u64,
+    pub target_touched_bytes: u64,
+    pub requested_delta_bytes: u64,
     pub expected_workload_identity: String,
     pub acknowledgement: Option<crate::pressure::WorkerLevelAcknowledgement>,
     pub transition_duration_ms: Option<u64>,
+    pub configured_transition_deadline_ms: Option<u64>,
     pub sample: Option<crate::pressure::PressureLevelSample>,
 }
 
@@ -459,6 +463,8 @@ pub trait PressureExecutionBackend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureCleanupEvidence {
     pub worker_absent: bool,
+    pub pre_stop_unit_present: bool,
+    pub stop_action: PressureScopeStopAction,
     pub worker_scope_stopped: bool,
     pub worker_scope_zero_members: bool,
     pub worker_scope_absent: bool,
@@ -490,6 +496,12 @@ impl PressureCleanupEvidence {
     fn simulated(passed: bool) -> Self {
         Self {
             worker_absent: passed,
+            pre_stop_unit_present: passed,
+            stop_action: if passed {
+                PressureScopeStopAction::StopUnitRequested
+            } else {
+                PressureScopeStopAction::StopFailed
+            },
             worker_scope_stopped: passed,
             worker_scope_zero_members: passed,
             worker_scope_absent: passed,
@@ -509,6 +521,15 @@ impl PressureCleanupEvidence {
             failure_reason: (!passed).then(|| "simulated cleanup failure".into()),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureScopeStopAction {
+    AlreadyAbsent,
+    StopUnitRequested,
+    StopUnitNoSuchUnitReconciled,
+    StopFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,6 +554,36 @@ pub fn wait_for_transient_scope_removal(
             bail!("TRANSIENT_SCOPE_REMOVAL_TIMEOUT");
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+pub fn already_absent_scope_is_clean(
+    worker_absent: bool,
+    cgroup_member_count: Option<usize>,
+    unit_absent: bool,
+) -> bool {
+    worker_absent && cgroup_member_count == Some(0) && unit_absent
+}
+
+pub fn no_such_unit_race_reconciles(
+    worker_absent: bool,
+    cgroup_member_count: Option<usize>,
+    unit_absent_after_error: bool,
+) -> bool {
+    already_absent_scope_is_clean(worker_absent, cgroup_member_count, unit_absent_after_error)
+}
+
+pub fn initial_scope_stop_action(
+    state_readable: bool,
+    unit_present: bool,
+    ownership_exact: bool,
+) -> PressureScopeStopAction {
+    if !state_readable || !ownership_exact {
+        PressureScopeStopAction::StopFailed
+    } else if unit_present {
+        PressureScopeStopAction::StopUnitRequested
+    } else {
+        PressureScopeStopAction::AlreadyAbsent
     }
 }
 
@@ -566,9 +617,14 @@ pub fn execute_pressure_with_backend(
                             level_index: level.level_index,
                             stage: PressureLevelProgressStage::Completed,
                             monotonic_ns: level.ended_monotonic_ns,
+                            target_touched_bytes: level.actual_touched_bytes,
+                            requested_delta_bytes: level
+                                .worker_acknowledgement
+                                .requested_delta_bytes,
                             expected_workload_identity: level.workload_identity.clone(),
                             acknowledgement: Some(level.worker_acknowledgement.clone()),
                             transition_duration_ms: None,
+                            configured_transition_deadline_ms: None,
                             sample: None,
                         });
                     evidence.runs[order].levels.push(*level);
@@ -725,6 +781,20 @@ fn counter_map(path: &Path) -> Result<std::collections::BTreeMap<String, u64>> {
 
 fn scalar(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn cgroup_member_count(cgroup: &Path) -> Option<usize> {
+    if !cgroup.exists() {
+        return Some(0);
+    }
+    fs::read_to_string(cgroup.join("cgroup.procs"))
+        .ok()
+        .map(|members| {
+            members
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
 }
 
 fn process_cpu_ticks(pid: u32) -> Option<u64> {
@@ -1098,16 +1168,21 @@ fn execute_real_pressure_run(
                     level_index: level.level_index,
                     stage: PressureLevelProgressStage::TransitionStarting,
                     monotonic_ns: timestamp_ns(),
+                    target_touched_bytes: command.target_touched_bytes,
+                    requested_delta_bytes: command.requested_delta_bytes,
                     expected_workload_identity: expected_workload_identity.clone(),
                     acknowledgement: None,
                     transition_duration_ms: None,
+                    configured_transition_deadline_ms: Some(
+                        plan.watchdog.level_transition_timeout_ms,
+                    ),
                     sample: None,
                 },
             )))?;
             let (version, experiment_id, ipc_run_id, ipc_pid, ipc_ticks) =
                 worker_message_identity(&payload.experiment_id, &run_id, pid, start_ticks);
             let transition_started = Instant::now();
-            let ack_message = client.send_with_timeout(
+            let ack_message = match client.send_with_timeout(
                 &crate::pressure_worker::WorkerIpcMessage::LevelRequest {
                     version,
                     experiment_id,
@@ -1119,12 +1194,35 @@ fn execute_real_pressure_run(
                 },
                 transition_timeout,
                 "LEVEL_REQUEST/LEVEL_ACK",
-            )?;
-            if transition_started.elapsed() > transition_timeout {
-                final_state = PressureRunState::SafetyAbort;
-                reason = "WATCHDOG_TIMEOUT during level transition".into();
-                break;
-            }
+            ) {
+                Ok(message) => message,
+                Err(_) => {
+                    let elapsed_ms = transition_started
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX);
+                    persist_event(PressurePersistenceEvent::Progress(Box::new(
+                        PressureLevelProgress {
+                            level_index: level.level_index,
+                            stage: PressureLevelProgressStage::TransitionTimeout,
+                            monotonic_ns: timestamp_ns(),
+                            target_touched_bytes: level.target_touched_bytes,
+                            requested_delta_bytes: level.target_touched_bytes.saturating_sub(prior),
+                            expected_workload_identity: expected_workload_identity.clone(),
+                            acknowledgement: None,
+                            transition_duration_ms: Some(elapsed_ms),
+                            configured_transition_deadline_ms: Some(
+                                plan.watchdog.level_transition_timeout_ms,
+                            ),
+                            sample: None,
+                        },
+                    )))?;
+                    final_state = PressureRunState::SafetyAbort;
+                    reason = "WATCHDOG_TIMEOUT during bounded worker level transition".into();
+                    break;
+                }
+            };
             let acknowledgement = match ack_message {
                 crate::pressure_worker::WorkerIpcMessage::LevelAck {
                     acknowledgement, ..
@@ -1141,9 +1239,14 @@ fn execute_real_pressure_run(
                     level_index: level.level_index,
                     stage: PressureLevelProgressStage::LevelAcknowledged,
                     monotonic_ns: timestamp_ns(),
+                    target_touched_bytes: level.target_touched_bytes,
+                    requested_delta_bytes: acknowledgement.requested_delta_bytes,
                     expected_workload_identity: expected_workload_identity.clone(),
                     acknowledgement: Some(acknowledgement.clone()),
                     transition_duration_ms: Some(transition_duration_ms),
+                    configured_transition_deadline_ms: Some(
+                        plan.watchdog.level_transition_timeout_ms,
+                    ),
                     sample: None,
                 },
             )))?;
@@ -1222,9 +1325,14 @@ fn execute_real_pressure_run(
                     level_index: level.level_index,
                     stage: PressureLevelProgressStage::StabilizationStarting,
                     monotonic_ns: timestamp_ns(),
+                    target_touched_bytes: level.target_touched_bytes,
+                    requested_delta_bytes: acknowledgement.requested_delta_bytes,
                     expected_workload_identity: expected_workload_identity.clone(),
                     acknowledgement: Some(acknowledgement.clone()),
                     transition_duration_ms: Some(transition_duration_ms),
+                    configured_transition_deadline_ms: Some(
+                        plan.watchdog.level_transition_timeout_ms,
+                    ),
                     sample: None,
                 },
             )))?;
@@ -1252,9 +1360,14 @@ fn execute_real_pressure_run(
                     level_index: level.level_index,
                     stage: PressureLevelProgressStage::HoldStarting,
                     monotonic_ns: timestamp_ns(),
+                    target_touched_bytes: level.target_touched_bytes,
+                    requested_delta_bytes: acknowledgement.requested_delta_bytes,
                     expected_workload_identity: expected_workload_identity.clone(),
                     acknowledgement: Some(acknowledgement.clone()),
                     transition_duration_ms: Some(transition_duration_ms),
+                    configured_transition_deadline_ms: Some(
+                        plan.watchdog.level_transition_timeout_ms,
+                    ),
                     sample: None,
                 },
             )))?;
@@ -1332,9 +1445,14 @@ fn execute_real_pressure_run(
                         level_index: level.level_index,
                         stage: PressureLevelProgressStage::Sampling,
                         monotonic_ns: sample.monotonic_ns,
+                        target_touched_bytes: level.target_touched_bytes,
+                        requested_delta_bytes: acknowledgement.requested_delta_bytes,
                         expected_workload_identity: expected_workload_identity.clone(),
                         acknowledgement: Some(acknowledgement.clone()),
                         transition_duration_ms: Some(transition_duration_ms),
+                        configured_transition_deadline_ms: Some(
+                            plan.watchdog.level_transition_timeout_ms,
+                        ),
                         sample: Some(sample),
                     },
                 )))?;
@@ -1575,15 +1693,66 @@ fn execute_real_pressure_run(
         .take()
         .map(|handle| handle.stop_and_cleanup().is_ok())
         .unwrap_or(true);
-    let stop_result = systemd.stop_owned_scope(&scope_plan);
-    let stop_job_result = Some(match &stop_result {
-        Ok(()) => "done".to_string(),
-        Err(error) => format!("failed: {error:#}"),
+    let worker_absent = child_stopped && process_start_ticks(pid).is_err();
+    let pre_stop_state = systemd.read_scope_state(&scope_plan.unit_name);
+    let pre_stop_unit_present = pre_stop_state.as_ref().is_ok_and(Option::is_some);
+    let ownership_exact = pre_stop_state.as_ref().is_ok_and(|state| {
+        state.as_ref().is_none_or(|state| {
+            state.unit_name == scope_plan.unit_name
+                && state.object_path == scope.object_path
+                && state.control_group == scope.control_group
+                && state.memory_max == scope_plan.memory_max
+                && state.runtime_max_usec == scope_plan.runtime_max_usec
+        })
     });
-    let worker_scope_stopped = stop_result.is_ok()
-        && systemd
-            .wait_inactive_or_removed(&scope_plan.unit_name, heartbeat_timeout)
-            .is_ok();
+    let pre_stop_members = cgroup_member_count(&cgroup);
+    let mut stop_action = initial_scope_stop_action(
+        pre_stop_state.is_ok(),
+        pre_stop_unit_present,
+        ownership_exact,
+    );
+    let stop_job_result;
+    let mut worker_scope_stopped = false;
+    if stop_action == PressureScopeStopAction::AlreadyAbsent {
+        stop_job_result = Some("not_requested_already_absent".into());
+        worker_scope_stopped = already_absent_scope_is_clean(worker_absent, pre_stop_members, true);
+    } else if stop_action == PressureScopeStopAction::StopUnitRequested {
+        match systemd.stop_owned_scope(&scope_plan) {
+            Ok(()) => {
+                stop_job_result = Some("done".into());
+                worker_scope_stopped = systemd
+                    .wait_inactive_or_removed(&scope_plan.unit_name, heartbeat_timeout)
+                    .is_ok();
+            }
+            Err(error)
+                if error.to_string().contains("NoSuchUnit")
+                    || error.to_string().contains("not loaded") =>
+            {
+                let reconciled_absent = systemd
+                    .read_scope_state(&scope_plan.unit_name)
+                    .is_ok_and(|state| state.is_none());
+                let reconciled_members = cgroup_member_count(&cgroup);
+                if no_such_unit_race_reconciles(
+                    worker_absent,
+                    reconciled_members,
+                    reconciled_absent,
+                ) {
+                    stop_action = PressureScopeStopAction::StopUnitNoSuchUnitReconciled;
+                    stop_job_result = Some("no_such_unit_reconciled".into());
+                    worker_scope_stopped = true;
+                } else {
+                    stop_action = PressureScopeStopAction::StopFailed;
+                    stop_job_result = Some(format!("failed: {error:#}"));
+                }
+            }
+            Err(error) => {
+                stop_action = PressureScopeStopAction::StopFailed;
+                stop_job_result = Some(format!("failed: {error:#}"));
+            }
+        }
+    } else {
+        stop_job_result = Some("ownership_ambiguous_stop_not_requested".into());
+    }
     let final_scope_state = systemd
         .read_scope_state(&scope_plan.unit_name)
         .ok()
@@ -1594,21 +1763,10 @@ fn execute_real_pressure_run(
     let final_sub_state = final_scope_state
         .as_ref()
         .map(|state| state.sub_state.clone());
-    let cgroup_member_count = if cgroup.join("cgroup.procs").is_file() {
-        fs::read_to_string(cgroup.join("cgroup.procs"))
-            .ok()
-            .map(|members| {
-                members
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .count()
-            })
-    } else {
-        Some(0)
-    };
+    let cgroup_member_count = cgroup_member_count(&cgroup);
     let worker_scope_zero_members = cgroup_member_count == Some(0);
     let removal_started = Instant::now();
-    let removal_result = if worker_scope_stopped && worker_scope_zero_members {
+    let removal_result = if worker_absent && worker_scope_stopped && worker_scope_zero_members {
         wait_for_transient_scope_removal(heartbeat_timeout, || {
             systemd.unit_exists(&scope_plan.unit_name)
         })
@@ -1623,9 +1781,9 @@ fn execute_real_pressure_run(
             .unwrap_or(u64::MAX)
     });
     let unit_removed = removal_result.is_ok();
-    let classification = if stop_result.is_err() {
+    let classification = if stop_action == PressureScopeStopAction::StopFailed {
         PressureScopeCleanupClassification::StopFailed
-    } else if !worker_scope_stopped || !worker_scope_zero_members {
+    } else if !worker_absent || !worker_scope_stopped || !worker_scope_zero_members {
         PressureScopeCleanupClassification::ActiveOrMembered
     } else if !unit_removed {
         PressureScopeCleanupClassification::TransientScopeRemovalTimeout
@@ -1647,7 +1805,9 @@ fn execute_real_pressure_run(
         .as_ref()
         .is_none_or(|path| !path.exists());
     let cleanup = PressureCleanupEvidence {
-        worker_absent: child_stopped && process_start_ticks(pid).is_err(),
+        worker_absent,
+        pre_stop_unit_present,
+        stop_action,
         worker_scope_stopped,
         worker_scope_zero_members,
         worker_scope_absent: unit_removed,
@@ -1752,7 +1912,7 @@ mod tests {
     fn manifest_fixture() -> PreparedPressureManifest {
         let value = serde_json::json!({
             "payload": {
-                "schema_version": 4,
+                "schema_version": 5,
                 "experiment_id": "checkpoint3c-test",
                 "scenario": "progressive_memory_pressure",
                 "scenario_version": 1,
@@ -1768,7 +1928,7 @@ mod tests {
                 "observer_binary":{"path_role":"nemord","sha256":"observer","build_profile":"release","source_state_id":"source","embedded_git_head":"head"},
                 "worker_implementation_identity":"worker",
                 "worker_protocol_version":1,
-                "pressure_executor_schema_version":2,
+                "pressure_executor_schema_version":3,
                 "worker_executable_path":"/runner",
                 "config_sha256":"config",
                 "environment":{
@@ -1893,6 +2053,32 @@ mod tests {
             serde_json::to_vec(&historical.payload).unwrap(),
         ));
         assert!(historical.verify_payload().is_err());
+    }
+
+    #[test]
+    fn historical_v4_pressure_manifest_remains_immutable_incomplete_evidence() {
+        let mut historical = manifest_fixture();
+        historical.payload.schema_version = 4;
+        historical.payload.pressure_executor_schema_version = 2;
+        historical.payload_sha256 = hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&historical.payload).unwrap(),
+        ));
+        assert!(historical.verify_payload().is_err());
+        let evidence = PressureExecutionEvidence {
+            schema_version: 2,
+            experiment_id: "checkpoint3c-1785315276506307352".into(),
+            state: PressureExperimentState::SafetyAbort,
+            runs: Vec::new(),
+            execution_error: Some("transition watchdog".into()),
+            search_complete: false,
+            capacity_gain_percent: EvaluationState::NotEvaluated,
+        };
+        assert!(!evidence.search_complete);
+        assert_eq!(
+            evidence.capacity_gain_percent,
+            EvaluationState::NotEvaluated
+        );
+        assert_ne!(pressure_execution_exit_status(evidence.state), 0);
     }
 
     fn identity_fixture() -> (tempfile::TempDir, PreparedPressureManifest, PathBuf) {
@@ -2216,6 +2402,129 @@ mod tests {
         assert!(format!("{error:#}").contains("TRANSIENT_SCOPE_REMOVAL_TIMEOUT"));
     }
 
+    #[test]
+    fn already_absent_scope_requires_absent_worker_and_zero_members() {
+        assert!(already_absent_scope_is_clean(true, Some(0), true));
+        assert!(!already_absent_scope_is_clean(false, Some(0), true));
+        assert!(!already_absent_scope_is_clean(true, Some(1), true));
+        assert!(!already_absent_scope_is_clean(true, None, true));
+        assert!(!already_absent_scope_is_clean(true, Some(0), false));
+    }
+
+    #[test]
+    fn no_such_unit_race_reconciles_only_complete_final_absence() {
+        assert!(no_such_unit_race_reconciles(true, Some(0), true));
+        assert!(!no_such_unit_race_reconciles(true, Some(1), true));
+        assert!(!no_such_unit_race_reconciles(false, Some(0), true));
+        assert!(!no_such_unit_race_reconciles(true, Some(0), false));
+    }
+
+    #[test]
+    fn ambiguous_or_unreadable_scope_never_selects_stop_unit() {
+        assert_eq!(
+            initial_scope_stop_action(true, true, true),
+            PressureScopeStopAction::StopUnitRequested
+        );
+        assert_eq!(
+            initial_scope_stop_action(true, false, true),
+            PressureScopeStopAction::AlreadyAbsent
+        );
+        assert_eq!(
+            initial_scope_stop_action(true, true, false),
+            PressureScopeStopAction::StopFailed
+        );
+        assert_eq!(
+            initial_scope_stop_action(false, true, true),
+            PressureScopeStopAction::StopFailed
+        );
+    }
+
+    #[test]
+    fn cleanup_evidence_distinguishes_natural_collection_and_active_stop() {
+        let natural = PressureCleanupEvidence {
+            worker_absent: true,
+            pre_stop_unit_present: false,
+            stop_action: PressureScopeStopAction::AlreadyAbsent,
+            worker_scope_stopped: true,
+            worker_scope_zero_members: true,
+            worker_scope_absent: true,
+            observer_absent: true,
+            observer_runtime_directory_absent: true,
+            stop_job_result: Some("not_requested_already_absent".into()),
+            final_active_state: None,
+            final_sub_state: None,
+            cgroup_member_count: Some(0),
+            unit_removed: true,
+            removal_wait_ms: 0,
+            classification: PressureScopeCleanupClassification::Clean,
+            failure_reason: None,
+        };
+        let mut actively_stopped = natural.clone();
+        actively_stopped.pre_stop_unit_present = true;
+        actively_stopped.stop_action = PressureScopeStopAction::StopUnitRequested;
+        actively_stopped.stop_job_result = Some("done".into());
+        assert!(natural.passed());
+        assert!(actively_stopped.passed());
+        assert_ne!(natural.stop_action, actively_stopped.stop_action);
+    }
+
+    struct TransitionTimeoutBackend;
+
+    impl PressureExecutionBackend for TransitionTimeoutBackend {
+        fn execute_run(
+            &mut self,
+            _manifest: &PreparedPressureManifest,
+            _order_index: usize,
+            persist_event: &mut dyn FnMut(PressurePersistenceEvent) -> Result<()>,
+        ) -> Result<PressureBackendRunResult> {
+            persist_event(PressurePersistenceEvent::Progress(Box::new(
+                PressureLevelProgress {
+                    level_index: 2,
+                    stage: PressureLevelProgressStage::TransitionTimeout,
+                    monotonic_ns: 8_001_000_000,
+                    target_touched_bytes: 2_130_706_432,
+                    requested_delta_bytes: 704_643_072,
+                    expected_workload_identity: "frozen-level-2".into(),
+                    acknowledgement: None,
+                    transition_duration_ms: Some(8_001),
+                    configured_transition_deadline_ms: Some(8_000),
+                    sample: None,
+                },
+            )))?;
+            Ok(PressureBackendRunResult {
+                state: PressureRunState::SafetyAbort,
+                reason: "WATCHDOG_TIMEOUT during bounded worker level transition".into(),
+                execution_error: None,
+                cleanup: PressureCleanupEvidence::simulated(true),
+            })
+        }
+    }
+
+    #[test]
+    fn transition_timeout_persists_terminal_progress_and_is_only_safety_abort() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = runnable_manifest(&temporary);
+        let store = IncrementalPressureStore::create(&manifest).unwrap();
+        let evidence =
+            execute_pressure_with_backend(&manifest, &mut TransitionTimeoutBackend, &store)
+                .unwrap();
+        assert_eq!(evidence.state, PressureExperimentState::SafetyAbort);
+        assert_eq!(
+            evidence.runs[0].level_progress[0].stage,
+            PressureLevelProgressStage::TransitionTimeout
+        );
+        assert_eq!(
+            evidence.runs[0].level_progress[0].transition_duration_ms,
+            Some(8_001)
+        );
+        assert!(evidence.runs[0].levels.is_empty());
+        assert!(!evidence.search_complete);
+        assert_eq!(
+            evidence.capacity_gain_percent,
+            EvaluationState::NotEvaluated
+        );
+    }
+
     struct PartialEvidenceBackend;
 
     impl PressureExecutionBackend for PartialEvidenceBackend {
@@ -2231,9 +2540,12 @@ mod tests {
                     level_index: 0,
                     stage: PressureLevelProgressStage::TransitionStarting,
                     monotonic_ns: 1,
+                    target_touched_bytes: 4096,
+                    requested_delta_bytes: 4096,
                     expected_workload_identity: identity.clone(),
                     acknowledgement: None,
                     transition_duration_ms: None,
+                    configured_transition_deadline_ms: Some(8000),
                     sample: None,
                 },
             )))?;
@@ -2242,6 +2554,8 @@ mod tests {
                     level_index: 0,
                     stage: PressureLevelProgressStage::LevelAcknowledged,
                     monotonic_ns: 2,
+                    target_touched_bytes: 4096,
+                    requested_delta_bytes: 4096,
                     expected_workload_identity: identity,
                     acknowledgement: Some(crate::pressure::WorkerLevelAcknowledgement {
                         experiment_id: manifest.payload.experiment_id.clone(),
@@ -2259,6 +2573,7 @@ mod tests {
                         acknowledged_monotonic_ns: 2,
                     }),
                     transition_duration_ms: Some(1),
+                    configured_transition_deadline_ms: Some(8000),
                     sample: None,
                 },
             )))?;

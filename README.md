@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C V3 ATTEMPT 1 safety-aborted on executor defect; corrected V4 preparation next |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C V4 ATTEMPT 1 partial valid evidence / transition and cleanup defects corrected |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -34,13 +34,13 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 575 / 575 |
-| Passed / failed / ignored | 575 / 0 / 0 |
-| Phase 10 validation | 3A/3B CLOSED / PASS; 3C V3 ATTEMPT 1 safety-aborted on executor defect / V4 pending |
+| Tests defined / executed | 583 / 583 |
+| Passed / failed / ignored | 583 / 0 / 0 |
+| Phase 10 validation | 3A/3B CLOSED / PASS; 3C V4 ATTEMPT 1 safety-aborted / V5 pending |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
-| Checkpoint 3C | V3 ATTEMPT 1: SAFETY ABORT / EXECUTOR DEFECT / NOT PERFORMANCE EVIDENCE; immutable and never rerun |
+| Checkpoint 3C | V4 ATTEMPT 1: SAFETY ABORT / transition watchdog + cleanup classification defect / partial valid level evidence only |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -251,6 +251,20 @@ production performance claims.
   (`b8f8974327450451e2256911f39d97460a4e85256861126fdc6dfb0e9e29ecf7`)
   are authoritative negative evidence. V3 is never rerun or revalidated into
   performance evidence and supports no capacity claim.
+- V4 experiment `checkpoint3c-1785315276506307352` passed final freeze and
+  root preflight, then its one execution attempt returned the correct nonzero
+  status. Baseline levels 704,643,072 and 1,426,063,360 bytes were valid
+  Sustainable results with 3,988 ms and 7,016 ms transitions, five samples,
+  zero OOM/OOM-kill and every mandatory gate passing. Level 2 reached
+  `transition_starting` for 2,130,706,432 bytes but timed out before ACK, so it
+  is not an unsustainable or capacity point. The cumulative full-payload hash
+  made each append transition increasingly expensive; cleanup also
+  misclassified a naturally collected exact scope as `StopFailed` after
+  `NoSuchUnit`. V4 remains immutable partial evidence, never rerun, with report
+  SHA-256
+  `c1cf090c517ad7ef4fa6badc3138c6f13f8a507f246f8ff73c1ab2a2676c2d54`
+  and database SHA-256
+  `dddf2a47a84f6a3c634d7d56c5837ed9078fad766a4e93d321356ba1d3d9f8f2`.
 - The live worker is a separate initially unallocated process controlled by a
   versioned mode-0600 AF_UNIX protocol. Systemd D-Bus attaches its exact
   PID/start-ticks identity to the frozen scope and verifies `MemoryMax` before

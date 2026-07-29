@@ -496,6 +496,37 @@ garbage collection, and reports `TRANSIENT_SCOPE_REMOVAL_TIMEOUT` explicitly.
 Execution and cleanup diagnostics are both retained, and only completed
 framework validation returns CLI status 0.
 
+Checkpoint 3C V4 experiment `checkpoint3c-1785315276506307352` passed final
+freeze and root preflight, then its sole execution attempt ended **SAFETY
+ABORT / TRANSITION WATCHDOG + CLEANUP CLASSIFICATION DEFECT / PARTIAL VALID
+LEVEL EVIDENCE ONLY**. Run 0 baseline levels 704,643,072 and 1,426,063,360
+bytes were valid Sustainable results. Their transitions were 3,988 ms and
+7,016 ms; each hold produced five samples, all mandatory gates passed, and
+OOM/OOM-kill/watchdog observations were zero. Level 2 targeted 2,130,706,432
+bytes but recorded only `transition_starting`: no ACK, stabilization, hold or
+completed evidence exists, so it is not an unsustainable or capacity point.
+
+The transition defect was cumulative SHA-256 work after every append. The
+worker now fills only the new SplitMix64 slice in bounded chunks and updates a
+running SHA-256 with those chunks; cloning/finalizing yields exactly the same
+full-payload-prefix digest without rescanning old bytes. The unchanged
+8-second transition watchdog remains a bounded infrastructure safety deadline,
+and timeout now persists target, delta, elapsed time, configured deadline and
+expected workload identity explicitly.
+
+V4 cleanup already proved worker absence, zero members, observer/runtime
+absence and structural equality, but the exact transient scope had naturally
+disappeared and `StopUnit` returned `NoSuchUnit`; this was incorrectly
+classified `StopFailed`. Cleanup now inspects exact ownership first, accepts
+an already absent scope only with absent worker and zero/absent cgroup, and
+reconciles a between-check `NoSuchUnit` race under the same strict evidence.
+Ambiguous or foreign units are never stopped. V4 correctly returned status 1,
+is never rerun, and provides no capacity or comparison. Immutable report and
+database SHA-256 values are respectively
+`c1cf090c517ad7ef4fa6badc3138c6f13f8a507f246f8ff73c1ab2a2676c2d54`
+and
+`dddf2a47a84f6a3c634d7d56c5837ed9078fad766a4e93d321356ba1d3d9f8f2`.
+
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,
 worker/unit/cgroup final absence, structural restore and full host restore.

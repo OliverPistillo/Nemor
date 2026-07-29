@@ -18,6 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 pub const PRESSURE_WORKER_PROTOCOL_VERSION: u32 = 1;
+const GENERATION_HASH_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -425,6 +426,8 @@ pub struct ProgressiveWorkerSession {
     state: WorkerProtocolState,
     next_level_index: usize,
     payload: Vec<u8>,
+    integrity_hasher: Sha256,
+    integrity_hashed_bytes: u64,
 }
 
 impl ProgressiveWorkerSession {
@@ -452,6 +455,8 @@ impl ProgressiveWorkerSession {
             state: WorkerProtocolState::StartedUnallocated,
             next_level_index: 0,
             payload: Vec::new(),
+            integrity_hasher: Sha256::new(),
+            integrity_hashed_bytes: 0,
         })
     }
 
@@ -504,10 +509,28 @@ impl ProgressiveWorkerSession {
         let prior = usize::try_from(command.prior_touched_bytes)?;
         let target = usize::try_from(command.target_touched_bytes)?;
         self.payload.resize(target, 0);
-        for (index, byte) in self.payload[prior..].iter_mut().enumerate() {
-            *byte = synthetic_byte(SyntheticPattern::Incompressible, self.seed, prior + index);
+        for chunk_start in (prior..target).step_by(GENERATION_HASH_CHUNK_BYTES) {
+            let chunk_end = chunk_start
+                .saturating_add(GENERATION_HASH_CHUNK_BYTES)
+                .min(target);
+            for (offset, byte) in self.payload[chunk_start..chunk_end].iter_mut().enumerate() {
+                *byte = synthetic_byte(
+                    SyntheticPattern::Incompressible,
+                    self.seed,
+                    chunk_start + offset,
+                );
+            }
+            self.integrity_hasher
+                .update(&self.payload[chunk_start..chunk_end]);
         }
-        let integrity_identity = hex::encode(Sha256::digest(&self.payload));
+        self.integrity_hashed_bytes = self
+            .integrity_hashed_bytes
+            .checked_add(command.requested_delta_bytes)
+            .context("progressive integrity byte count overflow")?;
+        if self.integrity_hashed_bytes != command.target_touched_bytes {
+            bail!("incremental integrity state does not match touched payload");
+        }
+        let integrity_identity = hex::encode(self.integrity_hasher.clone().finalize());
         self.state = WorkerProtocolState::LevelAcknowledged;
         self.next_level_index = self
             .next_level_index
@@ -557,6 +580,16 @@ impl ProgressiveWorkerSession {
     pub fn stop(&mut self) {
         self.state = WorkerProtocolState::Stopped;
     }
+
+    #[cfg(test)]
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    #[cfg(test)]
+    fn integrity_hashed_bytes(&self) -> u64 {
+        self.integrity_hashed_bytes
+    }
 }
 
 pub fn command_for_level(
@@ -590,8 +623,12 @@ mod tests {
     use std::time::Instant;
 
     fn level(bytes: u64) -> PlannedPressureLevel {
+        level_at(0, bytes)
+    }
+
+    fn level_at(level_index: usize, bytes: u64) -> PlannedPressureLevel {
         PlannedPressureLevel {
-            level_index: 0,
+            level_index,
             target_logical_bytes: bytes,
             target_touched_bytes: bytes,
             seed: 7,
@@ -633,6 +670,51 @@ mod tests {
         );
         worker.begin_hold().unwrap();
         assert!(worker.bounded_integrity_check().is_ok());
+    }
+
+    #[test]
+    fn incremental_digest_matches_full_prefix_after_every_level() {
+        let mut worker =
+            ProgressiveWorkerSession::start_unallocated("exp".into(), "run".into(), 7, 42, 99)
+                .unwrap();
+        worker.verify_owned_scope_and_memory_max(32 * 1024).unwrap();
+        let mut prior = 0;
+        for (index, target) in [4096, 12_288, 24_576].into_iter().enumerate() {
+            let command = command_for_level("exp", "run", &level_at(index, target), prior).unwrap();
+            let ack = worker.apply_level(&command, index as u64 + 1).unwrap();
+            assert_eq!(
+                ack.integrity_identity,
+                hex::encode(Sha256::digest(worker.payload()))
+            );
+            assert_eq!(worker.integrity_hashed_bytes(), target);
+            prior = target;
+        }
+    }
+
+    #[test]
+    fn later_levels_append_exact_generator_bytes_without_changing_prior_payload() {
+        let mut worker =
+            ProgressiveWorkerSession::start_unallocated("exp".into(), "run".into(), 7, 42, 99)
+                .unwrap();
+        worker.verify_owned_scope_and_memory_max(16_384).unwrap();
+        worker
+            .apply_level(
+                &command_for_level("exp", "run", &level_at(0, 4096), 0).unwrap(),
+                1,
+            )
+            .unwrap();
+        let acknowledged_prefix = worker.payload().to_vec();
+        worker
+            .apply_level(
+                &command_for_level("exp", "run", &level_at(1, 12_288), 4096).unwrap(),
+                2,
+            )
+            .unwrap();
+        assert_eq!(&worker.payload()[..4096], acknowledged_prefix);
+        assert_eq!(worker.integrity_hashed_bytes(), 12_288);
+        assert!(worker.payload().iter().enumerate().all(|(index, byte)| {
+            *byte == synthetic_byte(SyntheticPattern::Incompressible, 7, index)
+        }));
     }
 
     #[test]

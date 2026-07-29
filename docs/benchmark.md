@@ -481,6 +481,39 @@ uses a bounded transient-unit garbage-collection wait; timeout is explicitly
 `TRANSIENT_SCOPE_REMOVAL_TIMEOUT`. Pressure execution exits zero only for
 `completed_framework_validation`.
 
+V4 experiment `checkpoint3c-1785315276506307352` is permanently classified
+**SAFETY ABORT / TRANSITION WATCHDOG + CLEANUP CLASSIFICATION DEFECT / PARTIAL
+VALID LEVEL EVIDENCE ONLY**. Final freeze and root pressure preflight passed.
+Run 0 baseline levels 704,643,072 and 1,426,063,360 bytes completed as valid
+Sustainable evidence: transitions were 3,988 ms and 7,016 ms, holds were
+5,007 ms and 5,011 ms with five samples each, every mandatory health gate
+passed, and OOM/OOM-kill/watchdog observations were zero. Those facts apply
+only to those exact per-level baseline results.
+
+Level 2 targeted 2,130,706,432 bytes and persisted `transition_starting`, but
+received no ACK and entered no stabilization or hold. It is not an
+unsustainable or capacity boundary. The worker had generated each appended
+delta and then SHA-256 hashed the entire cumulative payload; the observed
+growth is structurally consistent with that repeated full-prefix scan. The
+corrected worker incrementally feeds bounded newly generated SplitMix64 chunks
+to a running SHA-256 state and clones/finalizes it for the unchanged exact
+full-prefix digest. Transition timeout remains an 8-second safety watchdog,
+not a performance threshold, and now persists an explicit terminal progress
+record with target, delta, elapsed time, deadline and frozen workload identity.
+
+Cleanup observed absent worker, zero members, absent observer/runtime state and
+matching structure, but `StopUnit` returned `NoSuchUnit` because the transient
+scope had already been collected. The corrected exact-owned state machine
+distinguishes `already_absent`, `stop_unit_requested`,
+`stop_unit_no_such_unit_reconciled` and `stop_failed`. It never stops an
+ambiguous unit and reconciles `NoSuchUnit` only when worker, exact unit and
+cgroup membership are all absent. V4 correctly exited status 1 and is never
+rerun. Its immutable report SHA-256 is
+`c1cf090c517ad7ef4fa6badc3138c6f13f8a507f246f8ff73c1ab2a2676c2d54`
+and database SHA-256 is
+`dddf2a47a84f6a3c634d7d56c5837ed9078fad766a4e93d321356ba1d3d9f8f2`.
+It provides no capacity, maximum, observe comparison or Checkpoint 3C PASS.
+
 `pressure-preflight` accepts only `PreparedPressureManifest` and is read-only.
 It reports manifest/provenance/scenario/run/worker/observer support,
 material-environment match, cgroup and PSI availability, foreign-process and
