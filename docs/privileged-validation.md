@@ -580,7 +580,7 @@ another component set, ownership, contract version, source, binary,
 configuration or material environment. It never evaluates capacity or
 effectiveness and never enables production `nemord`.
 
-Compatibility preflight schema version 3 uses typed DAMON observability:
+Compatibility preflight schema version 4 uses typed DAMON observability:
 observed, privilege-hidden, absent, or inspection-error. Opening
 `nr_kdamonds` with write access remains an open-only readiness probe: it writes
 no bytes and changes no sysfs value. When an ordinary user can observe the
@@ -588,4 +588,7 @@ admin and trace interfaces but cannot open that node or traverse the
 tracepoint, the report defers runtime capability to the root read-only
 preflight instead of declaring the kernel unsupported. Deferred capability
 cannot authorize execution; root must repeat the complete current inspection
-and produce `verified`. Unexpected I/O inspection errors fail closed.
+and either produce `verified` or explicitly authorize the bounded
+`requires_owned_context_validation` bootstrap when `nr_kdamonds=0`.
+Unexpected I/O inspection errors fail closed; the bootstrap is not production
+activation and cannot authorize another component set.

@@ -878,12 +878,15 @@ workflow is `prepare-capacity-compatibility`,
 production activation remains false and capacity/effectiveness remain
 `not_evaluated`.
 
-Preflight schema version 3 separates static contract support from typed
+Preflight schema version 4 separates static contract support from typed
 privilege-sensitive observations. DAMON probes distinguish observed,
 privilege-hidden, absent, and inspection-error states; permission denial is
 never collapsed into unsupported. An unprivileged report may pass all
 user-observable gates while returning
-`deferred_to_privileged_preflight`; that state never means verified and keeps
+`deferred_to_privileged_preflight`; when no kdamond context exists, the root
+report uses `requires_owned_context_validation` and the bounded exact-owned
+validator performs the context-dependent bootstrap. Neither state means
+verified before validation, and both keep
 `execution_ready=false`. A root preflight with the exact preparing
 `SUDO_UID:SUDO_GID` repeats the inspection and may set runtime capability to
 `verified` only when current DAMON/DAMOS support, access, conflicts, identities,

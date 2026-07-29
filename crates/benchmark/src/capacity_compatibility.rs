@@ -25,7 +25,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const PREPARED_CAPACITY_COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
 pub const CAPACITY_COMPATIBILITY_EXECUTION_SCHEMA_VERSION: u32 = 1;
-pub const CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION: u32 = 3;
+pub const CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION: u32 = 4;
 pub const CAPACITY_COMPATIBILITY_MAX_RUNTIME_MS: u64 = 180_000;
 pub const CAPACITY_COMPATIBILITY_MANIFEST_NAME: &str = "capacity-compatibility.manifest.json";
 const HARNESS_REPORT: &str = "/tmp/nemor-privileged-validation-report.json";
@@ -146,6 +146,7 @@ impl PreparedCapacityCompatibilityManifest {
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegeSensitiveCapabilityStatus {
     DeferredToPrivilegedPreflight,
+    RequiresOwnedContextValidation,
     Verified,
     Unsupported,
     InspectionError,
@@ -260,6 +261,13 @@ fn observability_status(
             PrivilegeSensitiveCapabilityStatus::DeferredToPrivilegedPreflight
         };
     }
+    if matches!(observation.nr_kdamonds, Observation::Observed(0)) {
+        return if privileged {
+            PrivilegeSensitiveCapabilityStatus::RequiresOwnedContextValidation
+        } else {
+            PrivilegeSensitiveCapabilityStatus::DeferredToPrivilegedPreflight
+        };
+    }
     privileged_runtime_capability(damon, damos, privileged)
 }
 
@@ -288,6 +296,9 @@ struct ComponentReportAssessment {
     host_oom_observed: bool,
     damon_safety_passed: bool,
     exact_resource_identities_present: bool,
+    shadow_session_passed: bool,
+    vaddr_pageout_supported: bool,
+    cold_address_fence: bool,
 }
 
 fn assess_damos_report(report: &Value, expected_commit: &str) -> ComponentReportAssessment {
@@ -338,6 +349,9 @@ fn assess_damos_report(report: &Value, expected_commit: &str) -> ComponentReport
                     .and_then(Value::as_u64)
                     .is_some()
         }),
+        shadow_session_passed: check_passed("shadow_session_passed"),
+        vaddr_pageout_supported: check_passed("vaddr_pageout_supported"),
+        cold_address_fence: check_passed("cold_address_fence"),
     }
 }
 
@@ -551,8 +565,12 @@ pub fn capacity_compatibility_preflight(
             PrivilegeSensitiveCapabilityStatus::Unsupported
                 | PrivilegeSensitiveCapabilityStatus::InspectionError
         );
-    let execution_ready_except_authorization = user_observable_gates_passed
-        && privileged_runtime_capability == PrivilegeSensitiveCapabilityStatus::Verified;
+    let bounded_entry = matches!(
+        privileged_runtime_capability,
+        PrivilegeSensitiveCapabilityStatus::Verified
+            | PrivilegeSensitiveCapabilityStatus::RequiresOwnedContextValidation
+    );
+    let execution_ready_except_authorization = user_observable_gates_passed && bounded_entry;
     Ok(CapacityCompatibilityPreflight {
         schema_version: CAPACITY_COMPATIBILITY_PREFLIGHT_SCHEMA_VERSION,
         manifest_verified: true,
@@ -599,6 +617,9 @@ pub fn validate_capacity_compatibility(
         && assessment.scope_matches
         && assessment.errors_empty
         && assessment.required_gates_passed
+        && assessment.vaddr_pageout_supported
+        && assessment.shadow_session_passed
+        && assessment.cold_address_fence
         && assessment.cleanup_passed
         && assessment.structural_restore_passed
         && assessment.exact_resource_identities_present
@@ -788,6 +809,9 @@ mod tests {
             ("zero_oom", true),
             ("kdamond_started", true),
             ("kdamond_stopped", true),
+            ("shadow_session_passed", true),
+            ("vaddr_pageout_supported", true),
+            ("cold_address_fence", true),
         ]);
         for (name, passed) in check_overrides {
             checks.insert(*name, *passed);
@@ -825,6 +849,9 @@ mod tests {
                 host_oom_observed: false,
                 damon_safety_passed: true,
                 exact_resource_identities_present: true,
+                shadow_session_passed: true,
+                vaddr_pageout_supported: true,
+                cold_address_fence: true,
             }
         );
     }
@@ -834,6 +861,13 @@ mod tests {
         let assessment = assess_damos_report(&report(&[("zero_oom", false)]), "commit");
         assert!(assessment.host_oom_observed);
         assert!(assessment.cleanup_passed);
+    }
+
+    #[test]
+    fn missing_shadow_capability_gate_forbids_compatibility_pass() {
+        let assessment =
+            assess_damos_report(&report(&[("vaddr_pageout_supported", false)]), "commit");
+        assert!(!assessment.vaddr_pageout_supported);
     }
 
     #[test]
@@ -892,6 +926,32 @@ mod tests {
     fn privileged_complete_capability_is_verified() {
         assert_eq!(
             privileged_runtime_capability(&damon_capability(), &damos_capability(), true),
+            PrivilegeSensitiveCapabilityStatus::Verified
+        );
+    }
+
+    #[test]
+    fn zero_kdamonds_requires_owned_context_validation() {
+        use damon::Observation;
+        let observation = damon::DamonObservability {
+            admin: Observation::Observed(true),
+            kdamonds: Observation::Observed(true),
+            nr_kdamonds: Observation::Observed(0),
+            readable: Observation::Observed(true),
+            writable: Observation::Observed(true),
+            tracefs: Observation::Observed(true),
+            aggregated_tracepoint: Observation::Observed(true),
+            available_operations: Observation::Observed(Vec::new()),
+            vaddr: Observation::Observed(false),
+            active_external_session: Observation::Observed(false),
+            special_module_conflict: Observation::Observed(false),
+        };
+        assert_eq!(
+            observability_status(&observation, &damon_capability(), &damos_capability(), true),
+            PrivilegeSensitiveCapabilityStatus::RequiresOwnedContextValidation
+        );
+        assert_ne!(
+            PrivilegeSensitiveCapabilityStatus::RequiresOwnedContextValidation,
             PrivilegeSensitiveCapabilityStatus::Verified
         );
     }
