@@ -444,8 +444,8 @@ worker implementation contracts.
 The unprivileged simulator allocates no workload memory and performs no
 privileged operation. It deterministically covers all-sustainable,
 unsustainable, PSI/OOM/worker/observer/watchdog/restore abort, touched-byte
-mismatch, refinement and comparison-mismatch paths. Checkpoint 3C status is
-**LIVE PATH IMPLEMENTED / V2 PREPARATION NEXT**, not PASS.
+mismatch, refinement and comparison-mismatch paths. Checkpoint 3C remains
+**OPEN**, not PASS.
 
 The live worker is a separate process whose payload begins at zero bytes. The
 runner binds its PID/start ticks to the audited transient systemd D-Bus scope,
@@ -513,6 +513,21 @@ rerun. Its immutable report SHA-256 is
 and database SHA-256 is
 `dddf2a47a84f6a3c634d7d56c5837ed9078fad766a4e93d321356ba1d3d9f8f2`.
 It provides no capacity, maximum, observe comparison or Checkpoint 3C PASS.
+
+The transition IPC taxonomy remediation is integrated in commit
+`96dc1b4fede9b772b929f1e3c94f1a6564480c44`. Genuine transition socket
+deadlines map to `TransitionTimeout`, `SafetyAbort` and `WATCHDOG_TIMEOUT`;
+non-timeout IPC failures map separately to `TransitionIpcFailure`, `Invalid`
+and `ExecutionError`. Neither path is an unsustainable or capacity boundary.
+The current contracts are pressure execution evidence schema 4, prepared
+pressure manifest schema 6 and worker protocol 1. The remediation passed
+independent static acceptance, the accepted local integration suite passed
+589 tests with zero failures, and GitHub CI run `30454663806`, job
+`90585052557`, concluded successfully for that exact commit. These results do
+not constitute live or performance validation. V5 is frozen historical
+lineage and is not reusable; no post-remediation pressure preflight,
+execution, or new pressure lineage exists. Checkpoint 3C therefore remains
+OPEN and Phase 11 has not started.
 
 `pressure-preflight` accepts only `PreparedPressureManifest` and is read-only.
 It reports manifest/provenance/scenario/run/worker/observer support,

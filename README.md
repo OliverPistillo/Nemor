@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C V4 ATTEMPT 1 partial valid evidence / transition and cleanup defects corrected |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C OPEN — IPC-taxonomy remediation integrated and CI-tested, not live-validated |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -34,13 +34,13 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 583 / 583 |
-| Passed / failed / ignored | 583 / 0 / 0 |
-| Phase 10 validation | 3A/3B CLOSED / PASS; 3C V4 ATTEMPT 1 safety-aborted / V5 pending |
+| Tests defined / executed | 589 / 589 (accepted local integration suite) |
+| Passed / failed / ignored | 589 / 0 / 0 locally; exact-commit GitHub CI test step PASS |
+| Phase 10 validation | 3A/3B CLOSED / PASS; 3C OPEN — no post-remediation live validation or new pressure lineage |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
-| Checkpoint 3C | V4 ATTEMPT 1: SAFETY ABORT / transition watchdog + cleanup classification defect / partial valid level evidence only |
+| Checkpoint 3C | V4 immutable partial evidence; IPC taxonomy integrated at `96dc1b4` with exact-commit CI PASS; V5 frozen/non-reusable |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -265,6 +265,18 @@ production performance claims.
   `c1cf090c517ad7ef4fa6badc3138c6f13f8a507f246f8ff73c1ab2a2676c2d54`
   and database SHA-256
   `dddf2a47a84f6a3c634d7d56c5837ed9078fad766a4e93d321356ba1d3d9f8f2`.
+- The transition IPC taxonomy remediation is integrated in commit
+  `96dc1b4fede9b772b929f1e3c94f1a6564480c44`. Genuine socket deadlines map
+  to `TransitionTimeout` / `SafetyAbort` / `WATCHDOG_TIMEOUT`; other IPC
+  failures map to `TransitionIpcFailure` / `Invalid` / `ExecutionError`.
+  Execution evidence schema 4, prepared pressure schema 6 and worker protocol
+  1 are the current contracts. The accepted local integration suite passed
+  589 tests with zero failures, and GitHub CI run `30454663806`, job
+  `90585052557`, passed on that exact commit. This is implementation, static
+  acceptance and CI evidence only: it is not live or performance validation,
+  creates no capacity or unsustainable boundary, and does not close
+  Checkpoint 3C. V5 is frozen historical lineage and cannot be reused; no new
+  pressure lineage has been prepared.
 - The live worker is a separate initially unallocated process controlled by a
   versioned mode-0600 AF_UNIX protocol. Systemd D-Bus attaches its exact
   PID/start-ticks identity to the frozen scope and verifies `MemoryMax` before
