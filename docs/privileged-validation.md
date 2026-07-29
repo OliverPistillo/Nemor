@@ -385,7 +385,7 @@ as the next framework/design target.
 Checkpoint 3C now provides the model, manifest-ready plan, versioned level/run
 evidence, scoped health gates, conservative headroom calculation, emergency
 taxonomy and deterministic simulated scheduler for controlled progressive
-pressure. It does not add a live command. Future baseline and observe runs must
+pressure. Baseline and observe runs must
 share the exact systemd-owned `MemoryMax`, schedule and worker implementation;
 no raw cgroup writer or arbitrary PID/unit target is introduced.
 
@@ -396,10 +396,11 @@ immediately, preserve evidence and leave later levels unexecuted. Safety abort
 is never a capacity boundary. Refinement is permitted only within an actually
 tested healthy/unhealthy bracket and never publishes an untested value.
 
-Checkpoint 3C is **FRAMEWORK READY / LIVE VALIDATION PENDING**. External review
-is required before any conservative live pilot preparation. No 3C preparation,
-preflight, transient unit, observer, pressure allocation or privileged action
-was performed while implementing the framework.
+V1 is **STATIC PREPARATION VALIDATED / NOT EXECUTION-CAPABLE** and remains
+immutable. Commit `0ca43a654585aeed45bf6426f73694b67a3e9508` created a valid
+static manifest but did not include a separate scoped worker or
+pressure-specific preflight/executor. No V1 experiment occurred; V1 is not a
+failed experiment.
 
 The pre-live review hardening is fail-closed: sustainable evidence requires
 the complete gate set and valid sample/duration coverage; an unacknowledged
@@ -415,9 +416,32 @@ creates immutable run/observer transaction plans in fresh directories. It
 rejects root, reuse and unsafe provenance. Future systemd remains the sole
 cgroup writer. No preflight or cleanup action is part of preparation.
 
-After the separately gated V1 preparation succeeds, Checkpoint 3C status is
-**LIVE PILOT V1 PREPARED / PREFLIGHT PENDING**, not PASS. Static manifest
-review must precede any separately authorized user/root pressure preflight.
+The live bridge adds `pressure-preflight` and
+`execute-pressure-experiment`; neither accepts a fixed-load manifest, and the
+fixed-load path rejects pressure manifests. Preflight is read-only, compares
+material hash with material hash, treats preparation `MemAvailable` as
+historical evidence, and checks current availability against shared
+`MemoryMax` plus frozen reserves. User and root share all non-authorization
+results.
+
+The executor requires root and exact preparing `SUDO_UID:SUDO_GID`. It starts
+a separate zero-allocation worker, attaches its exact PID/start ticks through
+the audited systemd D-Bus scope, verifies membership and `MemoryMax`, then
+permits the first typed mode-0600 AF_UNIX level request. Only observe runs
+start their prepared DynamicUser transaction. Evidence is persisted before
+run zero and after each level; emergency checks occur before another
+allocation. Exact-owned cleanup never targets foreign processes or units.
+
+Host OOM is detected separately from cgroup events using the host-wide
+`/proc/vmstat` `oom_kill` delta; its attribution limitation is retained and
+any increase is a safety abort. Linux PSI `avg10` thresholds use the kernel's
+percentage units directly (`0.20` means 0.20%). Restore is a post-cleanup run
+gate. Observer `RuntimeMaxUSec` is derived from all three level lifecycles plus
+bounded startup/cleanup margins under a hard maximum.
+
+Checkpoint 3C is **LIVE PATH IMPLEMENTED / V2 PREPARATION NEXT**, not PASS.
+After exact CI success V2 may be prepared once unprivileged. Static review
+must precede separately authorized user/root pressure preflight.
 
 ATTEMPT 5 validated this complete lifecycle on CachyOS. It passed all required
 gates with no OOM, no watchdog trigger, exact-owned cleanup, scope collection,

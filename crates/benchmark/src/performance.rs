@@ -735,13 +735,13 @@ pub fn prepare_experiment_manifest(
 }
 
 pub fn execute_prepared_experiment(manifest_path: &Path) -> Result<ExperimentOutcome> {
-    if !nix::unistd::geteuid().is_root() {
-        bail!("Checkpoint 3A execution requires privileged execution")
-    }
     let manifest_bytes = fs::read(manifest_path)?;
     let manifest_file_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
     let manifest: PreparedExperimentManifest = serde_json::from_slice(&manifest_bytes)?;
     manifest.verify(manifest_path)?;
+    if !nix::unistd::geteuid().is_root() {
+        bail!("fixed-load execution requires privileged execution")
+    }
     let payload = &manifest.payload;
     let sudo_uid = std::env::var("SUDO_UID")
         .ok()

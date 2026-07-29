@@ -28,7 +28,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub const PREPARED_PRESSURE_SCHEMA_VERSION: u32 = 1;
+pub const PREPARED_PRESSURE_SCHEMA_VERSION: u32 = 2;
 pub const PRESSURE_RUN_PLAN_VERSION: u32 = 1;
 pub const CONSERVATIVE_PILOT_POLICY_VERSION: u32 = 1;
 pub const PRESSURE_WORKER_PROTOCOL_VERSION: u32 = 1;
@@ -251,6 +251,9 @@ pub struct PreparedPressurePayload {
     pub runner_binary: BinaryIdentity,
     pub observer_binary: BinaryIdentity,
     pub worker_implementation_identity: String,
+    pub worker_protocol_version: u32,
+    pub pressure_executor_schema_version: u32,
+    pub worker_executable_path: PathBuf,
     pub config_sha256: String,
     pub environment: EnvironmentFingerprint,
     pub environment_hash: String,
@@ -302,6 +305,11 @@ impl PreparedPressureManifest {
                 != PressureComparisonPurpose::PressureFrameworkValidation
             || self.payload.generator_id != INCOMPRESSIBLE_GENERATOR_ID
             || self.payload.generator_version != SYNTHETIC_GENERATOR_VERSION
+            || self.payload.worker_protocol_version
+                != crate::pressure_worker::PRESSURE_WORKER_PROTOCOL_VERSION
+            || self.payload.pressure_executor_schema_version
+                != crate::pressure_live::PRESSURE_EXECUTION_SCHEMA_VERSION
+            || self.payload.worker_executable_path != self.payload.runner_path
             || self.payload.pressure_plans.len() != 6
             || self.payload.observer_runs.len() != 3
             || self.payload.observer_property_contract_version != OBSERVER_PROPERTY_CONTRACT_VERSION
@@ -410,6 +418,28 @@ fn pressure_observer_run_id(
     repetition_index: usize,
 ) -> String {
     format!("c3c-o{order_index}-r{repetition_index}-{experiment_id}")
+}
+
+pub fn pressure_observer_runtime_max_usec(plan: &ProgressivePressurePlan) -> Result<u64> {
+    let level_ms = plan
+        .stabilization_duration_ms
+        .checked_add(plan.hold_duration_ms)
+        .context("pressure observer per-level duration overflow")?;
+    let measured_ms = (plan.levels.len() as u64)
+        .checked_mul(level_ms)
+        .context("pressure observer measured duration overflow")?;
+    let runtime_ms = measured_ms
+        .checked_add(10_000) // startup/readiness
+        .and_then(|value| value.checked_add(10_000)) // exact-owned cleanup
+        .and_then(|value| value.checked_add(5_000)) // scheduler margin
+        .context("pressure observer runtime overflow")?;
+    let runtime_usec = runtime_ms
+        .checked_mul(1_000)
+        .context("pressure observer runtime usec overflow")?;
+    if runtime_usec > crate::observer_service::PERFORMANCE_SERVICE_RUNTIME_MAX_USEC {
+        bail!("pressure observer lifecycle exceeds the hard RuntimeMax");
+    }
+    Ok(runtime_usec)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,8 +573,16 @@ pub fn prepare_pressure_experiment(
             let run_id =
                 pressure_observer_run_id(&experiment_id, run.order_index, run.repetition_index);
             let (binary, staged_config) = crate::observer_service::staged_observer_paths(&run_id)?;
-            let service_plan =
-                ObserverServicePlan::new_with_runtime(&run_id, binary, staged_config, 55_000_000)?;
+            let service_plan = ObserverServicePlan::new_with_runtime(
+                &run_id,
+                binary,
+                staged_config,
+                pressure_observer_runtime_max_usec(
+                    pressure_plans
+                        .get(run.order_index)
+                        .context("pressure plan missing for observer RuntimeMax")?,
+                )?,
+            )?;
             let prepared_config_path =
                 prepared_root.join(format!("observe-{}.toml", run.order_index));
             let prepared_config_sha256 = crate::performance::write_inspection_config(
@@ -582,6 +620,9 @@ pub fn prepare_pressure_experiment(
         runner_binary,
         observer_binary: observer_identity,
         worker_implementation_identity,
+        worker_protocol_version: crate::pressure_worker::PRESSURE_WORKER_PROTOCOL_VERSION,
+        pressure_executor_schema_version: crate::pressure_live::PRESSURE_EXECUTION_SCHEMA_VERSION,
+        worker_executable_path: runner_path.clone(),
         config_sha256: loaded.sha256,
         environment,
         environment_hash,
@@ -749,6 +790,68 @@ mod tests {
                 workload_bytes_allocated: 0,
                 observer_processes_started: 0,
             }
+        );
+    }
+
+    #[test]
+    fn pressure_observer_runtime_covers_full_pilot_and_stays_bounded() {
+        let reserve = default_headroom_policy().derive(16 * 1024 * MIB).unwrap();
+        let levels = PilotPolicyV1::conservative_v1()
+            .freeze(&reserve, 1)
+            .unwrap();
+        let plan = ProgressivePressurePlan {
+            version: PRESSURE_PLAN_VERSION,
+            scenario: PRESSURE_SCENARIO.into(),
+            scenario_version: PRESSURE_SCENARIO_VERSION,
+            comparison_purpose: PressureComparisonPurpose::PressureFrameworkValidation,
+            variants: vec![
+                BenchmarkVariant::CachyosBaseline,
+                BenchmarkVariant::NemorObserve,
+            ],
+            generator_id: INCOMPRESSIBLE_GENERATOR_ID.into(),
+            generator_version: SYNTHETIC_GENERATOR_VERSION,
+            experiment_seed: 1,
+            levels,
+            hold_duration_ms: 5_000,
+            stabilization_duration_ms: 2_000,
+            sample_interval_ms: 1_000,
+            worker_memory_max_bytes: 1024 * MIB,
+            watchdog: PressureWatchdogPolicy {
+                heartbeat_timeout_ms: 2_000,
+                level_timeout_ms: 10_000,
+                total_timeout_ms: 45_000,
+            },
+            health: PressureHealthPolicy {
+                version: PRESSURE_HEALTH_POLICY_VERSION,
+                host_psi_full_avg10_emergency: 0.2,
+                cgroup_psi_full_avg10_unsustainable: 0.1,
+                max_major_faults_per_level: 1_000,
+                max_swap_in_bytes_per_level: 1,
+                max_swap_out_bytes_per_level: 1,
+                max_block_writes_bytes_per_level: 1,
+                host_oom_forbidden: true,
+                request_oom: false,
+                zero_limits_mean_zero_tolerance: true,
+            },
+            stop_policy: StopPolicy {
+                stop_after_first_unsustainable: true,
+                stop_immediately_on_safety_abort: true,
+                never_use_safety_abort_as_capacity_bound: true,
+            },
+            refinement: RefinementPolicy {
+                mode: RefinementMode::DisabledForFrameworkPilot,
+                granularity_bytes: 16 * MIB,
+                maximum_refinements: 0,
+            },
+            maximum_levels: 3,
+            maximum_total_duration_ms: 45_000,
+            headroom: reserve,
+            systemd_transient_scope_required: true,
+            exact_owned_worker_required: true,
+        };
+        assert_eq!(
+            pressure_observer_runtime_max_usec(&plan).unwrap(),
+            46_000_000
         );
     }
 }

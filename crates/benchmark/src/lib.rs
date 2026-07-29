@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
@@ -14,6 +15,7 @@ pub mod harness;
 pub mod observer_service;
 pub mod performance;
 pub mod pressure;
+pub mod pressure_live;
 pub mod pressure_prepare;
 pub mod pressure_worker;
 pub mod systemd;

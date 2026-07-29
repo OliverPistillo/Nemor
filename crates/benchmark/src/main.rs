@@ -149,6 +149,16 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
+    PressurePreflight {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    ExecutePressureExperiment {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     ExecuteExperiment {
         #[arg(long)]
         manifest: PathBuf,
@@ -177,6 +187,17 @@ enum Command {
         pattern: String,
         #[arg(long)]
         control_dir: PathBuf,
+    },
+    #[command(hide = true)]
+    PressureWorker {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        experiment_id: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        seed: u64,
     },
 }
 
@@ -547,6 +568,21 @@ fn run() -> Result<i32> {
             )?;
             println!("manifest={}", path.display());
         }
+        Command::PressurePreflight { manifest, json } => {
+            let report = nemor_benchmark::pressure_live::pressure_preflight(&manifest)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::ExecutePressureExperiment { manifest } => {
+            let evidence = nemor_benchmark::pressure_live::execute_pressure_experiment(&manifest)?;
+            println!(
+                "experiment_id={} state={:?} capacity_gain_percent=not_evaluated",
+                evidence.experiment_id, evidence.state
+            );
+        }
         Command::ExecuteExperiment { manifest } => {
             let outcome = nemor_benchmark::performance::execute_prepared_experiment(&manifest)?;
             println!(
@@ -593,6 +629,21 @@ fn run() -> Result<i32> {
                 _ => bail!("unsupported synthetic worker pattern"),
             };
             nemor_benchmark::harness::run_worker(bytes, seed, pattern, &control_dir)?;
+        }
+        Command::PressureWorker {
+            socket,
+            experiment_id,
+            run_id,
+            seed,
+        } => {
+            let start_ticks = nemor_benchmark::pressure_worker::current_process_start_ticks()?;
+            nemor_benchmark::pressure_worker::run_pressure_worker_server(
+                &socket,
+                experiment_id,
+                run_id,
+                seed,
+                start_ticks,
+            )?;
         }
     }
     Ok(0)

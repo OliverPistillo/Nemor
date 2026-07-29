@@ -393,8 +393,13 @@ Checkpoint 3C adds an explicit version-1 `progressive_memory_pressure`
 contract with comparison purpose `pressure_framework_validation`. It remains
 limited to `cachyos_baseline,nemor_observe` and reuses the 3A/3B provenance,
 material-environment, owned systemd scope, DynamicUser observer, watchdog,
-restore, counter, persistence and immutable-failure architecture. The live
-prepare/execute path does not accept 3C yet.
+restore, counter, persistence and immutable-failure architecture.
+
+V1 is **STATIC PREPARATION VALIDATED / NOT EXECUTION-CAPABLE**. Commit
+`0ca43a654585aeed45bf6426f73694b67a3e9508` produced a valid static pressure
+manifest but had no pressure-specific preflight/executor and its worker was
+still in-process. V1 remains immutable. No V1 preflight or live experiment
+occurred, so this is not an experiment failure.
 
 `ProgressivePressurePlan` freezes the SplitMix64 incompressible generator v1,
 experiment seed, exact ordered byte levels, hold/stabilization/sample timing,
@@ -440,12 +445,37 @@ The unprivileged simulator allocates no workload memory and performs no
 privileged operation. It deterministically covers all-sustainable,
 unsustainable, PSI/OOM/worker/observer/watchdog/restore abort, touched-byte
 mismatch, refinement and comparison-mismatch paths. Checkpoint 3C status is
-**FRAMEWORK READY / LIVE VALIDATION PENDING**, not PASS.
+**LIVE PATH IMPLEMENTED / V2 PREPARATION NEXT**, not PASS.
 
-Future flow is: external review, separately authorized preparation that
-derives and freezes exact conservative levels, manifest review, separately
-authorized read-only host preflight, and only then a separately approved live
-pilot. None of those live steps occurred here.
+The live worker is a separate process whose payload begins at zero bytes. The
+runner binds its PID/start ticks to the audited transient systemd D-Bus scope,
+verifies membership and frozen `MemoryMax`, and only then sends level zero
+over a versioned mode-0600 AF_UNIX protocol. Fixed messages bind protocol,
+experiment, run and worker identity; level requests also bind seed, prior
+bytes, delta, target and generator. Foreign, duplicate and out-of-order
+messages fail closed.
+
+`pressure-preflight` accepts only `PreparedPressureManifest` and is read-only.
+It reports manifest/provenance/scenario/run/worker/observer support,
+material-environment match, cgroup and PSI availability, foreign-process and
+stale-unit clearance, output freshness, headroom safety and authorization.
+Preparation `MemAvailable` remains evidence; current availability may differ
+when it still covers shared `MemoryMax` plus frozen reserves. Linux PSI
+`avg10` values use the percentage units emitted by the kernel directly:
+`0.20` and `0.10` mean 0.20% and 0.10%, without rescaling.
+
+`execute-pressure-experiment` accepts only pressure manifests and requires
+root plus exact preparing `SUDO_UID:SUDO_GID`; fixed-load commands reject
+pressure manifests. It persists the six-run plan before run zero and updates
+JSON, SQLite and `runs/` after every level/state transition. Host OOM uses the
+host-wide `/proc/vmstat` `oom_kill` delta, separately from cgroup-local
+`memory.events`; because attribution is limited, any increase fails safe.
+Emergency checks precede the next level. Cleanup addresses only the owned
+PID/start ticks, scope and observer transaction.
+
+Next flow is fresh V2 preparation from the exact CI-approved commit, static
+review, user/root pressure preflight, then a separately approved pilot. No
+pressure execution occurs in implementation or CI.
 
 The external review is now incorporated. A sustainable level must contain the
 complete variant-applicable gate set, with every gate mandatory and passing;

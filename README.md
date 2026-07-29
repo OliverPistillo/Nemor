@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C controlled-pressure framework ready, live validation pending |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B CLOSED / PASS; 3C live path implemented, V2 preparation next |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -36,11 +36,11 @@ development; ⚪ planned.
 | Workspace crates | 15 |
 | Tests defined / executed | 547 / 547 |
 | Passed / failed / ignored | 547 / 0 / 0 |
-| Phase 10 validation | 3A/3B CLOSED / PASS; 3C framework ready / live validation pending |
+| Phase 10 validation | 3A/3B CLOSED / PASS; 3C live path implemented / no pressure run |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
-| Checkpoint 3C | external-review hardening and dedicated live-preparation bridge ready; V1 preparation is the next gated step |
+| Checkpoint 3C | V1 static preparation preserved as non-executable; pressure preflight/executor and scoped worker implemented; V2 preparation next |
 | Runtime mode | `observe` |
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
@@ -212,8 +212,11 @@ production performance claims.
   actually tested healthy level; safety aborts are retained but never become
   capacity bounds. Host OOM is forbidden. A zero-allocation, zero-privilege
   simulator covers negative levels, aborts, restore failure and refinement.
-  The framework is ready, but no 3C preparation, preflight or live validation
-  has occurred.
+  V1 is preserved as valid static preparation evidence, but commit
+  `0ca43a654585aeed45bf6426f73694b67a3e9508` did not contain the separate
+  worker process or pressure-specific preflight/executor. V1 is therefore
+  **STATIC PREPARATION VALIDATED / NOT EXECUTION-CAPABLE**, not a failed
+  experiment; no live experiment occurred.
 - Checkpoint 3C pre-live hardening makes the mandatory health-gate set
   complete, enforces coherent hold/sample/monotonic timing, separates
   protocol-invalid touched-byte evidence from valid unsustainable boundaries,
@@ -230,6 +233,17 @@ production performance claims.
   writes no cgroup, and allocates no workload. The resulting pilot remains
   framework validation: `search_complete=false` and capacity is
   `not_evaluated`.
+- `pressure-preflight` parses only the pressure manifest and is read-only. It
+  checks current headroom against frozen `MemoryMax` plus reserves without
+  requiring volatile `MemAvailable` equality, compares material hash only to
+  material hash, and reports user/root authorization separately.
+  `execute-pressure-experiment` accepts only pressure manifests and requires
+  root plus the exact preparing `SUDO_UID:SUDO_GID`.
+- The live worker is a separate initially unallocated process controlled by a
+  versioned mode-0600 AF_UNIX protocol. Systemd D-Bus attaches its exact
+  PID/start-ticks identity to the frozen scope and verifies `MemoryMax` before
+  level zero. Evidence is persisted after each level, emergency gates precede
+  every next allocation, and cleanup targets only owned resources.
 
 Phase 9 real CachyOS validation covers two synthetic, host-specific paths. The
 profitable path measured 39,931,904 saved bytes, positive system/process

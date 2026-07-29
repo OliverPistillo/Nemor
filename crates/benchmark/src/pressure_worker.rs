@@ -7,11 +7,357 @@
 use crate::performance::{INCOMPRESSIBLE_GENERATOR_ID, SYNTHETIC_GENERATOR_VERSION};
 use crate::pressure::{PlannedPressureLevel, WorkerLevelAcknowledgement};
 use crate::{synthetic_byte, SyntheticPattern};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 
 pub const PRESSURE_WORKER_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkerIpcMessage {
+    Hello {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+        touched_bytes: u64,
+    },
+    VerifyBoundary {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+        memory_max_bytes: u64,
+    },
+    BoundaryVerified {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+    },
+    LevelRequest {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+        command: WorkerLevelCommand,
+        monotonic_ns: u64,
+    },
+    LevelAck {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+        acknowledgement: WorkerLevelAcknowledgement,
+    },
+    BeginHold {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+    },
+    HeartbeatRequest {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+    },
+    Heartbeat {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+        touched_bytes: u64,
+    },
+    IntegrityResult {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+        identity: String,
+    },
+    Stop {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+    },
+    Stopped {
+        version: u32,
+        experiment_id: String,
+        run_id: String,
+        pid: u32,
+        start_ticks: u64,
+    },
+}
+
+fn write_message(stream: &mut UnixStream, message: &WorkerIpcMessage) -> Result<()> {
+    serde_json::to_writer(&mut *stream, message)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_message(reader: &mut BufReader<UnixStream>) -> Result<WorkerIpcMessage> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 || line.len() > 64 * 1024 {
+        bail!("pressure worker IPC message is absent or oversized");
+    }
+    Ok(serde_json::from_str(&line)?)
+}
+
+fn message_identity_matches(
+    message: &WorkerIpcMessage,
+    experiment_id: &str,
+    run_id: &str,
+    pid: u32,
+    start_ticks: u64,
+) -> bool {
+    let identity = match message {
+        WorkerIpcMessage::VerifyBoundary {
+            version,
+            experiment_id,
+            run_id,
+            pid,
+            start_ticks,
+            ..
+        }
+        | WorkerIpcMessage::LevelRequest {
+            version,
+            experiment_id,
+            run_id,
+            pid,
+            start_ticks,
+            ..
+        }
+        | WorkerIpcMessage::BeginHold {
+            version,
+            experiment_id,
+            run_id,
+            pid,
+            start_ticks,
+        }
+        | WorkerIpcMessage::HeartbeatRequest {
+            version,
+            experiment_id,
+            run_id,
+            pid,
+            start_ticks,
+        }
+        | WorkerIpcMessage::Stop {
+            version,
+            experiment_id,
+            run_id,
+            pid,
+            start_ticks,
+        } => (*version, experiment_id, run_id, *pid, *start_ticks),
+        _ => return false,
+    };
+    identity.0 == PRESSURE_WORKER_PROTOCOL_VERSION
+        && identity.1 == experiment_id
+        && identity.2 == run_id
+        && identity.3 == pid
+        && identity.4 == start_ticks
+}
+
+pub fn run_pressure_worker_server(
+    socket_path: &Path,
+    experiment_id: String,
+    run_id: String,
+    seed: u64,
+    start_ticks: u64,
+) -> Result<()> {
+    if socket_path.exists() || !socket_path.is_absolute() {
+        bail!("pressure worker socket must be a fresh absolute path");
+    }
+    let pid = std::process::id();
+    let mut session = ProgressiveWorkerSession::start_unallocated(
+        experiment_id.clone(),
+        run_id.clone(),
+        seed,
+        pid,
+        start_ticks,
+    )?;
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("bind pressure worker socket {}", socket_path.display()))?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("protect pressure worker socket {}", socket_path.display()))?;
+    let (mut stream, _) = listener
+        .accept()
+        .context("accept pressure worker controller connection")?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    write_message(
+        &mut stream,
+        &WorkerIpcMessage::Hello {
+            version: PRESSURE_WORKER_PROTOCOL_VERSION,
+            experiment_id: experiment_id.clone(),
+            run_id: run_id.clone(),
+            pid,
+            start_ticks,
+            touched_bytes: 0,
+        },
+    )?;
+    loop {
+        let message = read_message(&mut reader)?;
+        if !message_identity_matches(&message, &experiment_id, &run_id, pid, start_ticks) {
+            bail!("foreign or out-of-order pressure worker IPC message");
+        }
+        match message {
+            WorkerIpcMessage::VerifyBoundary {
+                memory_max_bytes, ..
+            } => {
+                session.verify_owned_scope_and_memory_max(memory_max_bytes)?;
+                write_message(
+                    &mut stream,
+                    &WorkerIpcMessage::BoundaryVerified {
+                        version: PRESSURE_WORKER_PROTOCOL_VERSION,
+                        experiment_id: experiment_id.clone(),
+                        run_id: run_id.clone(),
+                        pid,
+                        start_ticks,
+                    },
+                )?;
+            }
+            WorkerIpcMessage::LevelRequest {
+                command,
+                monotonic_ns,
+                ..
+            } => {
+                let acknowledgement = session.apply_level(&command, monotonic_ns)?;
+                write_message(
+                    &mut stream,
+                    &WorkerIpcMessage::LevelAck {
+                        version: PRESSURE_WORKER_PROTOCOL_VERSION,
+                        experiment_id: experiment_id.clone(),
+                        run_id: run_id.clone(),
+                        pid,
+                        start_ticks,
+                        acknowledgement,
+                    },
+                )?;
+            }
+            WorkerIpcMessage::BeginHold { .. } => {
+                session.begin_hold()?;
+                let identity = session.bounded_integrity_check()?;
+                write_message(
+                    &mut stream,
+                    &WorkerIpcMessage::IntegrityResult {
+                        version: PRESSURE_WORKER_PROTOCOL_VERSION,
+                        experiment_id: experiment_id.clone(),
+                        run_id: run_id.clone(),
+                        pid,
+                        start_ticks,
+                        identity,
+                    },
+                )?;
+                write_message(
+                    &mut stream,
+                    &WorkerIpcMessage::Heartbeat {
+                        version: PRESSURE_WORKER_PROTOCOL_VERSION,
+                        experiment_id: experiment_id.clone(),
+                        run_id: run_id.clone(),
+                        pid,
+                        start_ticks,
+                        touched_bytes: session.touched_bytes(),
+                    },
+                )?;
+            }
+            WorkerIpcMessage::HeartbeatRequest { .. } => {
+                let identity = session.bounded_integrity_check()?;
+                write_message(
+                    &mut stream,
+                    &WorkerIpcMessage::Heartbeat {
+                        version: PRESSURE_WORKER_PROTOCOL_VERSION,
+                        experiment_id: experiment_id.clone(),
+                        run_id: run_id.clone(),
+                        pid,
+                        start_ticks,
+                        touched_bytes: session.touched_bytes(),
+                    },
+                )?;
+                write_message(
+                    &mut stream,
+                    &WorkerIpcMessage::IntegrityResult {
+                        version: PRESSURE_WORKER_PROTOCOL_VERSION,
+                        experiment_id: experiment_id.clone(),
+                        run_id: run_id.clone(),
+                        pid,
+                        start_ticks,
+                        identity,
+                    },
+                )?;
+            }
+            WorkerIpcMessage::Stop { .. } => {
+                session.stop();
+                write_message(
+                    &mut stream,
+                    &WorkerIpcMessage::Stopped {
+                        version: PRESSURE_WORKER_PROTOCOL_VERSION,
+                        experiment_id,
+                        run_id,
+                        pid,
+                        start_ticks,
+                    },
+                )?;
+                break;
+            }
+            _ => bail!("pressure worker received an invalid protocol direction"),
+        }
+    }
+    let _ = fs::remove_file(socket_path);
+    Ok(())
+}
+
+pub struct PressureWorkerClient {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+pub fn current_process_start_ticks() -> Result<u64> {
+    let stat = fs::read_to_string("/proc/self/stat")?;
+    let close = stat
+        .rfind(')')
+        .ok_or_else(|| anyhow::anyhow!("malformed /proc/self/stat"))?;
+    stat[close + 1..]
+        .split_whitespace()
+        .nth(19)
+        .context("missing process start ticks")?
+        .parse()
+        .map_err(Into::into)
+}
+
+impl PressureWorkerClient {
+    pub fn connect(socket_path: &Path) -> Result<Self> {
+        let stream = UnixStream::connect(socket_path)?;
+        let reader = BufReader::new(stream.try_clone()?);
+        Ok(Self { stream, reader })
+    }
+
+    pub fn send(&mut self, message: &WorkerIpcMessage) -> Result<WorkerIpcMessage> {
+        write_message(&mut self.stream, message)?;
+        read_message(&mut self.reader)
+    }
+
+    pub fn receive(&mut self) -> Result<WorkerIpcMessage> {
+        read_message(&mut self.reader)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +391,7 @@ pub struct ProgressiveWorkerSession {
     worker_start_ticks: u64,
     memory_max_bytes: u64,
     state: WorkerProtocolState,
+    next_level_index: usize,
     payload: Vec<u8>,
 }
 
@@ -71,6 +418,7 @@ impl ProgressiveWorkerSession {
             worker_start_ticks,
             memory_max_bytes: 0,
             state: WorkerProtocolState::StartedUnallocated,
+            next_level_index: 0,
             payload: Vec::new(),
         })
     }
@@ -109,6 +457,7 @@ impl ProgressiveWorkerSession {
             || command.experiment_id != self.experiment_id
             || command.run_id != self.run_id
             || command.seed != self.seed
+            || command.level_index != self.next_level_index
             || command.generator_id != INCOMPRESSIBLE_GENERATOR_ID
             || command.generator_version != SYNTHETIC_GENERATOR_VERSION
             || command.prior_touched_bytes != self.touched_bytes()
@@ -128,6 +477,10 @@ impl ProgressiveWorkerSession {
         }
         let integrity_identity = hex::encode(Sha256::digest(&self.payload));
         self.state = WorkerProtocolState::LevelAcknowledged;
+        self.next_level_index = self
+            .next_level_index
+            .checked_add(1)
+            .context("progressive worker level index overflow")?;
         Ok(WorkerLevelAcknowledgement {
             experiment_id: self.experiment_id.clone(),
             run_id: self.run_id.clone(),
@@ -259,5 +612,22 @@ mod tests {
         command.run_id = "foreign".into();
         assert!(worker.apply_level(&command, 1).is_err());
         assert_eq!(worker.touched_bytes(), 0);
+    }
+
+    #[test]
+    fn duplicate_and_out_of_order_levels_fail_without_allocation() {
+        let mut worker =
+            ProgressiveWorkerSession::start_unallocated("exp".into(), "run".into(), 7, 42, 99)
+                .unwrap();
+        worker.verify_owned_scope_and_memory_max(16_384).unwrap();
+        let mut out_of_order = command_for_level("exp", "run", &level(4096), 0).unwrap();
+        out_of_order.level_index = 1;
+        assert!(worker.apply_level(&out_of_order, 1).is_err());
+        assert_eq!(worker.touched_bytes(), 0);
+
+        let first = command_for_level("exp", "run", &level(4096), 0).unwrap();
+        worker.apply_level(&first, 2).unwrap();
+        assert!(worker.apply_level(&first, 3).is_err());
+        assert_eq!(worker.touched_bytes(), 4096);
     }
 }

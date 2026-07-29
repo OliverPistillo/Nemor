@@ -215,6 +215,14 @@ pub struct TransientScopePlan {
     pub cpu_accounting: bool,
     pub io_accounting: bool,
     pub collect_mode: String,
+    pub contract: TransientScopeContract,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransientScopeContract {
+    FixedLoad,
+    ProgressivePressure,
 }
 
 impl TransientScopePlan {
@@ -255,13 +263,39 @@ impl TransientScopePlan {
             cpu_accounting: true,
             io_accounting: true,
             collect_mode: "inactive-or-failed".into(),
+            contract: TransientScopeContract::FixedLoad,
         })
+    }
+
+    pub fn with_pressure_limits(
+        run_id: &str,
+        identity: OwnedProcessIdentity,
+        memory_max: u64,
+        runtime_max_usec: u64,
+    ) -> Result<Self> {
+        let mut plan = Self::with_limits(
+            run_id,
+            identity,
+            128 * 1024 * 1024,
+            runtime_max_usec,
+            "Nemor Phase 10 Checkpoint 3C progressive pressure worker",
+        )?;
+        plan.memory_max = memory_max;
+        plan.contract = TransientScopeContract::ProgressivePressure;
+        plan.validate()?;
+        Ok(plan)
     }
 
     pub fn validate(&self) -> Result<()> {
         validate_unit_name(&self.unit_name)?;
+        let memory_limit_valid = match self.contract {
+            TransientScopeContract::FixedLoad => self.memory_max <= 512 * 1024 * 1024,
+            TransientScopeContract::ProgressivePressure => {
+                self.memory_max <= 16 * 1024 * 1024 * 1024
+            }
+        };
         if self.memory_max == 0
-            || self.memory_max > 512 * 1024 * 1024
+            || !memory_limit_valid
             || self.runtime_max_usec < 15_000_000
             || self.runtime_max_usec > 120_000_000
             || !self.memory_accounting

@@ -13,10 +13,24 @@ pub const PRESSURE_SCENARIO: &str = "progressive_memory_pressure";
 pub const PRESSURE_SCENARIO_VERSION: u32 = 1;
 pub const PRESSURE_PLAN_VERSION: u32 = 1;
 pub const PRESSURE_HEALTH_POLICY_VERSION: u32 = 1;
-pub const LEVEL_EVIDENCE_VERSION: u32 = 1;
+pub const LEVEL_EVIDENCE_VERSION: u32 = 2;
 pub const MAX_PRESSURE_LEVELS: usize = 12;
 pub const MAX_PRESSURE_DURATION_MS: u64 = 15 * 60 * 1_000;
 pub const PRESSURE_FRAMEWORK_MANIFEST_VERSION: u32 = 1;
+pub const PSI_AVG10_UNIT: &str = "percent_stall_time_as_emitted_by_linux";
+
+pub fn psi_avg10_threshold_crossed(observed_linux_avg10: f64, threshold: f64) -> Result<bool> {
+    if !observed_linux_avg10.is_finite()
+        || !threshold.is_finite()
+        || observed_linux_avg10 < 0.0
+        || threshold < 0.0
+        || observed_linux_avg10 > 100.0
+        || threshold > 100.0
+    {
+        bail!("PSI avg10 values must use Linux percent units in [0,100]");
+    }
+    Ok(observed_linux_avg10 >= threshold)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PressureFrameworkManifest {
@@ -513,7 +527,6 @@ pub fn required_level_health_gates(variant: BenchmarkVariant) -> BTreeSet<Health
         HealthGate::WorkerCpu,
         HealthGate::RunnerCpu,
         HealthGate::ElapsedDuration,
-        HealthGate::RestoreOwnership,
     ]);
     if variant == BenchmarkVariant::NemorObserve {
         gates.insert(HealthGate::ObserverContract);
@@ -599,6 +612,17 @@ impl WorkerLevelAcknowledgement {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PressureLevelSample {
+    pub monotonic_ns: u64,
+    pub memory_current_bytes: Option<u64>,
+    pub host_memory_full_avg10_percent: Option<f64>,
+    pub cgroup_memory_full_avg10_percent: Option<f64>,
+    pub worker_alive: bool,
+    pub heartbeat_touched_bytes: u64,
+    pub integrity_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LevelEvidence {
     pub version: u32,
     pub experiment_id: String,
@@ -619,6 +643,7 @@ pub struct LevelEvidence {
     pub stabilization_completed_ms: u64,
     pub duration_ms: u64,
     pub sample_count: usize,
+    pub raw_samples: Vec<PressureLevelSample>,
     pub memory_mean_bytes: Option<f64>,
     pub memory_peak_bytes: Option<u64>,
     pub metrics: Vec<PressureMetric>,
@@ -684,6 +709,9 @@ impl LevelEvidence {
             || u64::try_from(self.sample_count).unwrap_or(u64::MAX) < minimum_samples
         {
             bail!("completed level has insufficient timing or sample coverage");
+        }
+        if !self.raw_samples.is_empty() && self.raw_samples.len() != self.sample_count {
+            bail!("raw pressure sample count differs from level sample contract");
         }
         if self.classification == LevelClassification::Sustainable {
             let required = required_level_health_gates(self.variant);
@@ -1061,6 +1089,7 @@ impl SimulatedPressureBackend {
             sample_count: usize::try_from(plan.hold_duration_ms / plan.sample_interval_ms)
                 .unwrap_or(1)
                 .max(1),
+            raw_samples: Vec::new(),
             memory_mean_bytes: Some(touched as f64),
             memory_peak_bytes: Some(touched),
             metrics: vec![
@@ -1816,6 +1845,11 @@ mod tests {
             plan.health.cgroup_psi_full_avg10_unsustainable = invalid;
             assert!(plan.validate().is_err());
         }
+        assert!(!psi_avg10_threshold_crossed(0.19, 0.20).unwrap());
+        assert!(psi_avg10_threshold_crossed(0.20, 0.20).unwrap());
+        assert!(!psi_avg10_threshold_crossed(0.09, 0.10).unwrap());
+        assert!(psi_avg10_threshold_crossed(0.10, 0.10).unwrap());
+        assert_eq!(PSI_AVG10_UNIT, "percent_stall_time_as_emitted_by_linux");
     }
 
     #[test]
