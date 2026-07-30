@@ -243,6 +243,7 @@ pub struct TransientScopePlan {
 pub enum TransientScopeContract {
     FixedLoad,
     ProgressivePressure,
+    CapacityBenchmark,
 }
 
 impl TransientScopePlan {
@@ -306,6 +307,25 @@ impl TransientScopePlan {
         Ok(plan)
     }
 
+    pub fn with_capacity_limits(
+        run_id: &str,
+        identity: OwnedProcessIdentity,
+        memory_max: u64,
+        runtime_max_usec: u64,
+    ) -> Result<Self> {
+        let mut plan = Self::with_limits(
+            run_id,
+            identity,
+            128 * 1024 * 1024,
+            runtime_max_usec,
+            "Nemor Phase 10 bounded capacity benchmark worker",
+        )?;
+        plan.memory_max = memory_max;
+        plan.contract = TransientScopeContract::CapacityBenchmark;
+        plan.validate()?;
+        Ok(plan)
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_unit_name(&self.unit_name)?;
         let memory_limit_valid = match self.contract {
@@ -313,11 +333,17 @@ impl TransientScopePlan {
             TransientScopeContract::ProgressivePressure => {
                 self.memory_max <= 16 * 1024 * 1024 * 1024
             }
+            TransientScopeContract::CapacityBenchmark => self.memory_max <= 16 * 1024 * 1024 * 1024,
+        };
+        let runtime_limit_valid = match self.contract {
+            TransientScopeContract::CapacityBenchmark => {
+                (120_000_000..=600_000_000).contains(&self.runtime_max_usec)
+            }
+            _ => (15_000_000..=120_000_000).contains(&self.runtime_max_usec),
         };
         if self.memory_max == 0
             || !memory_limit_valid
-            || self.runtime_max_usec < 15_000_000
-            || self.runtime_max_usec > 120_000_000
+            || !runtime_limit_valid
             || !self.memory_accounting
             || !self.cpu_accounting
             || !self.io_accounting

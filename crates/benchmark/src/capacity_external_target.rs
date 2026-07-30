@@ -373,7 +373,6 @@ pub fn run_target_worker(
             transaction_root: transaction_root.to_path_buf(),
             state: CapacityExternalTargetState::Ready,
         })?;
-    write_private_atomic(&descriptor_path, &serde_json::to_vec_pretty(&descriptor)?)?;
     let active = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
     let hot_cycles = Arc::new(AtomicU64::new(0));
@@ -397,10 +396,28 @@ pub fn run_target_worker(
         Duration::from_millis(100),
     );
     let started = Instant::now();
-    let mut sequence = 0;
+    // The descriptor is the readiness commit.  Publish a complete, fsynced
+    // Ready progress record first so a controller that can observe the
+    // descriptor can also immediately validate the initial runtime state.
+    let mut sequence = 1;
     let mut controlled_refaults = 0;
     let mut cold_cycles = 0;
     let mut state = CapacityExternalTargetState::Ready;
+    write_progress(
+        &progress_path,
+        session_id,
+        nonce,
+        state,
+        sequence,
+        &hot_cycles,
+        &warm_cycles,
+        &hot_pages,
+        &warm_pages,
+        cold_cycles,
+        controlled_refaults,
+        &initial,
+    )?;
+    write_private_atomic(&descriptor_path, &serde_json::to_vec_pretty(&descriptor)?)?;
     while started.elapsed() < Duration::from_millis(CAPACITY_EXTERNAL_TARGET_RUNTIME_MS) {
         if let Some(command) = read_command(&transaction_root.join("command-start.json"), nonce)? {
             if !matches!(command, CapacityExternalTargetCommand::Start { .. })

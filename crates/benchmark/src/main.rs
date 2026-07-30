@@ -241,6 +241,18 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
+    CapacityBenchmarkRecoveryPreflight {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    RecoverCapacityBenchmark {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        idempotence_check: bool,
+    },
     PressurePreflight {
         #[arg(long)]
         manifest: PathBuf,
@@ -837,6 +849,27 @@ fn run() -> Result<i32> {
                     1
                 },
             );
+        }
+        Command::CapacityBenchmarkRecoveryPreflight { manifest, json } => {
+            let report =
+                nemor_benchmark::capacity_benchmark::capacity_benchmark_recovery_preflight(
+                    &manifest,
+                )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::RecoverCapacityBenchmark {
+            manifest,
+            idempotence_check,
+        } => {
+            let report = nemor_benchmark::capacity_benchmark::recover_capacity_benchmark(
+                &manifest,
+                idempotence_check,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::PressurePreflight { manifest, json } => {
             let report = nemor_benchmark::pressure_live::pressure_preflight(&manifest)?;

@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,6 +58,24 @@ pub const COMPOSITION_LEVEL_TIMEOUT_MS: u64 = 25_000;
 pub const COMPOSITION_RUN_TIMEOUT_MS: u64 = 90_000;
 const HARNESS_REPORT: &str = "/tmp/nemor-privileged-validation-report.json";
 const HARNESS_STATE: &str = "/tmp/nemor-privileged-validation";
+
+struct ExactSocketGuard {
+    path: PathBuf,
+    output_root: PathBuf,
+}
+
+impl Drop for ExactSocketGuard {
+    fn drop(&mut self) {
+        if self.path.parent() != Some(self.output_root.as_path()) {
+            return;
+        }
+        if let Ok(meta) = fs::symlink_metadata(&self.path) {
+            if meta.file_type().is_socket() {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityPressureCompositionContract {
@@ -924,7 +942,7 @@ fn now_ns() -> Result<u128> {
         .as_nanos())
 }
 
-fn mem_available_bytes() -> Result<u64> {
+pub(crate) fn mem_available_bytes() -> Result<u64> {
     let meminfo = fs::read_to_string("/proc/meminfo").context("read /proc/meminfo")?;
     let kib = meminfo
         .lines()
@@ -936,7 +954,7 @@ fn mem_available_bytes() -> Result<u64> {
     kib.checked_mul(1024).context("MemAvailable overflow")
 }
 
-fn processes_contain(needle: &str) -> bool {
+pub(crate) fn processes_contain(needle: &str) -> bool {
     let Ok(entries) = fs::read_dir("/proc") else {
         return true;
     };
@@ -996,13 +1014,138 @@ fn ipc_identity(
     )
 }
 
+struct ExactTargetGuard {
+    child: Option<Child>,
+    root: PathBuf,
+    nonce: String,
+    pid: u32,
+    start_ticks: u64,
+}
+
+impl ExactTargetGuard {
+    fn child_mut(&mut self) -> Result<&mut Child> {
+        self.child.as_mut().context("target child already reaped")
+    }
+
+    fn stop_and_reap(&mut self) -> Result<std::process::ExitStatus> {
+        let _ = write_command(
+            &self.root,
+            &CapacityExternalTargetCommand::Stop {
+                nonce: self.nonce.clone(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = self.child_mut()?.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                if proc_start_ticks(self.pid)? == Some(self.start_ticks) {
+                    self.child_mut()?.kill()?;
+                }
+                break self.child_mut()?.wait()?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        self.child = None;
+        Ok(status)
+    }
+
+    fn cleanup(&mut self) -> Result<std::process::ExitStatus> {
+        let status = self.stop_and_reap()?;
+        if self.root.exists() {
+            remove_target_root(&self.root)?;
+        }
+        Ok(status)
+    }
+}
+
+impl Drop for ExactTargetGuard {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        let _ = write_command(
+            &self.root,
+            &CapacityExternalTargetCommand::Stop {
+                nonce: self.nonce.clone(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if self
+                .child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok())
+                .flatten()
+                .is_some()
+            {
+                self.child = None;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.child.is_some()
+            && proc_start_ticks(self.pid).ok().flatten() == Some(self.start_ticks)
+        {
+            let _ = self.child.as_mut().expect("checked").kill();
+            let _ = self.child.as_mut().expect("checked").wait();
+            self.child = None;
+        }
+        if self.child.is_none() && self.root.exists() {
+            let _ = remove_target_root(&self.root);
+        }
+    }
+}
+
+fn wait_initial_target_progress(
+    descriptor: &CapacityExternalTargetDescriptor,
+    timeout: Duration,
+) -> Result<CapacityExternalTargetProgress> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match read_progress(&descriptor.payload.progress_path) {
+            Ok(progress) => {
+                if progress.protocol_version != descriptor.payload.contract.protocol_version
+                    || progress.target_session_id != descriptor.payload.identity.target_session_id
+                    || progress.nonce != descriptor.payload.identity.nonce
+                    || progress.state != CapacityExternalTargetState::Ready
+                    || progress.sequence == 0
+                    || [
+                        progress.hot_fingerprint.clone(),
+                        progress.warm_fingerprint.clone(),
+                        progress.cold_fingerprint.clone(),
+                    ] != descriptor.payload.mapping_content_identities
+                    || proc_start_ticks(descriptor.payload.identity.pid)?
+                        != Some(descriptor.payload.identity.start_ticks)
+                {
+                    bail!("external target initial progress identity mismatch");
+                }
+                return Ok(progress);
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.context("external target initial readiness")),
+        }
+        if Instant::now() >= deadline {
+            bail!("external target initial progress readiness timeout");
+        }
+    }
+}
+
 fn spawn_target(
     payload: &CapacityCompositionPayload,
     root: &Path,
     transaction_id: &str,
     session_id: &str,
     nonce: &str,
-) -> Result<(Child, CapacityExternalTargetDescriptor)> {
+) -> Result<(ExactTargetGuard, CapacityExternalTargetDescriptor)> {
     fs::create_dir(root)?;
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
     let creator_pid = std::process::id();
@@ -1034,19 +1177,45 @@ fn spawn_target(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let descriptor_path = root.join("target-descriptor.json");
-    wait_for_path(&descriptor_path, Duration::from_secs(5))?;
-    let descriptor: CapacityExternalTargetDescriptor =
-        serde_json::from_slice(&fs::read(&descriptor_path)?)?;
-    descriptor.validate_integrity()?;
-    if descriptor.payload.identity.creator_pid != creator_pid
-        || descriptor.payload.identity.creator_start_ticks != creator_ticks
-        || descriptor.payload.identity.executable_sha256 != payload.target_binary.sha256
-        || descriptor.payload.identity.embedded_source_commit != payload.provenance.git_head
-    {
-        bail!("composition target exact identity mismatch");
+    let pid = child.id();
+    let start_ticks = proc_start_ticks(pid)?.context("target start ticks unavailable")?;
+    let mut guard = ExactTargetGuard {
+        child: Some(child),
+        root: root.to_path_buf(),
+        nonce: nonce.to_owned(),
+        pid,
+        start_ticks,
+    };
+    let result = (|| {
+        let descriptor_path = root.join("target-descriptor.json");
+        wait_for_path(&descriptor_path, Duration::from_secs(5))?;
+        let descriptor: CapacityExternalTargetDescriptor =
+            serde_json::from_slice(&fs::read(&descriptor_path)?)?;
+        descriptor.validate_integrity()?;
+        if descriptor.payload.identity.creator_pid != creator_pid
+            || descriptor.payload.identity.creator_start_ticks != creator_ticks
+            || descriptor.payload.identity.executable_sha256 != payload.target_binary.sha256
+            || descriptor.payload.identity.embedded_source_commit != payload.provenance.git_head
+            || descriptor.payload.identity.pid != pid
+            || descriptor.payload.identity.start_ticks != start_ticks
+        {
+            bail!("composition target exact identity mismatch");
+        }
+        wait_initial_target_progress(&descriptor, Duration::from_secs(2))?;
+        Ok(descriptor)
+    })();
+    match result {
+        Ok(descriptor) => Ok((guard, descriptor)),
+        Err(error) => {
+            let cleanup = guard.cleanup().err();
+            match cleanup {
+                Some(cleanup) => {
+                    Err(error.context(format!("target cleanup also failed: {cleanup:#}")))
+                }
+                None => Err(error),
+            }
+        }
     }
-    Ok((child, descriptor))
 }
 
 fn remove_target_root(root: &Path) -> Result<()> {
@@ -1086,7 +1255,7 @@ fn target_for_level(
     let root = payload
         .output_root
         .join(format!("target-r{}-l{}", run.order_index, level_index));
-    let (mut child, descriptor) =
+    let (mut guard, descriptor) =
         spawn_target(payload, &root, &transaction_id, &session_id, &nonce)?;
     let before = read_progress(&descriptor.payload.progress_path)?;
     if before.cold_cycles != 0 {
@@ -1185,7 +1354,7 @@ fn target_for_level(
             },
         );
     }
-    let status = child.wait()?;
+    let status = guard.stop_and_reap()?;
     let after = read_progress(&descriptor.payload.progress_path)?;
     fs::copy(&descriptor_path, level_dir.join("target-descriptor.json"))?;
     write_new_json(&level_dir.join("target-progress.json"), &after)?;
@@ -1556,6 +1725,10 @@ pub fn execute_capacity_composition_payload(
         let socket = payload
             .output_root
             .join(format!("pressure-{}.sock", run.order_index));
+        let _socket_guard = ExactSocketGuard {
+            path: socket.clone(),
+            output_root: payload.output_root.clone(),
+        };
         let mut child = Command::new(&payload.runner_path)
             .args([
                 "pressure-worker",
@@ -1583,12 +1756,25 @@ pub fn execute_capacity_composition_payload(
             pid,
             start_ticks: ticks,
         };
-        let plan = TransientScopePlan::with_pressure_limits(
-            &run_id,
-            identity,
-            payload.pressure_memory_max_bytes,
-            100_000_000,
-        )?;
+        let plan = if expected_levels_per_run > 3 {
+            // Ten levels include transition, stabilization, a fresh target
+            // lifecycle and cleanup.  Keep the historical three-level
+            // composition contract at 100 s, while freezing a bounded
+            // capacity-only 300 s scope.
+            TransientScopePlan::with_capacity_limits(
+                &run_id,
+                identity,
+                payload.pressure_memory_max_bytes,
+                300_000_000,
+            )?
+        } else {
+            TransientScopePlan::with_pressure_limits(
+                &run_id,
+                identity,
+                payload.pressure_memory_max_bytes,
+                100_000_000,
+            )?
+        };
         let mut systemd = SystemdDbusBackend::system()?;
         let scope = systemd.start_owned_scope(&plan)?;
         scope.verify(&plan)?;
@@ -1683,6 +1869,24 @@ pub fn execute_capacity_composition_payload(
                 oom_kill,
                 level_restore,
             );
+            let valid_unsustainable_health = expected_levels_per_run > 3
+                && acknowledgement.actual_touched_bytes == level.target_touched_bytes
+                && pressure_heartbeat
+                && worker_alive
+                && oom == 0
+                && oom_kill == 0
+                && target.fingerprints_valid
+                && target.descriptor_consumed_once
+                && target.cleanup_passed
+                && level_restore
+                && (!target.hot_progress || !target.warm_progress);
+            let classification = if sustainable {
+                CompositionLevelClassification::Sustainable
+            } else if valid_unsustainable_health {
+                CompositionLevelClassification::UnsustainableHealth
+            } else {
+                CompositionLevelClassification::InvalidEvidence
+            };
             let level_evidence = CapacityCompositionLevelEvidence {
                 version: COMPOSITION_LEVEL_EVIDENCE_VERSION,
                 run_order: run.order_index,
@@ -1708,11 +1912,7 @@ pub fn execute_capacity_composition_payload(
                 oom_kill,
                 watchdog_triggered: false,
                 target,
-                classification: if sustainable {
-                    CompositionLevelClassification::Sustainable
-                } else {
-                    CompositionLevelClassification::InvalidEvidence
-                },
+                classification,
                 cleanup_passed: true,
                 structural_restore_passed: level_restore,
             };
@@ -1746,10 +1946,18 @@ pub fn execute_capacity_composition_payload(
             Duration::from_secs(5),
         );
         let restored = StructuralSnapshot::capture().matches(&before);
-        let run_pass = levels.len() == expected_levels_per_run
+        let all_sustainable = levels.len() == expected_levels_per_run
             && levels
                 .iter()
-                .all(|level| level.classification == CompositionLevelClassification::Sustainable)
+                .all(|level| level.classification == CompositionLevelClassification::Sustainable);
+        let observed_boundary = expected_levels_per_run > 3
+            && levels.last().is_some_and(|level| {
+                level.classification == CompositionLevelClassification::UnsustainableHealth
+            })
+            && levels[..levels.len().saturating_sub(1)]
+                .iter()
+                .all(|level| level.classification == CompositionLevelClassification::Sustainable);
+        let run_pass = (all_sustainable || observed_boundary)
             && worker_status.success()
             && scope_cleanup.passed()
             && restored;
@@ -1769,7 +1977,11 @@ pub fn execute_capacity_composition_payload(
             scope_cleanup,
             structural_restore_passed: restored,
             reason: if run_pass {
-                format!("all {expected_levels_per_run} composition levels sustainable")
+                if observed_boundary {
+                    "valid capacity UnsustainableHealth boundary observed".into()
+                } else {
+                    format!("all {expected_levels_per_run} composition levels sustainable")
+                }
             } else {
                 "composition run mandatory evidence failed".into()
             },
@@ -1782,7 +1994,9 @@ pub fn execute_capacity_composition_payload(
         }
         persist_execution(&payload.output_root, &evidence)?;
     }
-    if evidence.completed_runs == 6 && evidence.completed_levels == 6 * expected_levels_per_run {
+    if evidence.completed_runs == 6
+        && (expected_levels_per_run > 3 || evidence.completed_levels == 6 * expected_levels_per_run)
+    {
         evidence.state = successful_state;
         evidence.reason = format!(
             "6/6 runs and {}/{} composition levels passed",

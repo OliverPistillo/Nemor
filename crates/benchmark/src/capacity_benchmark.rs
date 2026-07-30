@@ -5,31 +5,40 @@ use crate::capacity_composition::{
     CapacityCompositionPayload, CompositionExperimentState, CompositionLevelClassification,
     CompositionRunPlan, PreparedCapacityCompositionManifest,
 };
+use crate::capacity_external_validation::ExternalTargetExecutionReport;
 use crate::capacity_orchestration::CapacityComponent;
 use crate::pressure::{PlannedLevelState, PlannedPressureLevel};
 use crate::pressure_prepare::{derive_memory_max, paired_run_seed};
-use crate::{deterministic_order, BenchmarkVariant, EvaluationState, BUILD_GIT_HEAD};
+use crate::systemd::SystemdDbusBackend;
+use crate::{
+    deterministic_order, BenchmarkVariant, BuildProvenance, EnvironmentFingerprint,
+    EvaluationState, BUILD_GIT_HEAD,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CAPACITY_BENCHMARK_CONTRACT_VERSION: u32 = 1;
 pub const CAPACITY_SEARCH_POLICY_VERSION: u32 = 1;
-pub const CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION: u32 = 1;
-pub const CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION: u32 = 1;
-pub const CAPACITY_BENCHMARK_RUN_VERSION: u32 = 1;
-pub const CAPACITY_BENCHMARK_LEVEL_VERSION: u32 = 1;
-pub const CAPACITY_EVALUATION_VERSION: u32 = 1;
+pub const CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION: u32 = 2;
+pub const CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION: u32 = 2;
+pub const CAPACITY_BENCHMARK_RUN_VERSION: u32 = 2;
+pub const CAPACITY_BENCHMARK_LEVEL_VERSION: u32 = 2;
+pub const CAPACITY_EVALUATION_VERSION: u32 = 2;
 pub const CAPACITY_BENCHMARK_MANIFEST_NAME: &str = "capacity-benchmark.manifest.json";
 pub const ALIGNMENT_BYTES: u64 = 16 * 1024 * 1024;
 pub const LEVEL_COUNT: usize = 10;
 pub const FAVORABLE_CAPACITY_TARGET_PERCENT: i64 = 30;
+pub const CAPACITY_SCOPE_RUNTIME_MAX_USEC: u64 = 300_000_000;
+pub const CAPACITY_LEVEL_TIMEOUT_MS: u64 = 30_000;
+pub const CAPACITY_RUN_TIMEOUT_MS: u64 = 280_000;
 
 fn hash_json<T: Serialize>(value: &T) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
@@ -127,6 +136,9 @@ pub struct CapacityBenchmarkPayload {
     pub target_percent: i64,
     pub target_source: String,
     pub target_status: CapacityTargetStatus,
+    pub capacity_scope_runtime_max_usec: u64,
+    pub per_level_timeout_ms: u64,
+    pub per_run_timeout_ms: u64,
     pub output_root: PathBuf,
     pub report_path: PathBuf,
     pub evaluation_path: PathBuf,
@@ -163,6 +175,11 @@ impl PreparedCapacityBenchmarkManifest {
             || self.payload.request_oom
             || self.payload.production_activation_authorized
             || self.payload.effectiveness_evaluation != EvaluationState::NotEvaluated
+            || self.payload.capacity_scope_runtime_max_usec != CAPACITY_SCOPE_RUNTIME_MAX_USEC
+            || self.payload.per_level_timeout_ms != CAPACITY_LEVEL_TIMEOUT_MS
+            || self.payload.per_run_timeout_ms != CAPACITY_RUN_TIMEOUT_MS
+            || self.payload.per_run_timeout_ms.saturating_mul(6)
+                > self.payload.search_policy.total_timeout_ms
         {
             bail!("capacity benchmark manifest contract mismatch");
         }
@@ -268,6 +285,7 @@ pub struct CapacityEvaluation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapacityBenchmarkExecutionEvidence {
     pub schema_version: u32,
+    pub state: CapacityBenchmarkState,
     pub experiment_id: String,
     pub source_commit: String,
     pub invocation_count: u32,
@@ -278,7 +296,45 @@ pub struct CapacityBenchmarkExecutionEvidence {
     pub structural_restore_passed: bool,
     pub effectiveness_evaluation: EvaluationState,
     pub production_activation_authorized: bool,
+    pub primary_error: Option<String>,
+    pub secondary_errors: Vec<String>,
     pub payload_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityBenchmarkState {
+    Running,
+    Complete,
+    Censored,
+    Incomplete,
+    Invalid,
+}
+
+impl CapacityBenchmarkExecutionEvidence {
+    pub fn seal(mut self) -> Result<Self> {
+        self.payload_sha256.clear();
+        self.payload_sha256 = hash_json(&self)?;
+        Ok(self)
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let mut candidate = self.clone();
+        let frozen = candidate.payload_sha256.clone();
+        candidate.payload_sha256.clear();
+        if self.schema_version != CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION
+            || frozen != hash_json(&candidate)?
+            || self.effectiveness_evaluation != EvaluationState::NotEvaluated
+            || self.production_activation_authorized
+            || matches!(
+                self.state,
+                CapacityBenchmarkState::Complete | CapacityBenchmarkState::Censored
+            ) && (!self.cleanup_passed || !self.structural_restore_passed)
+        {
+            bail!("capacity benchmark execution evidence contract mismatch");
+        }
+        Ok(())
+    }
 }
 
 pub fn safe_search_ceiling(effective_maximum: u64) -> Result<u64> {
@@ -335,6 +391,56 @@ fn prerequisite(
         source_commit,
         identity,
     })
+}
+
+fn verify_all_sums(archive: &Path) -> Result<()> {
+    let sums = fs::read_to_string(archive.join("SHA256SUMS"))?;
+    for line in sums.lines() {
+        let (expected, relative) = line
+            .split_once("  ")
+            .context("malformed prerequisite SHA256SUMS")?;
+        let path = archive.join(relative);
+        if path.canonicalize()?.strip_prefix(archive).is_err() || hash_file(&path)? != expected {
+            bail!("capacity prerequisite archive checksum mismatch");
+        }
+    }
+    Ok(())
+}
+
+fn verify_archive(prerequisite: &CapacityPrerequisite, report_name: &str) -> Result<()> {
+    let archive = prerequisite.archive.canonicalize()?;
+    if archive != prerequisite.archive
+        || hash_file(&archive.join("manifest.json"))? != prerequisite.manifest_sha256
+        || hash_file(&archive.join(report_name))? != prerequisite.report_sha256
+        || hash_file(&archive.join("SHA256SUMS"))? != prerequisite.sha256sums_sha256
+    {
+        bail!("capacity prerequisite frozen identity mismatch");
+    }
+    verify_all_sums(&archive)?;
+    let report_bytes = fs::read(archive.join(report_name))?;
+    match report_name {
+        "external-target-validation.json" => {
+            let report: ExternalTargetExecutionReport = serde_json::from_slice(&report_bytes)?;
+            report.verify()?;
+        }
+        "experiment-report.json" => {
+            let report: CapacityCompositionExecutionEvidence =
+                serde_json::from_slice(&report_bytes)?;
+            report.verify()?;
+        }
+        _ => bail!("unsupported capacity prerequisite report"),
+    }
+    let status = fs::read_to_string(archive.join("STATUS"))?;
+    if !status.lines().any(|line| {
+        line == "classification=PASS"
+            || line == "classification=COMPLETED_COMPOSITION_FRAMEWORK_VALIDATION"
+    }) || !status.contains("production_activation=false")
+        || !status.contains("cleanup=PASS")
+        || !status.contains("structural_restore=PASS")
+    {
+        bail!("capacity prerequisite final PASS/cleanup/restore contract mismatch");
+    }
+    Ok(())
 }
 
 pub fn prepare_capacity_benchmark(
@@ -429,6 +535,9 @@ pub fn prepare_capacity_benchmark(
         target_percent: FAVORABLE_CAPACITY_TARGET_PERCENT,
         target_source: "NEMOR_PROJECT_MASTER favorable capacity gain at least 30%".into(),
         target_status: CapacityTargetStatus::Indeterminate,
+        capacity_scope_runtime_max_usec: CAPACITY_SCOPE_RUNTIME_MAX_USEC,
+        per_level_timeout_ms: CAPACITY_LEVEL_TIMEOUT_MS,
+        per_run_timeout_ms: CAPACITY_RUN_TIMEOUT_MS,
         output_root: output_root.to_path_buf(),
         report_path: output_root.join("capacity-benchmark.report.json"),
         evaluation_path: output_root.join("capacity-evaluation.json"),
@@ -458,44 +567,101 @@ pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPref
     let verified = manifest.verify().is_ok();
     let payload = &manifest.payload;
     let current = std::env::current_exe()?.canonicalize()?;
+    let current_provenance = BuildProvenance::capture()?;
     let source_and_binaries_verified = BUILD_GIT_HEAD
         == payload.composition_payload.provenance.git_head
+        && current_provenance.clean_release_eligible()
+        && current_provenance.source_state_id
+            == payload.composition_payload.provenance.source_state_id
         && current == payload.composition_payload.runner_path
         && hash_file(&current)? == payload.composition_payload.runner_binary.sha256
         && hash_file(&payload.composition_payload.target_path)?
             == payload.composition_payload.target_binary.sha256
         && hash_file(&payload.composition_payload.validator_path)?
             == payload.composition_payload.validator_binary.sha256;
+    let loaded = common::LoadedConfig::load(&payload.composition_payload.config_path)?;
+    let environment = EnvironmentFingerprint::capture_for_performance(
+        &loaded.sha256,
+        &payload.composition_payload.provenance.git_head,
+    )?;
+    let material_environment_match = loaded.sha256 == payload.composition_payload.config_sha256
+        && environment.material_hash()? == payload.composition_payload.material_environment_hash;
+    let external_target_prerequisite_verified = payload.external_target_prerequisite.source_commit
+        == BUILD_GIT_HEAD
+        && verify_archive(
+            &payload.external_target_prerequisite,
+            "external-target-validation.json",
+        )
+        .is_ok();
+    let composition_prerequisite_verified = payload.composition_prerequisite.source_commit
+        == BUILD_GIT_HEAD
+        && verify_archive(&payload.composition_prerequisite, "experiment-report.json").is_ok();
     let output_fresh = fs::read_dir(&payload.output_root)?.next().is_none();
-    let stale_resources_clear = !Path::new("/tmp/nemor-privileged-validation-report.json").exists();
+    let stale_resources_clear = !Path::new("/tmp/nemor-privileged-validation-report.json").exists()
+        && !super::capacity_composition::processes_contain("pressure-worker")
+        && !super::capacity_composition::processes_contain("capacity-external-target-worker")
+        && !payload.output_root.join("pressure-0.sock").exists();
     let root = nix::unistd::geteuid().is_root();
-    let ready =
-        verified && source_and_binaries_verified && output_fresh && stale_resources_clear && root;
+    let identity_authorized = root
+        && std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            == Some(payload.composition_payload.preparing_uid)
+        && std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            == Some(payload.composition_payload.preparing_gid);
+    let current_mem = super::capacity_composition::mem_available_bytes()?;
+    let recomputed_ceiling = safe_search_ceiling(
+        payload
+            .composition_payload
+            .headroom
+            .pressure_effective_maximum_bytes,
+    )?;
+    let headroom_safe = current_mem
+        >= payload
+            .composition_payload
+            .pressure_memory_max_bytes
+            .saturating_add(payload.composition_payload.headroom.fixed_reserve_bytes);
+    let ownership_plan_supported = payload.composition_payload.preparing_uid != 0
+        && payload.composition_payload.preparing_gid != 0
+        && payload
+            .output_root
+            .starts_with("/tmp/nemor-capacity-benchmark-");
+    let ready = verified
+        && source_and_binaries_verified
+        && material_environment_match
+        && external_target_prerequisite_verified
+        && composition_prerequisite_verified
+        && recomputed_ceiling == payload.safe_search_ceiling_bytes
+        && headroom_safe
+        && ownership_plan_supported
+        && output_fresh
+        && stale_resources_clear
+        && identity_authorized;
     Ok(CapacityBenchmarkPreflight {
         schema_version: CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION,
         manifest_verified: verified,
         source_and_binaries_verified,
-        material_environment_match: true,
-        external_target_prerequisite_verified: payload.external_target_prerequisite.source_commit
-            == BUILD_GIT_HEAD,
-        composition_prerequisite_verified: payload.composition_prerequisite.source_commit
-            == BUILD_GIT_HEAD,
+        material_environment_match,
+        external_target_prerequisite_verified,
+        composition_prerequisite_verified,
         exact_profile_supported: payload.contract.exact_profile
             == CapacityBenchmarkContract::v1().exact_profile,
         search_policy_supported: payload.search_policy == CapacitySearchPolicy::v1(),
         run_plan_supported: payload.composition_payload.run_plan.len() == 6,
         level_ladder_supported: payload.levels
             == capacity_ladder(payload.safe_search_ceiling_bytes)?,
-        headroom_safe: true,
+        headroom_safe,
         memory_max_safe: payload.composition_payload.pressure_memory_max_bytes
             <= payload
                 .composition_payload
                 .headroom
                 .pressure_effective_maximum_bytes,
-        ownership_plan_supported: true,
+        ownership_plan_supported,
         output_fresh,
         stale_resources_clear,
-        current_identity_authorized: root,
+        current_identity_authorized: identity_authorized,
         bounded_capacity_benchmark_entry_ready: ready,
         execution_ready: ready,
         preflight_mutated: false,
@@ -545,6 +711,31 @@ fn median_u64(mut values: Vec<u64>) -> Option<u64> {
     values.get(values.len() / 2).copied()
 }
 
+fn median_i64(mut values: Vec<i64>) -> Option<i64> {
+    values.sort_unstable();
+    values.get(values.len() / 2).copied()
+}
+
+fn percent_floor(numerator: i128, denominator: u64) -> Option<i64> {
+    if denominator == 0 {
+        return None;
+    }
+    let denominator = i128::from(denominator);
+    let scaled = numerator.checked_mul(100)?;
+    let quotient = scaled.div_euclid(denominator);
+    i64::try_from(quotient).ok()
+}
+
+fn percent_ceil(numerator: i128, denominator: u64) -> Option<i64> {
+    if denominator == 0 {
+        return None;
+    }
+    let denominator = i128::from(denominator);
+    let scaled = numerator.checked_mul(100)?;
+    let quotient = -((-scaled).div_euclid(denominator));
+    i64::try_from(quotient).ok()
+}
+
 fn evaluate(
     composition: &CapacityCompositionExecutionEvidence,
     ceiling: u64,
@@ -567,6 +758,12 @@ fn evaluate(
             let c = &boundaries[ci];
             let bl = b.highest_sustainable_bytes.unwrap_or(0);
             let cl = c.highest_sustainable_bytes.unwrap_or(0);
+            let conservative = b.first_unsustainable_bytes.and_then(|baseline_upper| {
+                percent_floor(i128::from(cl) - i128::from(baseline_upper), baseline_upper)
+            });
+            let possible = c.first_unsustainable_bytes.and_then(|capacity_upper| {
+                percent_ceil(i128::from(capacity_upper) - i128::from(bl), bl)
+            });
             pairs.push(CapacityPairEvaluation {
                 repetition_index: repetition,
                 baseline_lower_bound_bytes: bl,
@@ -577,8 +774,8 @@ fn evaluate(
                 capacity_censored: c.right_censored,
                 demonstrated_delta_bytes: i64::try_from(cl).unwrap_or(i64::MAX)
                     - i64::try_from(bl).unwrap_or(i64::MAX),
-                conservative_gain_lower_bound_percent: None,
-                possible_gain_upper_bound_percent: None,
+                conservative_gain_lower_bound_percent: conservative,
+                possible_gain_upper_bound_percent: possible,
                 valid: b.valid_for_capacity_evaluation && c.valid_for_capacity_evaluation,
             });
         }
@@ -590,12 +787,12 @@ fn evaluate(
             .any(|pair| pair.baseline_censored || pair.capacity_censored);
     let baseline = median_u64(pairs.iter().map(|p| p.baseline_lower_bound_bytes).collect());
     let capacity = median_u64(pairs.iter().map(|p| p.capacity_lower_bound_bytes).collect());
-    let delta = match (baseline, capacity) {
-        (Some(b), Some(c)) => {
-            Some(i64::try_from(c).unwrap_or(i64::MAX) - i64::try_from(b).unwrap_or(i64::MAX))
-        }
-        _ => None,
-    };
+    let delta = median_i64(
+        pairs
+            .iter()
+            .map(|pair| pair.demonstrated_delta_bytes)
+            .collect(),
+    );
     let demonstrated = match (baseline, capacity) {
         (Some(b), Some(c)) if b > 0 && !censored => {
             Some(((c as i128 - b as i128) * 100 / b as i128) as i64)
@@ -609,6 +806,32 @@ fn evaluate(
     } else {
         CapacityEvaluationState::Complete
     };
+    let conservative = if all_valid {
+        let values: Vec<_> = pairs
+            .iter()
+            .filter_map(|pair| pair.conservative_gain_lower_bound_percent)
+            .collect();
+        (values.len() == 3).then(|| median_i64(values)).flatten()
+    } else {
+        None
+    };
+    let possible = if all_valid {
+        let values: Vec<_> = pairs
+            .iter()
+            .filter_map(|pair| pair.possible_gain_upper_bound_percent)
+            .collect();
+        (values.len() == 3).then(|| median_i64(values)).flatten()
+    } else {
+        None
+    };
+    let target_status =
+        if conservative.is_some_and(|value| value >= FAVORABLE_CAPACITY_TARGET_PERCENT) {
+            CapacityTargetStatus::DefinitivelyMet
+        } else if possible.is_some_and(|value| value < FAVORABLE_CAPACITY_TARGET_PERCENT) {
+            CapacityTargetStatus::DefinitivelyNotMet
+        } else {
+            CapacityTargetStatus::Indeterminate
+        };
     (
         boundaries,
         CapacityEvaluation {
@@ -619,11 +842,11 @@ fn evaluate(
             median_capacity_demonstrated_bytes: capacity,
             median_paired_demonstrated_delta_bytes: delta,
             demonstrated_capacity_gain_percent: demonstrated,
-            conservative_gain_lower_bound_percent: None,
-            possible_gain_upper_bound_percent: None,
+            conservative_gain_lower_bound_percent: conservative,
+            possible_gain_upper_bound_percent: possible,
             target_percent: Some(FAVORABLE_CAPACITY_TARGET_PERCENT),
             target_source: "NEMOR_PROJECT_MASTER favorable capacity gain at least 30%".into(),
-            target_status: CapacityTargetStatus::Indeterminate,
+            target_status,
             statistical_limitation: "three matched pairs; no broad statistical significance".into(),
         },
     )
@@ -635,15 +858,117 @@ pub fn execute_capacity_benchmark(path: &Path) -> Result<CapacityBenchmarkExecut
     if !capacity_benchmark_preflight(path)?.bounded_capacity_benchmark_entry_ready {
         bail!("capacity benchmark bounded entry is not ready");
     }
-    let composition = execute_capacity_composition_payload(
+    let blank_composition = || CapacityCompositionExecutionEvidence {
+        schema_version: crate::capacity_composition::COMPOSITION_EXECUTION_SCHEMA_VERSION,
+        experiment_id: manifest.payload.experiment_id.clone(),
+        source_commit: BUILD_GIT_HEAD.into(),
+        state: CompositionExperimentState::Running,
+        reason: "capacity benchmark execution starting".into(),
+        runs: Vec::new(),
+        planned_runs: 6,
+        completed_runs: 0,
+        planned_levels: 6 * LEVEL_COUNT,
+        completed_levels: 0,
+        invocation_count: 1,
+        search_complete: false,
+        capacity_evaluation: EvaluationState::NotEvaluated,
+        effectiveness_evaluation: EvaluationState::NotEvaluated,
+        production_activation_authorized: false,
+        cleanup_passed: false,
+        structural_restore_passed: false,
+        payload_sha256: String::new(),
+    };
+    let invalid_evaluation = || CapacityEvaluation {
+        version: CAPACITY_EVALUATION_VERSION,
+        state: CapacityEvaluationState::Invalid,
+        pairs: Vec::new(),
+        median_baseline_demonstrated_bytes: None,
+        median_capacity_demonstrated_bytes: None,
+        median_paired_demonstrated_delta_bytes: None,
+        demonstrated_capacity_gain_percent: None,
+        conservative_gain_lower_bound_percent: None,
+        possible_gain_upper_bound_percent: None,
+        target_percent: Some(FAVORABLE_CAPACITY_TARGET_PERCENT),
+        target_source: manifest.payload.target_source.clone(),
+        target_status: CapacityTargetStatus::Indeterminate,
+        statistical_limitation: "execution invalid; no capacity inference".into(),
+    };
+    let persist = |evidence: &CapacityBenchmarkExecutionEvidence| -> Result<()> {
+        evidence.verify()?;
+        let temporary = manifest.payload.report_path.with_extension("json.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(evidence)?)?;
+        fs::rename(temporary, &manifest.payload.report_path)?;
+        fs::write(
+            &manifest.payload.evaluation_path,
+            serde_json::to_vec_pretty(&evidence.evaluation)?,
+        )?;
+        Ok(())
+    };
+    let initial = CapacityBenchmarkExecutionEvidence {
+        schema_version: CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION,
+        state: CapacityBenchmarkState::Running,
+        experiment_id: manifest.payload.experiment_id.clone(),
+        source_commit: BUILD_GIT_HEAD.into(),
+        invocation_count: 1,
+        composition_execution: blank_composition(),
+        boundaries: Vec::new(),
+        evaluation: CapacityEvaluation {
+            state: CapacityEvaluationState::NotEvaluated,
+            ..invalid_evaluation()
+        },
+        cleanup_passed: false,
+        structural_restore_passed: false,
+        effectiveness_evaluation: EvaluationState::NotEvaluated,
+        production_activation_authorized: false,
+        primary_error: None,
+        secondary_errors: Vec::new(),
+        payload_sha256: String::new(),
+    }
+    .seal()?;
+    persist(&initial)?;
+    let composition = match execute_capacity_composition_payload(
         &manifest.payload.composition_payload,
         LEVEL_COUNT,
         CompositionExperimentState::CompletedCompositionFrameworkValidation,
-    )?;
+    ) {
+        Ok(composition) => composition,
+        Err(error) => {
+            let composition = fs::read(&manifest.payload.composition_payload.report_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_else(blank_composition);
+            let evidence = CapacityBenchmarkExecutionEvidence {
+                schema_version: CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION,
+                state: CapacityBenchmarkState::Invalid,
+                experiment_id: manifest.payload.experiment_id.clone(),
+                source_commit: BUILD_GIT_HEAD.into(),
+                invocation_count: 1,
+                cleanup_passed: composition.cleanup_passed,
+                structural_restore_passed: composition.structural_restore_passed,
+                composition_execution: composition,
+                boundaries: Vec::new(),
+                evaluation: invalid_evaluation(),
+                effectiveness_evaluation: EvaluationState::NotEvaluated,
+                production_activation_authorized: false,
+                primary_error: Some(format!("{error:#}")),
+                secondary_errors: Vec::new(),
+                payload_sha256: String::new(),
+            }
+            .seal()?;
+            persist(&evidence)?;
+            return Ok(evidence);
+        }
+    };
     let (boundaries, evaluation) =
         evaluate(&composition, manifest.payload.safe_search_ceiling_bytes);
-    let mut evidence = CapacityBenchmarkExecutionEvidence {
+    let evidence = CapacityBenchmarkExecutionEvidence {
         schema_version: CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION,
+        state: match evaluation.state {
+            CapacityEvaluationState::Complete => CapacityBenchmarkState::Complete,
+            CapacityEvaluationState::Censored => CapacityBenchmarkState::Censored,
+            CapacityEvaluationState::Incomplete => CapacityBenchmarkState::Incomplete,
+            _ => CapacityBenchmarkState::Invalid,
+        },
         experiment_id: manifest.payload.experiment_id.clone(),
         source_commit: BUILD_GIT_HEAD.into(),
         invocation_count: 1,
@@ -654,20 +979,260 @@ pub fn execute_capacity_benchmark(path: &Path) -> Result<CapacityBenchmarkExecut
         evaluation: evaluation.clone(),
         effectiveness_evaluation: EvaluationState::NotEvaluated,
         production_activation_authorized: false,
+        primary_error: None,
+        secondary_errors: Vec::new(),
         payload_sha256: String::new(),
-    };
-    evidence.payload_sha256 = hash_json(&evidence)?;
-    let mut report = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&manifest.payload.report_path)?;
-    serde_json::to_writer_pretty(&mut report, &evidence)?;
-    let mut evaluation_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&manifest.payload.evaluation_path)?;
-    serde_json::to_writer_pretty(&mut evaluation_file, &evaluation)?;
+    }
+    .seal()?;
+    persist(&evidence)?;
     Ok(evidence)
+}
+
+const LINEAGE1_ARCHIVE: &str = "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-benchmark-1-execution-error";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapacityRecoveryPreflight {
+    pub schema_version: u32,
+    pub experiment_id: String,
+    pub manifest_sha256: String,
+    pub archive_verified: bool,
+    pub consumed_lineage: bool,
+    pub exact_processes_absent: bool,
+    pub exact_units_absent: bool,
+    pub exact_cgroups_clear: bool,
+    pub damon_damos_clear: bool,
+    pub stale_socket_paths: Vec<PathBuf>,
+    pub stale_transaction_paths: Vec<PathBuf>,
+    pub exact_paths_verified: bool,
+    pub current_identity_authorized: bool,
+    pub recovery_ready: bool,
+    pub preflight_mutated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapacityRecoveryReport {
+    pub schema_version: u32,
+    pub experiment_id: String,
+    pub removed_sockets: Vec<PathBuf>,
+    pub removed_transactions: Vec<PathBuf>,
+    pub exact_processes_absent: bool,
+    pub exact_units_absent: bool,
+    pub exact_cgroups_clear: bool,
+    pub damon_damos_clear: bool,
+    pub idempotent_clean: bool,
+    pub production_activation_authorized: bool,
+    pub lineage_reexecution_authorized: bool,
+    pub payload_sha256: String,
+}
+
+impl CapacityRecoveryReport {
+    fn seal(mut self) -> Result<Self> {
+        self.payload_sha256.clear();
+        self.payload_sha256 = hash_json(&self)?;
+        Ok(self)
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let mut candidate = self.clone();
+        let frozen = candidate.payload_sha256.clone();
+        candidate.payload_sha256.clear();
+        if frozen != hash_json(&candidate)?
+            || self.production_activation_authorized
+            || self.lineage_reexecution_authorized
+            || !self.idempotent_clean
+        {
+            bail!("capacity recovery evidence contract mismatch");
+        }
+        Ok(())
+    }
+}
+
+fn legacy_capacity_identity(path: &Path) -> Result<(String, PathBuf, u32, u32)> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    let experiment = value
+        .pointer("/payload/experiment_id")
+        .and_then(|value| value.as_str())
+        .context("legacy capacity experiment identity absent")?
+        .to_owned();
+    let output = value
+        .pointer("/payload/output_root")
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from)
+        .context("legacy capacity output root absent")?;
+    let uid = value
+        .pointer("/payload/composition_payload/preparing_uid")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .context("legacy preparing UID absent")?;
+    let gid = value
+        .pointer("/payload/composition_payload/preparing_gid")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .context("legacy preparing GID absent")?;
+    Ok((experiment, output, uid, gid))
+}
+
+fn exact_recovery_paths(output: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let canonical_parent = output.canonicalize()?;
+    if !canonical_parent.starts_with("/tmp/nemor-capacity-benchmark-1-output") {
+        bail!("legacy recovery output root is not the frozen Lineage 1 root");
+    }
+    let mut sockets = Vec::new();
+    let mut transactions = Vec::new();
+    for entry in fs::read_dir(output)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || metadata.nlink() != 1 {
+            bail!("recovery path has symlink or hard-link ambiguity");
+        }
+        if name.starts_with("pressure-")
+            && name.ends_with(".sock")
+            && metadata.file_type().is_socket()
+        {
+            sockets.push(path);
+        } else if name.starts_with("target-r") && metadata.is_dir() {
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                let child_meta = fs::symlink_metadata(child.path())?;
+                if child_meta.file_type().is_symlink()
+                    || child_meta.is_dir()
+                    || child_meta.nlink() != 1
+                {
+                    bail!("recovery transaction contains ambiguous content");
+                }
+            }
+            transactions.push(path);
+        }
+    }
+    sockets.sort();
+    transactions.sort();
+    Ok((sockets, transactions))
+}
+
+pub fn capacity_benchmark_recovery_preflight(
+    manifest_path: &Path,
+) -> Result<CapacityRecoveryPreflight> {
+    let (experiment_id, output_root, preparing_uid, preparing_gid) =
+        legacy_capacity_identity(manifest_path)?;
+    let archive = Path::new(LINEAGE1_ARCHIVE);
+    let archive_verified = hash_file(&archive.join("manifest.json"))? == hash_file(manifest_path)?
+        && verify_all_sums(archive).is_ok()
+        && fs::read_to_string(archive.join("STATUS"))?.contains("classification=EXECUTION_ERROR");
+    let consumed_lineage =
+        fs::read_to_string(archive.join("STATUS"))?.contains("invocation_count=1");
+    let exact_processes_absent = !super::capacity_composition::processes_contain(&experiment_id)
+        && !super::capacity_composition::processes_contain("pressure-worker");
+    let (sockets, transactions) = exact_recovery_paths(&output_root)?;
+    let exact_units_absent = SystemdDbusBackend::system()
+        .and_then(|backend| backend.list_owned_benchmark_units())
+        .map(|units| units.is_empty())
+        .unwrap_or(false);
+    let exact_cgroups_clear = fs::read_dir("/sys/fs/cgroup")
+        .map(|entries| {
+            !entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("nemor-benchmark-")
+            })
+        })
+        .unwrap_or(false);
+    let damon = damon::inspect_linux(Path::new("/"), None);
+    let damos = damos::observe_capability(&damon);
+    let damon_damos_clear = !damon.active_external_session && !damos.external_session_conflict;
+    let root = nix::unistd::geteuid().is_root();
+    let identity_authorized = root
+        && std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            == Some(preparing_uid)
+        && std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            == Some(preparing_gid);
+    let exact_paths_verified = sockets
+        .iter()
+        .chain(&transactions)
+        .all(|path| path.parent() == Some(output_root.as_path()) && !path.is_symlink());
+    let ready = archive_verified
+        && consumed_lineage
+        && exact_processes_absent
+        && exact_units_absent
+        && exact_cgroups_clear
+        && damon_damos_clear
+        && exact_paths_verified
+        && identity_authorized;
+    Ok(CapacityRecoveryPreflight {
+        schema_version: 1,
+        experiment_id,
+        manifest_sha256: hash_file(manifest_path)?,
+        archive_verified,
+        consumed_lineage,
+        exact_processes_absent,
+        exact_units_absent,
+        exact_cgroups_clear,
+        damon_damos_clear,
+        stale_socket_paths: sockets,
+        stale_transaction_paths: transactions,
+        exact_paths_verified,
+        current_identity_authorized: identity_authorized,
+        recovery_ready: ready,
+        preflight_mutated: false,
+    })
+}
+
+pub fn recover_capacity_benchmark(
+    manifest_path: &Path,
+    idempotence_check: bool,
+) -> Result<CapacityRecoveryReport> {
+    let preflight = capacity_benchmark_recovery_preflight(manifest_path)?;
+    if !preflight.recovery_ready {
+        bail!("capacity recovery exact-owned preflight is not ready");
+    }
+    if idempotence_check
+        && (!preflight.stale_socket_paths.is_empty()
+            || !preflight.stale_transaction_paths.is_empty())
+    {
+        bail!("idempotence check refuses pending mutation");
+    }
+    let mut removed_sockets = Vec::new();
+    let mut removed_transactions = Vec::new();
+    if !idempotence_check {
+        for path in &preflight.stale_socket_paths {
+            fs::remove_file(path)?;
+            removed_sockets.push(path.clone());
+        }
+        for root in &preflight.stale_transaction_paths {
+            for entry in fs::read_dir(root)? {
+                fs::remove_file(entry?.path())?;
+            }
+            fs::remove_dir(root)?;
+            removed_transactions.push(root.clone());
+        }
+    }
+    let after = capacity_benchmark_recovery_preflight(manifest_path)?;
+    if !after.stale_socket_paths.is_empty() || !after.stale_transaction_paths.is_empty() {
+        bail!("capacity recovery left exact-owned residue");
+    }
+    let report = CapacityRecoveryReport {
+        schema_version: 1,
+        experiment_id: preflight.experiment_id,
+        removed_sockets,
+        removed_transactions,
+        exact_processes_absent: after.exact_processes_absent,
+        exact_units_absent: after.exact_units_absent,
+        exact_cgroups_clear: after.exact_cgroups_clear,
+        damon_damos_clear: after.damon_damos_clear,
+        idempotent_clean: true,
+        production_activation_authorized: false,
+        lineage_reexecution_authorized: false,
+        payload_sha256: String::new(),
+    }
+    .seal()?;
+    report.verify()?;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -726,5 +1291,182 @@ mod tests {
             CapacityTargetStatus::NotSpecified,
             CapacityTargetStatus::DefinitivelyNotMet
         );
+    }
+
+    #[test]
+    fn conservative_percent_rounds_down_for_positive_and_negative_values() {
+        assert_eq!(percent_floor(1, 3), Some(33));
+        assert_eq!(percent_floor(-1, 3), Some(-34));
+    }
+
+    #[test]
+    fn possible_percent_rounds_up_for_positive_and_negative_values() {
+        assert_eq!(percent_ceil(1, 3), Some(34));
+        assert_eq!(percent_ceil(-1, 3), Some(-33));
+    }
+
+    #[test]
+    fn percent_arithmetic_rejects_zero_denominator() {
+        assert_eq!(percent_floor(1, 0), None);
+        assert_eq!(percent_ceil(1, 0), None);
+    }
+
+    #[test]
+    fn capacity_scope_runtime_is_sufficient_and_finite() {
+        let runtime = CAPACITY_SCOPE_RUNTIME_MAX_USEC;
+        let run_timeout = CAPACITY_RUN_TIMEOUT_MS;
+        assert!(runtime / 1_000 >= run_timeout);
+        assert!(run_timeout * 6 <= CapacitySearchPolicy::v1().total_timeout_ms);
+        assert_eq!(CapacitySearchPolicy::v1().total_timeout_ms, 45 * 60 * 1000);
+    }
+
+    #[test]
+    fn paired_median_is_used_for_signed_deltas() {
+        assert_eq!(median_i64(vec![-10, 30, 0]), Some(0));
+        assert_eq!(median_i64(vec![30, 10, 20]), Some(20));
+    }
+
+    #[test]
+    fn execution_evidence_seal_detects_tamper_and_preserves_nonclaims() {
+        let evidence = CapacityBenchmarkExecutionEvidence {
+            schema_version: CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION,
+            state: CapacityBenchmarkState::Invalid,
+            experiment_id: "experiment".into(),
+            source_commit: BUILD_GIT_HEAD.into(),
+            invocation_count: 1,
+            composition_execution: CapacityCompositionExecutionEvidence {
+                schema_version: crate::capacity_composition::COMPOSITION_EXECUTION_SCHEMA_VERSION,
+                experiment_id: "experiment".into(),
+                source_commit: BUILD_GIT_HEAD.into(),
+                state: CompositionExperimentState::InvalidRun,
+                reason: "injected primary failure".into(),
+                runs: Vec::new(),
+                planned_runs: 6,
+                completed_runs: 0,
+                planned_levels: 60,
+                completed_levels: 0,
+                invocation_count: 1,
+                search_complete: false,
+                capacity_evaluation: EvaluationState::NotEvaluated,
+                effectiveness_evaluation: EvaluationState::NotEvaluated,
+                production_activation_authorized: false,
+                cleanup_passed: false,
+                structural_restore_passed: false,
+                payload_sha256: String::new(),
+            },
+            boundaries: Vec::new(),
+            evaluation: CapacityEvaluation {
+                version: CAPACITY_EVALUATION_VERSION,
+                state: CapacityEvaluationState::Invalid,
+                pairs: Vec::new(),
+                median_baseline_demonstrated_bytes: None,
+                median_capacity_demonstrated_bytes: None,
+                median_paired_demonstrated_delta_bytes: None,
+                demonstrated_capacity_gain_percent: None,
+                conservative_gain_lower_bound_percent: None,
+                possible_gain_upper_bound_percent: None,
+                target_percent: Some(30),
+                target_source: "master".into(),
+                target_status: CapacityTargetStatus::Indeterminate,
+                statistical_limitation: "three pairs".into(),
+            },
+            cleanup_passed: false,
+            structural_restore_passed: false,
+            effectiveness_evaluation: EvaluationState::NotEvaluated,
+            production_activation_authorized: false,
+            primary_error: Some("primary".into()),
+            secondary_errors: vec!["secondary".into()],
+            payload_sha256: String::new(),
+        }
+        .seal()
+        .unwrap();
+        evidence.verify().unwrap();
+        let mut tampered = evidence;
+        tampered.primary_error = Some("changed".into());
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn successful_evidence_requires_cleanup_and_restore() {
+        let mut evidence = CapacityBenchmarkExecutionEvidence {
+            schema_version: CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION,
+            state: CapacityBenchmarkState::Censored,
+            experiment_id: "experiment".into(),
+            source_commit: BUILD_GIT_HEAD.into(),
+            invocation_count: 1,
+            composition_execution: CapacityCompositionExecutionEvidence {
+                schema_version: crate::capacity_composition::COMPOSITION_EXECUTION_SCHEMA_VERSION,
+                experiment_id: "experiment".into(),
+                source_commit: BUILD_GIT_HEAD.into(),
+                state: CompositionExperimentState::CompletedCompositionFrameworkValidation,
+                reason: "done".into(),
+                runs: Vec::new(),
+                planned_runs: 6,
+                completed_runs: 6,
+                planned_levels: 60,
+                completed_levels: 60,
+                invocation_count: 1,
+                search_complete: false,
+                capacity_evaluation: EvaluationState::NotEvaluated,
+                effectiveness_evaluation: EvaluationState::NotEvaluated,
+                production_activation_authorized: false,
+                cleanup_passed: true,
+                structural_restore_passed: true,
+                payload_sha256: String::new(),
+            },
+            boundaries: Vec::new(),
+            evaluation: CapacityEvaluation {
+                version: CAPACITY_EVALUATION_VERSION,
+                state: CapacityEvaluationState::Censored,
+                pairs: Vec::new(),
+                median_baseline_demonstrated_bytes: None,
+                median_capacity_demonstrated_bytes: None,
+                median_paired_demonstrated_delta_bytes: None,
+                demonstrated_capacity_gain_percent: None,
+                conservative_gain_lower_bound_percent: None,
+                possible_gain_upper_bound_percent: None,
+                target_percent: Some(30),
+                target_source: "master".into(),
+                target_status: CapacityTargetStatus::Indeterminate,
+                statistical_limitation: "three pairs".into(),
+            },
+            cleanup_passed: false,
+            structural_restore_passed: true,
+            effectiveness_evaluation: EvaluationState::NotEvaluated,
+            production_activation_authorized: false,
+            primary_error: None,
+            secondary_errors: Vec::new(),
+            payload_sha256: String::new(),
+        }
+        .seal()
+        .unwrap();
+        assert!(evidence.verify().is_err());
+        evidence.cleanup_passed = true;
+        evidence = evidence.seal().unwrap();
+        evidence.verify().unwrap();
+    }
+
+    #[test]
+    fn recovery_evidence_is_idempotent_non_production_and_non_reexecution() {
+        let report = CapacityRecoveryReport {
+            schema_version: 1,
+            experiment_id: "consumed".into(),
+            removed_sockets: vec![PathBuf::from("/tmp/output/pressure-0.sock")],
+            removed_transactions: vec![PathBuf::from("/tmp/output/target-r0-l2")],
+            exact_processes_absent: true,
+            exact_units_absent: true,
+            exact_cgroups_clear: true,
+            damon_damos_clear: true,
+            idempotent_clean: true,
+            production_activation_authorized: false,
+            lineage_reexecution_authorized: false,
+            payload_sha256: String::new(),
+        }
+        .seal()
+        .unwrap();
+        report.verify().unwrap();
+        let mut tampered = report;
+        tampered.lineage_reexecution_authorized = true;
+        assert!(tampered.verify().is_err());
     }
 }
