@@ -5,6 +5,10 @@ use crate::capacity_composition::{
     CapacityCompositionPayload, CompositionExperimentState, CompositionLevelClassification,
     CompositionRunPlan, PreparedCapacityCompositionManifest,
 };
+use crate::capacity_external_target::{
+    TARGET_COMMAND_REFAULT_FILE, TARGET_COMMAND_START_FILE, TARGET_COMMAND_STOP_FILE,
+    TARGET_CONSUMED_FILE, TARGET_DESCRIPTOR_FILE, TARGET_PROGRESS_FILE,
+};
 use crate::capacity_external_validation::ExternalTargetExecutionReport;
 use crate::capacity_orchestration::CapacityComponent;
 use crate::pressure::{PlannedLevelState, PlannedPressureLevel};
@@ -989,6 +993,70 @@ pub fn execute_capacity_benchmark(path: &Path) -> Result<CapacityBenchmarkExecut
 }
 
 const LINEAGE1_ARCHIVE: &str = "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-benchmark-1-execution-error";
+const LINEAGE1_OUTPUT_ROOT: &str = "/tmp/nemor-capacity-benchmark-1-output";
+pub const CAPACITY_RECOVERY_PREFLIGHT_SCHEMA_VERSION: u32 = 2;
+pub const CAPACITY_RECOVERY_REPORT_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPathKind {
+    PressureSocket,
+    TargetTransactionDirectory,
+    PreservedEvidence,
+    Unexpected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryPathMetadata {
+    pub path: PathBuf,
+    pub kind: RecoveryPathKind,
+    pub device: u64,
+    pub inode: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub link_count: u64,
+    pub file_type: String,
+    pub mountpoint: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryCandidateEvidence {
+    pub metadata: RecoveryPathMetadata,
+    pub expected_uid: u32,
+    pub expected_gid: u32,
+    pub children: Vec<RecoveryPathMetadata>,
+    pub valid: bool,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryPlan {
+    pub output_root: RecoveryPathMetadata,
+    pub socket_candidates: Vec<PathBuf>,
+    pub transaction_candidates: Vec<PathBuf>,
+    pub existing_candidates: Vec<RecoveryCandidateEvidence>,
+    pub preserved_evidence: Vec<PathBuf>,
+    pub unexpected_entries: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryClassification {
+    Pass,
+    NoMutationAlreadyClean,
+    PartialFailure,
+    RejectedBeforeMutation,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryPathAction {
+    pub path: PathBuf,
+    pub kind: RecoveryPathKind,
+    pub removed: bool,
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapacityRecoveryPreflight {
@@ -1001,8 +1069,7 @@ pub struct CapacityRecoveryPreflight {
     pub exact_units_absent: bool,
     pub exact_cgroups_clear: bool,
     pub damon_damos_clear: bool,
-    pub stale_socket_paths: Vec<PathBuf>,
-    pub stale_transaction_paths: Vec<PathBuf>,
+    pub plan: RecoveryPlan,
     pub exact_paths_verified: bool,
     pub current_identity_authorized: bool,
     pub recovery_ready: bool,
@@ -1012,9 +1079,18 @@ pub struct CapacityRecoveryPreflight {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapacityRecoveryReport {
     pub schema_version: u32,
+    pub classification: RecoveryClassification,
     pub experiment_id: String,
+    pub manifest_sha256: String,
+    pub preflight_sha256: String,
+    pub before: RecoveryPlan,
+    pub actions: Vec<RecoveryPathAction>,
     pub removed_sockets: Vec<PathBuf>,
     pub removed_transactions: Vec<PathBuf>,
+    pub preserved_evidence: Vec<PathBuf>,
+    pub primary_error: Option<String>,
+    pub secondary_errors: Vec<String>,
+    pub after: RecoveryPlan,
     pub exact_processes_absent: bool,
     pub exact_units_absent: bool,
     pub exact_cgroups_clear: bool,
@@ -1036,9 +1112,14 @@ impl CapacityRecoveryReport {
         let mut candidate = self.clone();
         let frozen = candidate.payload_sha256.clone();
         candidate.payload_sha256.clear();
-        if frozen != hash_json(&candidate)?
+        if self.schema_version != CAPACITY_RECOVERY_REPORT_SCHEMA_VERSION
+            || frozen != hash_json(&candidate)?
             || self.production_activation_authorized
             || self.lineage_reexecution_authorized
+            || !matches!(
+                self.classification,
+                RecoveryClassification::Pass | RecoveryClassification::NoMutationAlreadyClean
+            )
             || !self.idempotent_clean
         {
             bail!("capacity recovery evidence contract mismatch");
@@ -1047,7 +1128,15 @@ impl CapacityRecoveryReport {
     }
 }
 
-fn legacy_capacity_identity(path: &Path) -> Result<(String, PathBuf, u32, u32)> {
+struct LegacyRecoveryIdentity {
+    experiment_id: String,
+    output_root: PathBuf,
+    preparing_uid: u32,
+    preparing_gid: u32,
+    runs: Vec<(usize, Vec<usize>)>,
+}
+
+fn legacy_capacity_identity(path: &Path) -> Result<LegacyRecoveryIdentity> {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
     let experiment = value
         .pointer("/payload/experiment_id")
@@ -1069,62 +1158,278 @@ fn legacy_capacity_identity(path: &Path) -> Result<(String, PathBuf, u32, u32)> 
         .and_then(|value| value.as_u64())
         .and_then(|value| u32::try_from(value).ok())
         .context("legacy preparing GID absent")?;
-    Ok((experiment, output, uid, gid))
+    let runs = value
+        .pointer("/payload/composition_payload/run_plan")
+        .and_then(|value| value.as_array())
+        .context("legacy capacity run plan absent")?
+        .iter()
+        .map(|run| {
+            let order = run
+                .get("order_index")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .context("legacy run order absent")?;
+            let levels = run
+                .get("levels")
+                .and_then(|value| value.as_array())
+                .context("legacy run levels absent")?
+                .iter()
+                .map(|level| {
+                    level
+                        .get("level_index")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| usize::try_from(value).ok())
+                        .context("legacy level index absent")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((order, levels))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LegacyRecoveryIdentity {
+        experiment_id: experiment,
+        output_root: output,
+        preparing_uid: uid,
+        preparing_gid: gid,
+        runs,
+    })
 }
 
-fn exact_recovery_paths(output: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let canonical_parent = output.canonicalize()?;
-    if !canonical_parent.starts_with("/tmp/nemor-capacity-benchmark-1-output") {
-        bail!("legacy recovery output root is not the frozen Lineage 1 root");
+fn is_mountpoint(path: &Path) -> Result<bool> {
+    let canonical = path.canonicalize()?;
+    let mounts = fs::read_to_string("/proc/self/mountinfo")?;
+    Ok(mounts.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .is_some_and(|mount| Path::new(mount) == canonical)
+    }))
+}
+
+fn metadata_snapshot(path: &Path, kind: RecoveryPathKind) -> Result<RecoveryPathMetadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    let file_type = if metadata.file_type().is_symlink() {
+        "symlink"
+    } else if metadata.file_type().is_socket() {
+        "socket"
+    } else if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "regular"
+    } else {
+        "special"
+    };
+    Ok(RecoveryPathMetadata {
+        path: path.to_path_buf(),
+        kind,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode() & 0o7777,
+        link_count: metadata.nlink(),
+        file_type: file_type.into(),
+        mountpoint: is_mountpoint(path).unwrap_or(false),
+    })
+}
+
+fn exact_parent(path: &Path, root: &Path) -> bool {
+    path.parent() == Some(root) && root.join(path.file_name().unwrap_or_default()) == path
+}
+
+fn allowed_transaction_child(name: &str) -> bool {
+    matches!(
+        name,
+        TARGET_DESCRIPTOR_FILE
+            | TARGET_PROGRESS_FILE
+            | TARGET_CONSUMED_FILE
+            | TARGET_COMMAND_START_FILE
+            | TARGET_COMMAND_REFAULT_FILE
+            | TARGET_COMMAND_STOP_FILE
+    )
+}
+
+fn validate_candidate(
+    path: &Path,
+    kind: RecoveryPathKind,
+    output: &RecoveryPathMetadata,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<RecoveryCandidateEvidence> {
+    let metadata = metadata_snapshot(path, kind)?;
+    let mut children = Vec::new();
+    let mut failures = Vec::new();
+    if !exact_parent(path, &output.path)
+        || metadata.device != output.device
+        || metadata.mountpoint
+        || metadata.uid != expected_uid
+        || metadata.gid != expected_gid
+    {
+        failures.push("parent/device/mount/ownership mismatch".to_owned());
     }
-    let mut sockets = Vec::new();
-    let mut transactions = Vec::new();
+    match kind {
+        RecoveryPathKind::PressureSocket => {
+            if metadata.file_type != "socket" || metadata.link_count != 1 || metadata.mode != 0o600
+            {
+                failures.push("pressure socket type/link/mode mismatch".to_owned());
+            }
+        }
+        RecoveryPathKind::TargetTransactionDirectory => {
+            if metadata.file_type != "directory"
+                || metadata.link_count != 2
+                || metadata.mode != 0o700
+            {
+                failures.push("transaction directory type/link/mode mismatch".to_owned());
+            } else {
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    let child_path = entry.path();
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let child =
+                        metadata_snapshot(&child_path, RecoveryPathKind::PreservedEvidence)?;
+                    if !allowed_transaction_child(&name)
+                        || child.file_type != "regular"
+                        || child.link_count != 1
+                        || child.mode != 0o600
+                        || child.uid != expected_uid
+                        || child.gid != expected_gid
+                        || child.device != output.device
+                        || child.mountpoint
+                        || child_path.parent() != Some(path)
+                    {
+                        failures.push(format!("unsafe transaction child: {name}"));
+                    }
+                    children.push(child);
+                }
+                children.sort_by(|a, b| a.path.cmp(&b.path));
+            }
+        }
+        _ => failures.push("invalid recovery candidate kind".to_owned()),
+    }
+    Ok(RecoveryCandidateEvidence {
+        metadata,
+        expected_uid,
+        expected_gid,
+        children,
+        valid: failures.is_empty(),
+        failure_reason: (!failures.is_empty()).then(|| failures.join("; ")),
+    })
+}
+
+fn preserved_evidence_name(name: &str, runs: &[(usize, Vec<usize>)]) -> bool {
+    matches!(
+        name,
+        "capacity-composition.report.json"
+            | "capacity-benchmark.report.json"
+            | "capacity-evaluation.json"
+            | "capacity-composition.sqlite"
+            | "capacity-composition.sqlite-shm"
+            | "capacity-composition.sqlite-wal"
+    ) || runs.iter().any(|(run, levels)| {
+        levels
+            .iter()
+            .any(|level| name == format!("run-{run}-level-{level}"))
+    })
+}
+
+fn build_recovery_plan(
+    output: &Path,
+    preparing_uid: u32,
+    preparing_gid: u32,
+    runs: &[(usize, Vec<usize>)],
+) -> Result<RecoveryPlan> {
+    if output != Path::new(LINEAGE1_OUTPUT_ROOT)
+        || output.canonicalize()? != Path::new(LINEAGE1_OUTPUT_ROOT)
+    {
+        bail!("legacy recovery output root is not exactly the frozen Lineage 1 root");
+    }
+    let root = metadata_snapshot(output, RecoveryPathKind::PreservedEvidence)?;
+    if root.file_type != "directory"
+        || root.mode != 0o700
+        || root.uid != preparing_uid
+        || root.gid != preparing_gid
+        || root.mountpoint
+    {
+        bail!("legacy recovery output root metadata mismatch");
+    }
+    let socket_candidates = runs
+        .iter()
+        .map(|(run, _)| output.join(format!("pressure-{run}.sock")))
+        .collect::<Vec<_>>();
+    let transaction_candidates = runs
+        .iter()
+        .flat_map(|(run, levels)| {
+            levels
+                .iter()
+                .map(move |level| output.join(format!("target-r{run}-l{level}")))
+        })
+        .collect::<Vec<_>>();
+    let socket_set = socket_candidates.iter().cloned().collect::<BTreeSet<_>>();
+    let transaction_set = transaction_candidates
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_uid = nix::unistd::geteuid().as_raw();
+    let expected_gid = nix::unistd::getegid().as_raw();
+    let mut existing_candidates = Vec::new();
+    let mut preserved_evidence = Vec::new();
+    let mut unexpected_entries = Vec::new();
     for entry in fs::read_dir(output)? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || metadata.nlink() != 1 {
-            bail!("recovery path has symlink or hard-link ambiguity");
-        }
-        if name.starts_with("pressure-")
-            && name.ends_with(".sock")
-            && metadata.file_type().is_socket()
-        {
-            sockets.push(path);
-        } else if name.starts_with("target-r") && metadata.is_dir() {
-            for child in fs::read_dir(&path)? {
-                let child = child?;
-                let child_meta = fs::symlink_metadata(child.path())?;
-                if child_meta.file_type().is_symlink()
-                    || child_meta.is_dir()
-                    || child_meta.nlink() != 1
-                {
-                    bail!("recovery transaction contains ambiguous content");
-                }
-            }
-            transactions.push(path);
+        if socket_set.contains(&path) {
+            existing_candidates.push(validate_candidate(
+                &path,
+                RecoveryPathKind::PressureSocket,
+                &root,
+                expected_uid,
+                expected_gid,
+            )?);
+        } else if transaction_set.contains(&path) {
+            existing_candidates.push(validate_candidate(
+                &path,
+                RecoveryPathKind::TargetTransactionDirectory,
+                &root,
+                expected_uid,
+                expected_gid,
+            )?);
+        } else if preserved_evidence_name(&name, runs) {
+            preserved_evidence.push(path);
+        } else {
+            unexpected_entries.push(path);
         }
     }
-    sockets.sort();
-    transactions.sort();
-    Ok((sockets, transactions))
+    existing_candidates.sort_by(|a, b| a.metadata.path.cmp(&b.metadata.path));
+    preserved_evidence.sort();
+    unexpected_entries.sort();
+    Ok(RecoveryPlan {
+        output_root: root,
+        socket_candidates,
+        transaction_candidates,
+        existing_candidates,
+        preserved_evidence,
+        unexpected_entries,
+    })
 }
 
 pub fn capacity_benchmark_recovery_preflight(
     manifest_path: &Path,
 ) -> Result<CapacityRecoveryPreflight> {
-    let (experiment_id, output_root, preparing_uid, preparing_gid) =
-        legacy_capacity_identity(manifest_path)?;
+    let identity = legacy_capacity_identity(manifest_path)?;
     let archive = Path::new(LINEAGE1_ARCHIVE);
     let archive_verified = hash_file(&archive.join("manifest.json"))? == hash_file(manifest_path)?
         && verify_all_sums(archive).is_ok()
         && fs::read_to_string(archive.join("STATUS"))?.contains("classification=EXECUTION_ERROR");
     let consumed_lineage =
         fs::read_to_string(archive.join("STATUS"))?.contains("invocation_count=1");
-    let exact_processes_absent = !super::capacity_composition::processes_contain(&experiment_id)
-        && !super::capacity_composition::processes_contain("pressure-worker");
-    let (sockets, transactions) = exact_recovery_paths(&output_root)?;
+    let exact_processes_absent =
+        !super::capacity_composition::processes_contain(&identity.experiment_id)
+            && !super::capacity_composition::processes_contain("pressure-worker");
+    let plan = build_recovery_plan(
+        &identity.output_root,
+        identity.preparing_uid,
+        identity.preparing_gid,
+        &identity.runs,
+    )?;
     let exact_units_absent = SystemdDbusBackend::system()
         .and_then(|backend| backend.list_owned_benchmark_units())
         .map(|units| units.is_empty())
@@ -1147,15 +1452,13 @@ pub fn capacity_benchmark_recovery_preflight(
         && std::env::var("SUDO_UID")
             .ok()
             .and_then(|value| value.parse().ok())
-            == Some(preparing_uid)
+            == Some(identity.preparing_uid)
         && std::env::var("SUDO_GID")
             .ok()
             .and_then(|value| value.parse().ok())
-            == Some(preparing_gid);
-    let exact_paths_verified = sockets
-        .iter()
-        .chain(&transactions)
-        .all(|path| path.parent() == Some(output_root.as_path()) && !path.is_symlink());
+            == Some(identity.preparing_gid);
+    let exact_paths_verified = plan.existing_candidates.iter().all(|item| item.valid)
+        && plan.unexpected_entries.is_empty();
     let ready = archive_verified
         && consumed_lineage
         && exact_processes_absent
@@ -1165,8 +1468,8 @@ pub fn capacity_benchmark_recovery_preflight(
         && exact_paths_verified
         && identity_authorized;
     Ok(CapacityRecoveryPreflight {
-        schema_version: 1,
-        experiment_id,
+        schema_version: CAPACITY_RECOVERY_PREFLIGHT_SCHEMA_VERSION,
+        experiment_id: identity.experiment_id,
         manifest_sha256: hash_file(manifest_path)?,
         archive_verified,
         consumed_lineage,
@@ -1174,8 +1477,7 @@ pub fn capacity_benchmark_recovery_preflight(
         exact_units_absent,
         exact_cgroups_clear,
         damon_damos_clear,
-        stale_socket_paths: sockets,
-        stale_transaction_paths: transactions,
+        plan,
         exact_paths_verified,
         current_identity_authorized: identity_authorized,
         recovery_ready: ready,
@@ -1191,47 +1493,107 @@ pub fn recover_capacity_benchmark(
     if !preflight.recovery_ready {
         bail!("capacity recovery exact-owned preflight is not ready");
     }
-    if idempotence_check
-        && (!preflight.stale_socket_paths.is_empty()
-            || !preflight.stale_transaction_paths.is_empty())
-    {
+    if idempotence_check && !preflight.plan.existing_candidates.is_empty() {
         bail!("idempotence check refuses pending mutation");
     }
+    let preflight_sha256 = hash_json(&preflight)?;
+    let before = preflight.plan.clone();
     let mut removed_sockets = Vec::new();
     let mut removed_transactions = Vec::new();
+    let mut actions = Vec::new();
+    let mut primary_error = None;
+    let mut secondary_errors = Vec::new();
     if !idempotence_check {
-        for path in &preflight.stale_socket_paths {
-            fs::remove_file(path)?;
-            removed_sockets.push(path.clone());
-        }
-        for root in &preflight.stale_transaction_paths {
-            for entry in fs::read_dir(root)? {
-                fs::remove_file(entry?.path())?;
+        for candidate in &preflight.plan.existing_candidates {
+            let revalidated = validate_candidate(
+                &candidate.metadata.path,
+                candidate.metadata.kind,
+                &preflight.plan.output_root,
+                candidate.expected_uid,
+                candidate.expected_gid,
+            );
+            let result = match revalidated {
+                Ok(current) if current == *candidate => match candidate.metadata.kind {
+                    RecoveryPathKind::PressureSocket => fs::remove_file(&candidate.metadata.path)
+                        .map(|_| {
+                            removed_sockets.push(candidate.metadata.path.clone());
+                        }),
+                    RecoveryPathKind::TargetTransactionDirectory => (|| {
+                        for child in &candidate.children {
+                            fs::remove_file(&child.path)?;
+                        }
+                        fs::remove_dir(&candidate.metadata.path)?;
+                        removed_transactions.push(candidate.metadata.path.clone());
+                        Ok(())
+                    })(),
+                    _ => unreachable!("preflight admits only exact recovery candidates"),
+                },
+                Ok(_) => Err(std::io::Error::other(
+                    "candidate metadata changed after preflight",
+                )),
+                Err(error) => Err(std::io::Error::other(format!("{error:#}"))),
+            };
+            let error = result.err().map(|error| error.to_string());
+            if let Some(error) = &error {
+                if primary_error.is_none() {
+                    primary_error = Some(error.clone());
+                } else {
+                    secondary_errors.push(error.clone());
+                }
             }
-            fs::remove_dir(root)?;
-            removed_transactions.push(root.clone());
+            actions.push(RecoveryPathAction {
+                path: candidate.metadata.path.clone(),
+                kind: candidate.metadata.kind,
+                removed: error.is_none(),
+                error,
+            });
         }
     }
-    let after = capacity_benchmark_recovery_preflight(manifest_path)?;
-    if !after.stale_socket_paths.is_empty() || !after.stale_transaction_paths.is_empty() {
-        bail!("capacity recovery left exact-owned residue");
-    }
+    let after_preflight = capacity_benchmark_recovery_preflight(manifest_path)?;
+    let clean = after_preflight.plan.existing_candidates.is_empty()
+        && after_preflight.exact_processes_absent
+        && after_preflight.exact_units_absent
+        && after_preflight.exact_cgroups_clear
+        && after_preflight.damon_damos_clear;
+    let classification = if primary_error.is_some() {
+        RecoveryClassification::PartialFailure
+    } else if !clean {
+        RecoveryClassification::Invalid
+    } else if idempotence_check {
+        RecoveryClassification::NoMutationAlreadyClean
+    } else {
+        RecoveryClassification::Pass
+    };
     let report = CapacityRecoveryReport {
-        schema_version: 1,
+        schema_version: CAPACITY_RECOVERY_REPORT_SCHEMA_VERSION,
+        classification,
         experiment_id: preflight.experiment_id,
+        manifest_sha256: preflight.manifest_sha256,
+        preflight_sha256,
+        before,
+        actions,
         removed_sockets,
         removed_transactions,
-        exact_processes_absent: after.exact_processes_absent,
-        exact_units_absent: after.exact_units_absent,
-        exact_cgroups_clear: after.exact_cgroups_clear,
-        damon_damos_clear: after.damon_damos_clear,
-        idempotent_clean: true,
+        preserved_evidence: after_preflight.plan.preserved_evidence.clone(),
+        primary_error,
+        secondary_errors,
+        after: after_preflight.plan,
+        exact_processes_absent: after_preflight.exact_processes_absent,
+        exact_units_absent: after_preflight.exact_units_absent,
+        exact_cgroups_clear: after_preflight.exact_cgroups_clear,
+        damon_damos_clear: after_preflight.damon_damos_clear,
+        idempotent_clean: clean,
         production_activation_authorized: false,
         lineage_reexecution_authorized: false,
         payload_sha256: String::new(),
     }
     .seal()?;
-    report.verify()?;
+    if matches!(
+        report.classification,
+        RecoveryClassification::Pass | RecoveryClassification::NoMutationAlreadyClean
+    ) {
+        report.verify()?;
+    }
     Ok(report)
 }
 
@@ -1448,11 +1810,40 @@ mod tests {
 
     #[test]
     fn recovery_evidence_is_idempotent_non_production_and_non_reexecution() {
+        let root = RecoveryPathMetadata {
+            path: PathBuf::from("/tmp/output"),
+            kind: RecoveryPathKind::PreservedEvidence,
+            device: 1,
+            inode: 2,
+            uid: 1000,
+            gid: 1000,
+            mode: 0o700,
+            link_count: 2,
+            file_type: "directory".into(),
+            mountpoint: false,
+        };
+        let plan = RecoveryPlan {
+            output_root: root,
+            socket_candidates: Vec::new(),
+            transaction_candidates: Vec::new(),
+            existing_candidates: Vec::new(),
+            preserved_evidence: Vec::new(),
+            unexpected_entries: Vec::new(),
+        };
         let report = CapacityRecoveryReport {
-            schema_version: 1,
+            schema_version: CAPACITY_RECOVERY_REPORT_SCHEMA_VERSION,
+            classification: RecoveryClassification::Pass,
             experiment_id: "consumed".into(),
+            manifest_sha256: "manifest".into(),
+            preflight_sha256: "preflight".into(),
+            before: plan.clone(),
+            actions: Vec::new(),
             removed_sockets: vec![PathBuf::from("/tmp/output/pressure-0.sock")],
             removed_transactions: vec![PathBuf::from("/tmp/output/target-r0-l2")],
+            preserved_evidence: Vec::new(),
+            primary_error: None,
+            secondary_errors: Vec::new(),
+            after: plan,
             exact_processes_absent: true,
             exact_units_absent: true,
             exact_cgroups_clear: true,
@@ -1468,5 +1859,138 @@ mod tests {
         let mut tampered = report;
         tampered.lineage_reexecution_authorized = true;
         assert!(tampered.verify().is_err());
+    }
+
+    fn fixture_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[test]
+    fn transaction_directory_uses_normal_link_count_two() {
+        let root = fixture_root();
+        let transaction = root.path().join("target-r0-l0");
+        fs::create_dir(&transaction).unwrap();
+        fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::symlink_metadata(&transaction).unwrap().nlink(), 2);
+        let output = metadata_snapshot(root.path(), RecoveryPathKind::PreservedEvidence).unwrap();
+        let item = validate_candidate(
+            &transaction,
+            RecoveryPathKind::TargetTransactionDirectory,
+            &output,
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+        .unwrap();
+        assert!(item.valid, "{:?}", item.failure_reason);
+    }
+
+    #[test]
+    fn nested_or_unknown_transaction_content_is_rejected() {
+        let root = fixture_root();
+        let transaction = root.path().join("target-r0-l0");
+        fs::create_dir(&transaction).unwrap();
+        fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(transaction.join("nested")).unwrap();
+        let output = metadata_snapshot(root.path(), RecoveryPathKind::PreservedEvidence).unwrap();
+        let item = validate_candidate(
+            &transaction,
+            RecoveryPathKind::TargetTransactionDirectory,
+            &output,
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+        .unwrap();
+        assert!(!item.valid);
+    }
+
+    #[test]
+    fn allowlisted_private_child_is_valid_and_hardlink_is_rejected() {
+        let root = fixture_root();
+        let transaction = root.path().join("target-r0-l0");
+        fs::create_dir(&transaction).unwrap();
+        fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700)).unwrap();
+        let child = transaction.join(TARGET_PROGRESS_FILE);
+        fs::write(&child, b"{}").unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = metadata_snapshot(root.path(), RecoveryPathKind::PreservedEvidence).unwrap();
+        let valid = validate_candidate(
+            &transaction,
+            RecoveryPathKind::TargetTransactionDirectory,
+            &output,
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+        .unwrap();
+        assert!(valid.valid);
+        fs::hard_link(&child, root.path().join("alias")).unwrap();
+        let invalid = validate_candidate(
+            &transaction,
+            RecoveryPathKind::TargetTransactionDirectory,
+            &output,
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+        .unwrap();
+        assert!(!invalid.valid);
+    }
+
+    #[test]
+    fn exact_socket_requires_socket_type_mode_and_single_link() {
+        use std::os::unix::net::UnixListener;
+        let root = fixture_root();
+        let path = root.path().join("pressure-0.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = metadata_snapshot(root.path(), RecoveryPathKind::PreservedEvidence).unwrap();
+        let item = validate_candidate(
+            &path,
+            RecoveryPathKind::PressureSocket,
+            &output,
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+        .unwrap();
+        assert!(item.valid);
+    }
+
+    #[test]
+    fn output_prefix_collision_and_symlink_are_not_exact() {
+        let root = fixture_root();
+        assert!(!exact_parent(
+            &PathBuf::from(format!("{}-foreign/pressure-0.sock", root.path().display())),
+            root.path()
+        ));
+        let link = root.path().with_extension("link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        assert_eq!(
+            metadata_snapshot(&link, RecoveryPathKind::PreservedEvidence)
+                .unwrap()
+                .file_type,
+            "symlink"
+        );
+    }
+
+    #[test]
+    fn preserved_evidence_does_not_match_arbitrary_recovery_prefixes() {
+        let runs = vec![(0, vec![0, 1])];
+        assert!(preserved_evidence_name("run-0-level-1", &runs));
+        assert!(!preserved_evidence_name("pressure-999.sock", &runs));
+        assert!(!preserved_evidence_name("target-r99-l99", &runs));
+    }
+
+    #[test]
+    fn recovery_v1_is_not_accepted_as_v2() {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "classification": "pass"
+        });
+        assert!(serde_json::from_value::<CapacityRecoveryReport>(value).is_err());
+        assert_eq!(CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION, 2);
+        assert_eq!(
+            crate::capacity_external_target::CAPACITY_EXTERNAL_TARGET_PROTOCOL_VERSION,
+            1
+        );
     }
 }

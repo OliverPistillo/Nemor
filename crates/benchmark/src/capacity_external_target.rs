@@ -24,6 +24,12 @@ pub const CAPACITY_EXTERNAL_TARGET_ZONE_BYTES: u64 = 8 * 1024 * 1024;
 pub const CAPACITY_EXTERNAL_TARGET_COLD_BYTES: u64 = 32 * 1024 * 1024;
 pub const CAPACITY_EXTERNAL_TARGET_HEARTBEAT_TIMEOUT_MS: u64 = 1_000;
 pub const CAPACITY_EXTERNAL_TARGET_RUNTIME_MS: u64 = 120_000;
+pub const TARGET_DESCRIPTOR_FILE: &str = "target-descriptor.json";
+pub const TARGET_PROGRESS_FILE: &str = "target-progress.json";
+pub const TARGET_CONSUMED_FILE: &str = "target-descriptor.consumed";
+pub const TARGET_COMMAND_START_FILE: &str = "command-start.json";
+pub const TARGET_COMMAND_REFAULT_FILE: &str = "command-refault.json";
+pub const TARGET_COMMAND_STOP_FILE: &str = "command-stop.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -300,9 +306,9 @@ pub fn consume_descriptor_once(path: &Path, descriptor_hash: &str) -> Result<Pat
 
 pub fn write_command(root: &Path, command: &CapacityExternalTargetCommand) -> Result<()> {
     let name = match command {
-        CapacityExternalTargetCommand::Start { .. } => "command-start.json",
-        CapacityExternalTargetCommand::RefaultCold { .. } => "command-refault.json",
-        CapacityExternalTargetCommand::Stop { .. } => "command-stop.json",
+        CapacityExternalTargetCommand::Start { .. } => TARGET_COMMAND_START_FILE,
+        CapacityExternalTargetCommand::RefaultCold { .. } => TARGET_COMMAND_REFAULT_FILE,
+        CapacityExternalTargetCommand::Stop { .. } => TARGET_COMMAND_STOP_FILE,
     };
     write_private_atomic(&root.join(name), &serde_json::to_vec(command)?)
 }
@@ -342,8 +348,8 @@ pub fn run_target_worker(
     let initial = [fingerprint(&hot), fingerprint(&warm), fingerprint(&cold)];
     let pid = std::process::id();
     let executable_path = canonical_executable(pid)?;
-    let descriptor_path = transaction_root.join("target-descriptor.json");
-    let progress_path = transaction_root.join("target-progress.json");
+    let descriptor_path = transaction_root.join(TARGET_DESCRIPTOR_FILE);
+    let progress_path = transaction_root.join(TARGET_PROGRESS_FILE);
     let descriptor =
         CapacityExternalTargetDescriptor::seal(CapacityExternalTargetDescriptorPayload {
             contract: CapacityExternalTargetContract::v1(),
@@ -419,7 +425,9 @@ pub fn run_target_worker(
     )?;
     write_private_atomic(&descriptor_path, &serde_json::to_vec_pretty(&descriptor)?)?;
     while started.elapsed() < Duration::from_millis(CAPACITY_EXTERNAL_TARGET_RUNTIME_MS) {
-        if let Some(command) = read_command(&transaction_root.join("command-start.json"), nonce)? {
+        if let Some(command) =
+            read_command(&transaction_root.join(TARGET_COMMAND_START_FILE), nonce)?
+        {
             if !matches!(command, CapacityExternalTargetCommand::Start { .. })
                 || state != CapacityExternalTargetState::Ready
             {
@@ -428,7 +436,8 @@ pub fn run_target_worker(
             active.store(true, Ordering::Release);
             state = CapacityExternalTargetState::Active;
         }
-        if let Some(command) = read_command(&transaction_root.join("command-refault.json"), nonce)?
+        if let Some(command) =
+            read_command(&transaction_root.join(TARGET_COMMAND_REFAULT_FILE), nonce)?
         {
             if !matches!(command, CapacityExternalTargetCommand::RefaultCold { .. })
                 || state != CapacityExternalTargetState::Active
@@ -440,7 +449,9 @@ pub fn run_target_worker(
             controlled_refaults = 1;
             cold_cycles = 1;
         }
-        if let Some(command) = read_command(&transaction_root.join("command-stop.json"), nonce)? {
+        if let Some(command) =
+            read_command(&transaction_root.join(TARGET_COMMAND_STOP_FILE), nonce)?
+        {
             if !matches!(command, CapacityExternalTargetCommand::Stop { .. }) {
                 bail!("invalid external target STOP command");
             }
