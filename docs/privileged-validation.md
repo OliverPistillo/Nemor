@@ -592,3 +592,24 @@ and either produce `verified` or explicitly authorize the bounded
 `requires_owned_context_validation` bootstrap when `nr_kdamonds=0`.
 Unexpected I/O inspection errors fail closed; the bootstrap is not production
 activation and cannot authorize another component set.
+
+The capacity external-target workflow is a separate benchmark-only validation
+boundary. `prepare-capacity-external-target-validation` freezes contract and
+protocol version 1, exact runner/target/validator binaries, the
+`DamonTelemetry` plus `DamosReclaim` component set, and the existing bounded
+DAMOS action envelope. `capacity-external-target-preflight` is read-only;
+`validate-capacity-external-target` is a one-shot privileged entry.
+
+The controller cannot accept a PID by itself. The runner creates an exact
+direct-child HOT/WARM/COLD target in a private transaction directory. Its
+single-link descriptor binds the transaction and session IDs, nonce, PID and
+start ticks, executable path and SHA-256, embedded source commit, creator
+identity, three non-overlapping ranges, content identities, and private
+control-channel identity. The validator verifies and consumes that descriptor
+before DAMON mutation. It then uses the same Stat-shadow-before-Pageout
+lifecycle as the diagnostic DAMOS validator, including the four direct gates,
+cleanup, recovery, and structural restore.
+
+This workflow validates ownership handoff and lifecycle only. It does not
+compose progressive pressure search, calculate capacity or effectiveness, or
+authorize production `nemor_capacity`.

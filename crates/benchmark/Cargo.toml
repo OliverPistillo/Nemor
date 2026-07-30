@@ -12,6 +12,7 @@ damon = { package = "nemor-damon", path = "../damon" }
 damos = { package = "nemor-damos", path = "../damos" }
 futures-lite.workspace = true
 hex.workspace = true
+memmap2.workspace = true
 nix.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

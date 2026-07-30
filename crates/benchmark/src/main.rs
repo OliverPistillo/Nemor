@@ -171,6 +171,30 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
+    PrepareCapacityExternalTargetValidation {
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        #[arg(long, default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        validator_binary: PathBuf,
+        #[arg(long)]
+        target_binary: Option<PathBuf>,
+        #[arg(long)]
+        prepared_dir: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    CapacityExternalTargetPreflight {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    ValidateCapacityExternalTarget {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     PressurePreflight {
         #[arg(long)]
         manifest: PathBuf,
@@ -220,6 +244,27 @@ enum Command {
         run_id: String,
         #[arg(long)]
         seed: u64,
+    },
+    #[command(hide = true)]
+    CapacityExternalTargetWorker {
+        #[arg(long)]
+        transaction_root: PathBuf,
+        #[arg(long)]
+        transaction_id: String,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        nonce: String,
+        #[arg(long)]
+        creator_pid: u32,
+        #[arg(long)]
+        creator_start_ticks: u64,
+        #[arg(long)]
+        preparing_uid: u32,
+        #[arg(long)]
+        preparing_gid: u32,
+        #[arg(long)]
+        unit_or_cgroup_identity: String,
     },
 }
 
@@ -625,6 +670,43 @@ fn run() -> Result<i32> {
                 report.validation_id, report.state
             );
         }
+        Command::PrepareCapacityExternalTargetValidation {
+            repository,
+            config,
+            validator_binary,
+            target_binary,
+            prepared_dir,
+            output_dir,
+        } => {
+            let path =
+                nemor_benchmark::capacity_external_validation::prepare_external_target_validation(
+                    &repository,
+                    &config,
+                    &validator_binary,
+                    target_binary.as_deref(),
+                    &prepared_dir,
+                    &output_dir,
+                )?;
+            println!("manifest={}", path.display());
+        }
+        Command::CapacityExternalTargetPreflight { manifest, json } => {
+            let report = nemor_benchmark::capacity_external_validation::external_target_preflight(
+                &manifest,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::ValidateCapacityExternalTarget { manifest } => {
+            let report =
+                nemor_benchmark::capacity_external_validation::validate_external_target(&manifest)?;
+            println!(
+                "validation_id={} state={:?} capacity=not_evaluated effectiveness=not_evaluated",
+                report.payload.validation_id, report.state
+            );
+        }
         Command::PressurePreflight { manifest, json } => {
             let report = nemor_benchmark::pressure_live::pressure_preflight(&manifest)?;
             if json {
@@ -703,6 +785,29 @@ fn run() -> Result<i32> {
                 run_id,
                 seed,
                 start_ticks,
+            )?;
+        }
+        Command::CapacityExternalTargetWorker {
+            transaction_root,
+            transaction_id,
+            session_id,
+            nonce,
+            creator_pid,
+            creator_start_ticks,
+            preparing_uid,
+            preparing_gid,
+            unit_or_cgroup_identity,
+        } => {
+            nemor_benchmark::capacity_external_target::run_target_worker(
+                &transaction_root,
+                &transaction_id,
+                &session_id,
+                &nonce,
+                creator_pid,
+                creator_start_ticks,
+                preparing_uid,
+                preparing_gid,
+                &unit_or_cgroup_identity,
             )?;
         }
     }

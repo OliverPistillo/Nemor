@@ -6,13 +6,18 @@ use actuator::{
     SnapshotStore,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use benchmark::capacity_external_target::{
+    self as external_target, CapacityExternalTargetCommand, CapacityExternalTargetDescriptor,
+};
 use clap::{Parser, ValueEnum};
 use memmap2::{Advice, MmapMut, MmapOptions};
 use nix::time::{clock_gettime, ClockId};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -218,12 +223,27 @@ struct Cli {
     ksm_bootstrap_preflight: bool,
     #[arg(long, value_enum, hide = true)]
     internal_worker: Option<InternalWorker>,
+    #[arg(long, hide = true, requires = "damos")]
+    external_target_descriptor: Option<PathBuf>,
+    #[arg(long, hide = true, requires = "external_target_descriptor")]
+    external_target_transaction_id: Option<String>,
+    #[arg(long, hide = true, requires = "external_target_descriptor")]
+    external_target_session_id: Option<String>,
+    #[arg(long, hide = true, requires = "external_target_descriptor")]
+    external_target_nonce: Option<String>,
+    #[arg(long, hide = true, requires = "external_target_descriptor")]
+    external_target_creator_pid: Option<u32>,
+    #[arg(long, hide = true, requires = "external_target_descriptor")]
+    external_target_creator_start_ticks: Option<u64>,
 }
 
 impl Cli {
     fn scope(&self) -> Result<Scope> {
         if self.internal_worker.is_some() || self.ksm_bootstrap_preflight {
             bail!("internal worker has no public validation scope");
+        }
+        if self.external_target_descriptor.is_some() && !self.damos {
+            bail!("external target validation is restricted to --damos");
         }
         let selected = [
             (self.preflight, Scope::Preflight),
@@ -1242,6 +1262,16 @@ impl SnapshotStore for JsonSnapshotStore {
 
 struct Deadline(Instant);
 
+#[derive(Debug, Clone)]
+struct ExternalTargetExpected {
+    descriptor_path: PathBuf,
+    transaction_id: String,
+    session_id: String,
+    nonce: String,
+    creator_pid: u32,
+    creator_start_ticks: u64,
+}
+
 impl Deadline {
     fn new() -> Self {
         Self(Instant::now() + GLOBAL_TIMEOUT)
@@ -1264,6 +1294,30 @@ fn main() -> Result<()> {
     if let Some(worker) = cli.internal_worker {
         return run_internal_worker(worker);
     }
+    let external_target = match cli.external_target_descriptor.clone() {
+        Some(descriptor_path) => Some(ExternalTargetExpected {
+            descriptor_path,
+            transaction_id: cli
+                .external_target_transaction_id
+                .clone()
+                .context("missing external target transaction ID")?,
+            session_id: cli
+                .external_target_session_id
+                .clone()
+                .context("missing external target session ID")?,
+            nonce: cli
+                .external_target_nonce
+                .clone()
+                .context("missing external target nonce")?,
+            creator_pid: cli
+                .external_target_creator_pid
+                .context("missing external target creator PID")?,
+            creator_start_ticks: cli
+                .external_target_creator_start_ticks
+                .context("missing external target creator start ticks")?,
+        }),
+        None => None,
+    };
     if cli.ksm_bootstrap_preflight {
         if cli.preflight
             || cli.cgroups
@@ -1349,7 +1403,7 @@ fn main() -> Result<()> {
     }
     if matches!(scope, Scope::Damos | Scope::All) {
         deadline.check("DAMOS validation")?;
-        if let Err(error) = validate_damos(&mut report.damos, &deadline) {
+        if let Err(error) = validate_damos(&mut report.damos, &deadline, external_target.as_ref()) {
             report.errors.push(format!("damos: {error:#}"));
         }
     }
@@ -4947,7 +5001,11 @@ fn validate_damon(evidence: &mut DamonEvidence, deadline: &Deadline) -> Result<(
     Ok(())
 }
 
-fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<()> {
+fn validate_damos(
+    evidence: &mut DamosEvidence,
+    deadline: &Deadline,
+    external: Option<&ExternalTargetExpected>,
+) -> Result<()> {
     evidence.attempted = true;
     deadline.check("DAMOS preflight")?;
     let damon_capability = damon::inspect_linux(
@@ -4977,16 +5035,62 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
         bail!("external kdamond objects make ownership ambiguous");
     }
     let baseline_instances = trace_instances()?;
-    let mut child = spawn_damos_target()?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&fs::read(Path::new(STATE_DIR).join("damon-target.json"))?)?;
+    let (mut child, metadata, external_descriptor) = if let Some(expected) = external {
+        let descriptor = external_target::validate_descriptor_file(
+            &expected.descriptor_path,
+            &expected.transaction_id,
+            &expected.session_id,
+            &expected.nonce,
+            expected.creator_pid,
+            expected.creator_start_ticks,
+        )
+        .context("external target ownership rejected before DAMON mutation")?;
+        external_target::consume_descriptor_once(
+            &expected.descriptor_path,
+            &descriptor.payload_sha256,
+        )
+        .context("external target descriptor reuse rejected before DAMON mutation")?;
+        let metadata = serde_json::json!({
+            "pid": descriptor.payload.identity.pid,
+            "start_ticks": descriptor.payload.identity.start_ticks,
+            "state": "ready",
+            "hot": [descriptor.payload.ranges.hot.start, descriptor.payload.ranges.hot.end],
+            "warm": [descriptor.payload.ranges.warm.start, descriptor.payload.ranges.warm.end],
+            "cold": [descriptor.payload.ranges.cold.start, descriptor.payload.ranges.cold.end]
+        });
+        (
+            DamosTarget::External {
+                descriptor: descriptor.clone(),
+            },
+            metadata,
+            Some(descriptor),
+        )
+    } else {
+        let (child, descriptor) = spawn_reusable_damos_target()?;
+        let metadata = serde_json::json!({
+            "pid": descriptor.payload.identity.pid,
+            "start_ticks": descriptor.payload.identity.start_ticks,
+            "state": "ready",
+            "hot": [descriptor.payload.ranges.hot.start, descriptor.payload.ranges.hot.end],
+            "warm": [descriptor.payload.ranges.warm.start, descriptor.payload.ranges.warm.end],
+            "cold": [descriptor.payload.ranges.cold.start, descriptor.payload.ranges.cold.end]
+        });
+        (
+            DamosTarget::Internal {
+                child,
+                descriptor: descriptor.clone(),
+            },
+            metadata,
+            Some(descriptor),
+        )
+    };
     let [hot, warm, cold] = target_ranges_from_metadata(&metadata)?;
     evidence.target_pid = Some(child.id());
-    evidence.target_start_ticks = Some(child.start_ticks);
+    evidence.target_start_ticks = Some(child.start_ticks());
     evidence.cold_range = Some(cold);
     let identity_ok = metadata["pid"].as_u64() == Some(u64::from(child.id()))
-        && metadata["start_ticks"].as_u64() == Some(child.start_ticks)
-        && proc_start_ticks(child.id())? == Some(child.start_ticks);
+        && metadata["start_ticks"].as_u64() == Some(child.start_ticks())
+        && proc_start_ticks(child.id())? == Some(child.start_ticks());
     evidence.checks.push(check(
         "synthetic_workload_ready",
         metadata["state"] == "ready",
@@ -4995,7 +5099,7 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
     evidence.checks.push(check(
         "stable_target_identity",
         identity_ok,
-        format!("pid={}, start_ticks={}", child.id(), child.start_ticks),
+        format!("pid={}, start_ticks={}", child.id(), child.start_ticks()),
     ));
     if !identity_ok {
         bail!("synthetic target identity mismatch");
@@ -5032,9 +5136,9 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
     }
     let ranges =
         damon::InitialRegionPlan::new(vec![hot, warm, cold], &proc_mapped_ranges(child.id())?)?;
-    signal_damon_target("damon-start")?;
+    signal_damos_target(external_descriptor.as_ref(), "damon-start")?;
     std::thread::sleep(Duration::from_millis(1600));
-    let progress = read_progress()?;
+    let progress = read_damos_progress(external_descriptor.as_ref())?;
     evidence.checks.push(check(
         "stable_cold_evidence",
         progress.cold_cycles == 0,
@@ -5044,8 +5148,8 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
         let input = damos::EligibilityInput {
             identity: Some(damos::StableTargetIdentity {
                 pid: child.id(),
-                start_ticks: child.start_ticks,
-                stable_key: format!("synthetic:{}", child.start_ticks),
+                start_ticks: child.start_ticks(),
+                stable_key: format!("synthetic:{}", child.start_ticks()),
                 owned: true,
             }),
             identity_fresh: true,
@@ -5116,7 +5220,7 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
         session_id: &shadow_id,
         admin,
         child_pid: child.id(),
-        child_start_ticks: child.start_ticks,
+        child_start_ticks: child.start_ticks(),
         ranges: &ranges,
         hot,
         warm,
@@ -5270,7 +5374,7 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
         "policy_decision_id": decision_id.clone(),
         "action_plan_id": plan_id.clone(),
         "target_pid": child.id(),
-        "target_start_ticks": child.start_ticks,
+        "target_start_ticks": child.start_ticks(),
         "reason": "manual_validation",
         "pressure_state": "PRESSURE",
         "cold_range": cold,
@@ -5292,8 +5396,8 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
         scheme_id: 0,
         target: damos::StableTargetIdentity {
             pid: child.id(),
-            start_ticks: child.start_ticks,
-            stable_key: format!("synthetic:{}", child.start_ticks),
+            start_ticks: child.start_ticks(),
+            stable_key: format!("synthetic:{}", child.start_ticks()),
             owned: true,
         },
         action: damos::DamosAction::Pageout,
@@ -5354,9 +5458,9 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
     ));
     let smaps_before = fs::read_to_string(format!("/proc/{}/smaps", child.id()))?;
     let vma_before = damon::parse_smaps_zone(&smaps_before, cold)?;
-    let hot_residency_before = read_range_residency(child.id(), child.start_ticks, hot)?;
-    let warm_residency_before = read_range_residency(child.id(), child.start_ticks, warm)?;
-    let cold_residency_before = read_range_residency(child.id(), child.start_ticks, cold)?;
+    let hot_residency_before = read_range_residency(child.id(), child.start_ticks(), hot)?;
+    let warm_residency_before = read_range_residency(child.id(), child.start_ticks(), warm)?;
+    let cold_residency_before = read_range_residency(child.id(), child.start_ticks(), cold)?;
     let pagemap_capable = [
         &hot_residency_before,
         &warm_residency_before,
@@ -5375,14 +5479,14 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
         evidence.failure_class = Some("capability_failure".into());
         bail!("exact owned-range pagemap evidence unavailable");
     }
-    let progress_before = read_progress()?;
+    let progress_before = read_damos_progress(external_descriptor.as_ref())?;
     let control_before = process_cpu_ns()?;
     let oom_before = oom_kill_count();
     let live = run_owned_damos_session(DamosSessionSpec {
         session_id: &live_id,
         admin,
         child_pid: child.id(),
-        child_start_ticks: child.start_ticks,
+        child_start_ticks: child.start_ticks(),
         ranges: &ranges,
         hot,
         warm,
@@ -5396,14 +5500,14 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
         max_nr_snapshots: Some(max_nr_snapshots),
     })?;
     let control_after = process_cpu_ns()?;
-    let progress_after = read_progress()?;
+    let progress_after = read_damos_progress(external_descriptor.as_ref())?;
     let smaps_after_pageout = fs::read_to_string(format!("/proc/{}/smaps", child.id()))?;
     let vma_after_pageout = damon::parse_smaps_zone(&smaps_after_pageout, cold)?;
     // This snapshot is intentionally taken after state=off/stats/trace drain and
     // before the synthetic child is allowed to touch COLD for refault.
-    let hot_residency_after_pageout = read_range_residency(child.id(), child.start_ticks, hot)?;
-    let warm_residency_after_pageout = read_range_residency(child.id(), child.start_ticks, warm)?;
-    let cold_residency_after_pageout = read_range_residency(child.id(), child.start_ticks, cold)?;
+    let hot_residency_after_pageout = read_range_residency(child.id(), child.start_ticks(), hot)?;
+    let warm_residency_after_pageout = read_range_residency(child.id(), child.start_ticks(), warm)?;
+    let cold_residency_after_pageout = read_range_residency(child.id(), child.start_ticks(), cold)?;
     evidence.quota_effective = Some(live.quota.clone());
     evidence.live_access_pattern = Some(live.access_pattern.clone());
     evidence.live_monitoring_intervals = Some(live.monitoring_intervals.clone());
@@ -5612,16 +5716,37 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
     ]);
     let successful_reclaim = applied > 0 && reclaim.observed();
     if successful_reclaim {
-        signal_damon_target("damon-refault")?;
-        let refault_path = Path::new(STATE_DIR).join("damon-refault-result");
-        wait_for_path(&refault_path, Duration::from_secs(5))?;
-        let fingerprint = read_trimmed(&refault_path)?.parse::<u64>()?;
+        signal_damos_target(external_descriptor.as_ref(), "damon-refault")?;
+        let fingerprint = if let Some(descriptor) = external_descriptor.as_ref() {
+            let wait_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let progress = external_target::read_progress(&descriptor.payload.progress_path)?;
+                if progress.controlled_refaults == 1 {
+                    break u64::from_str_radix(
+                        progress
+                            .cold_fingerprint
+                            .get(..16)
+                            .unwrap_or(&progress.cold_fingerprint),
+                        16,
+                    )
+                    .unwrap_or(0);
+                }
+                if Instant::now() >= wait_deadline {
+                    bail!("external target did not acknowledge controlled COLD refault");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        } else {
+            let refault_path = Path::new(STATE_DIR).join("damon-refault-result");
+            wait_for_path(&refault_path, Duration::from_secs(5))?;
+            read_trimmed(&refault_path)?.parse::<u64>()?
+        };
         reclaim.ranges.hot.after_refault =
-            Some(read_range_residency(child.id(), child.start_ticks, hot)?);
+            Some(read_range_residency(child.id(), child.start_ticks(), hot)?);
         reclaim.ranges.warm.after_refault =
-            Some(read_range_residency(child.id(), child.start_ticks, warm)?);
+            Some(read_range_residency(child.id(), child.start_ticks(), warm)?);
         reclaim.ranges.cold.after_refault =
-            Some(read_range_residency(child.id(), child.start_ticks, cold)?);
+            Some(read_range_residency(child.id(), child.start_ticks(), cold)?);
         evidence.reclaim = Some(reclaim.clone());
         let refault = damos::RefaultEvidence {
             action_id: format!("action-{plan_id}"),
@@ -5658,7 +5783,7 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
                 blacklist.active(blacklist.created_at_ns),
                 "early refault cooldown active".into(),
             ));
-            let mut blocked_input = protected_eligibility(child.id(), child.start_ticks, cold);
+            let mut blocked_input = protected_eligibility(child.id(), child.start_ticks(), cold);
             blocked_input.blacklisted = true;
             let blocked = damos::evaluate_eligibility(&blocked_input);
             evidence.checks.push(check(
@@ -5706,7 +5831,7 @@ fn validate_damos(evidence: &mut DamosEvidence, deadline: &Deadline) -> Result<(
             ),
         ]);
     }
-    signal_damon_target("damon-stop")?;
+    signal_damos_target(external_descriptor.as_ref(), "damon-stop")?;
     child.wait_for_exit(Duration::from_secs(5))?;
     evidence.checks.push(check(
         "cleanup",
@@ -7160,6 +7285,61 @@ struct RegisteredChild {
     terminated: bool,
 }
 
+enum DamosTarget {
+    Internal {
+        child: RegisteredChild,
+        descriptor: CapacityExternalTargetDescriptor,
+    },
+    External {
+        descriptor: CapacityExternalTargetDescriptor,
+    },
+}
+
+impl DamosTarget {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Internal { child, .. } => child.id(),
+            Self::External { descriptor } => descriptor.payload.identity.pid,
+        }
+    }
+
+    fn start_ticks(&self) -> u64 {
+        match self {
+            Self::Internal { child, .. } => child.start_ticks,
+            Self::External { descriptor } => descriptor.payload.identity.start_ticks,
+        }
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> Result<()> {
+        match self {
+            Self::Internal { child, descriptor } => {
+                let deadline = Instant::now() + timeout;
+                while Instant::now() < deadline {
+                    let progress =
+                        external_target::read_progress(&descriptor.payload.progress_path)?;
+                    if progress.state == external_target::CapacityExternalTargetState::Stopped {
+                        return child.wait_for_exit(Duration::from_secs(1));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                child.terminate()
+            }
+            Self::External { descriptor } => {
+                let deadline = Instant::now() + timeout;
+                while Instant::now() < deadline {
+                    let progress =
+                        external_target::read_progress(&descriptor.payload.progress_path)?;
+                    if progress.state == external_target::CapacityExternalTargetState::Stopped {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                bail!("external target did not acknowledge clean stop")
+            }
+        }
+    }
+}
+
 impl RegisteredChild {
     fn new(child: std::process::Child, start_ticks: u64) -> Self {
         Self {
@@ -7843,12 +8023,65 @@ fn spawn_synthetic_target(
     Ok(RegisteredChild::new(child, start_ticks))
 }
 
-fn spawn_damos_target() -> Result<RegisteredChild> {
-    spawn_synthetic_target(
-        8 * 1024 * 1024,
-        32 * 1024 * 1024,
-        damon::PageBackingProfile::BasePageNoHuge,
-    )
+fn spawn_reusable_damos_target() -> Result<(RegisteredChild, CapacityExternalTargetDescriptor)> {
+    let transaction_root = Path::new(STATE_DIR).join("damos-target-transaction");
+    fs::create_dir(&transaction_root)?;
+    fs::set_permissions(&transaction_root, fs::Permissions::from_mode(0o700))?;
+    let creator_pid = std::process::id();
+    let creator_start_ticks =
+        proc_start_ticks(creator_pid)?.context("DAMOS controller start ticks unavailable")?;
+    let transaction_id = format!("diagnostic-damos-{}", now_ns()?);
+    let session_id = format!("{transaction_id}-target");
+    let nonce = hex::encode(sha2::Sha256::digest(format!(
+        "{transaction_id}:{creator_pid}:{creator_start_ticks}"
+    )));
+    let executable = std::env::current_exe()?
+        .with_file_name("nemor-benchmark")
+        .canonicalize()
+        .context("exact sibling nemor-benchmark target binary unavailable")?;
+    let mut process = Command::new(executable);
+    process
+        .arg("capacity-external-target-worker")
+        .arg("--transaction-root")
+        .arg(&transaction_root)
+        .arg("--transaction-id")
+        .arg(&transaction_id)
+        .arg("--session-id")
+        .arg(&session_id)
+        .arg("--nonce")
+        .arg(&nonce)
+        .arg("--creator-pid")
+        .arg(creator_pid.to_string())
+        .arg("--creator-start-ticks")
+        .arg(creator_start_ticks.to_string())
+        .arg("--preparing-uid")
+        .arg(nix::unistd::geteuid().as_raw().to_string())
+        .arg("--preparing-gid")
+        .arg(nix::unistd::getegid().as_raw().to_string())
+        .arg("--unit-or-cgroup-identity")
+        .arg("direct-child-diagnostic")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn()?;
+    let descriptor_path = transaction_root.join("target-descriptor.json");
+    if wait_for_path(&descriptor_path, Duration::from_secs(5)).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("reusable DAMOS target descriptor unavailable");
+    }
+    let start_ticks =
+        proc_start_ticks(child.id())?.ok_or_else(|| anyhow!("reusable DAMOS target vanished"))?;
+    let descriptor = external_target::validate_descriptor_file(
+        &descriptor_path,
+        &transaction_id,
+        &session_id,
+        &nonce,
+        creator_pid,
+        creator_start_ticks,
+    )?;
+    external_target::consume_descriptor_once(&descriptor_path, &descriptor.payload_sha256)?;
+    Ok((RegisteredChild::new(child, start_ticks), descriptor))
 }
 
 fn write_workload_progress(progress: &WorkloadProgress) -> Result<()> {
@@ -7871,6 +8104,46 @@ fn signal_damon_target(name: &str) -> Result<()> {
     }
     fs::write(Path::new(STATE_DIR).join(name), b"1")?;
     Ok(())
+}
+
+fn read_damos_progress(
+    external: Option<&CapacityExternalTargetDescriptor>,
+) -> Result<WorkloadProgress> {
+    if let Some(descriptor) = external {
+        let progress = external_target::read_progress(&descriptor.payload.progress_path)?;
+        let numeric_fingerprint =
+            |value: &str| u64::from_str_radix(value.get(..16).unwrap_or(value), 16).unwrap_or(0);
+        return Ok(WorkloadProgress {
+            hot_cycles: progress.hot_cycles,
+            warm_cycles: progress.warm_cycles,
+            hot_pages_touched: progress.hot_pages_touched,
+            warm_pages_touched: progress.warm_pages_touched,
+            cold_cycles: progress.cold_cycles,
+            workload_started_ns: progress.heartbeat_monotonic_ns,
+            workload_stopped_ns: 0,
+            hot_fingerprint: numeric_fingerprint(&progress.hot_fingerprint),
+            warm_fingerprint: numeric_fingerprint(&progress.warm_fingerprint),
+            cold_fingerprint: numeric_fingerprint(&progress.cold_fingerprint),
+        });
+    }
+    read_progress()
+}
+
+fn signal_damos_target(
+    external: Option<&CapacityExternalTargetDescriptor>,
+    name: &str,
+) -> Result<()> {
+    let Some(descriptor) = external else {
+        return signal_damon_target(name);
+    };
+    let nonce = descriptor.payload.identity.nonce.clone();
+    let command = match name {
+        "damon-start" => CapacityExternalTargetCommand::Start { nonce },
+        "damon-refault" => CapacityExternalTargetCommand::RefaultCold { nonce },
+        "damon-stop" => CapacityExternalTargetCommand::Stop { nonce },
+        _ => bail!("invalid external target lifecycle signal"),
+    };
+    external_target::write_command(&descriptor.payload.transaction_root, &command)
 }
 
 fn proc_cpu_ticks(pid: u32) -> Result<u64> {

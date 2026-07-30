@@ -11,14 +11,17 @@ clap.workspace = true
 collector = { package = "nemor-collector", path = "../collector" }
 classifier = { package = "nemor-classifier", path = "../classifier" }
 common = { package = "nemor-common", path = "../common" }
+benchmark = { package = "nemor-benchmark", path = "../benchmark" }
 damon = { package = "nemor-damon", path = "../damon" }
 damos = { package = "nemor-damos", path = "../damos" }
+hex.workspace = true
 ksm = { package = "nemor-ksm", path = "../ksm" }
 memmap2.workspace = true
 nix.workspace = true
 policy-engine = { package = "nemor-policy-engine", path = "../policy-engine" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 storage = { package = "nemor-storage", path = "../storage" }
 tempfile.workspace = true
 tiering = { package = "nemor-tiering", path = "../tiering" }

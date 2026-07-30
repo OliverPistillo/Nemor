@@ -756,6 +756,7 @@ dependencies = [
  "clap",
  "futures-lite",
  "hex",
+ "memmap2",
  "nemor-common",
  "nemor-damon",
  "nemor-damos",
@@ -876,8 +877,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "memmap2",
  "nemor-actuator",
+ "nemor-benchmark",
  "nemor-classifier",
  "nemor-collector",
  "nemor-common",
@@ -891,6 +894,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

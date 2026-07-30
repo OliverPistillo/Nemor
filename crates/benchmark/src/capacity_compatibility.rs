@@ -203,7 +203,7 @@ fn privileged_runtime_capability(
     }
 }
 
-fn observability_status(
+pub(crate) fn observability_status(
     observation: &damon::DamonObservability,
     damon: &damon::DamonCapability,
     damos: &damos::DamosCapability,
