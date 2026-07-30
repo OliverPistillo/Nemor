@@ -613,3 +613,22 @@ cleanup, recovery, and structural restore.
 This workflow validates ownership handoff and lifecycle only. It does not
 compose progressive pressure search, calculate capacity or effectiveness, or
 authorize production `nemor_capacity`.
+
+External-target Lineage 1 completed one live invocation on source
+`0d7ec174724c7d40352ce7027e14e4686ee84df0`, validation ID
+`capacity-external-target-1785417370787560103`. User preflight passed with
+privileged capability deferred; authenticated-root preflight passed with
+`requires_owned_context_validation` and bounded entry ready. The exact
+`DamonTelemetry` plus `DamosReclaim` run passed all 48 DAMOS gates, including
+the four direct shadow gates. HOT and WARM service progressed, only the COLD
+fence was reclaimed, controlled refault preserved content, and cleanup,
+recovery, idempotent recovery, structural restore, and final zero-kdamond
+state all passed.
+
+The immutable evidence is archived at
+`~/.local/share/nemor/validation-history/phase10-capacity-external-target-1-completed`;
+its `SHA256SUMS` hash is
+`f6f939113de3ad727daf4524345afce774b17c261820a18a18f424a5a87893bd`.
+This result is not capacity evidence, is not pressure-search integration, does
+not validate components outside the exact pair, and leaves capacity and
+effectiveness `NotEvaluated` with production activation false.
