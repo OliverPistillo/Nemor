@@ -34,9 +34,9 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 630 / 630 (current local workspace suite) |
-| Passed / failed / ignored | 630 / 0 / 0 locally; exact-commit GitHub CI required for each integrated change |
-| Phase 10 validation | 3A/3B/3C CLOSED / PASS; capacity/effectiveness still not evaluated |
+| Tests defined / executed | 649 / 649 (current local workspace suite) |
+| Passed / failed / ignored | 649 / 0 / 0 locally; exact-commit GitHub CI required for each integrated change |
+| Phase 10 validation | 3A/3B/3C CLOSED / PASS; exact `DamonTelemetry` + `DamosReclaim` combined compatibility PASS; capacity/effectiveness still not evaluated |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
@@ -439,7 +439,9 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
   auto-disable/cooldown on cooperative owned targets.
 - Phase 10 remains in development: the benchmark framework, privileged
   owned-cgroup harness, and privileged observer service pipeline are
-  validated; real A/B evidence is pending.
+  validated; exact `DamonTelemetry` + `DamosReclaim` combined compatibility is
+  validated, while the true capacity benchmark and real A/B evidence remain
+  pending.
 - Phase 11 is not started.
 
 ## Documentation

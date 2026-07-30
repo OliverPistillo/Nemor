@@ -580,7 +580,7 @@ another component set, ownership, contract version, source, binary,
 configuration or material environment. It never evaluates capacity or
 effectiveness and never enables production `nemord`.
 
-Compatibility preflight schema version 4 uses typed DAMON observability:
+Compatibility preflight schema version 5 uses typed DAMON observability:
 observed, privilege-hidden, absent, or inspection-error. Opening
 `nr_kdamonds` with write access remains an open-only readiness probe: it writes
 no bytes and changes no sysfs value. When an ordinary user can observe the

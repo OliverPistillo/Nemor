@@ -863,9 +863,9 @@ restore failure and always emits `activation_authorized=false` with capacity
 and effectiveness `not_evaluated`.
 
 This foundation does not make `NemorCapacity` executable in variant
-resolution, does not add a combined live executor and does not alter normal
-`nemord`. A separate bounded owned-host orchestration validation remains
-required before activation or any capacity/effectiveness claim.
+resolution and does not alter normal `nemord`. The bounded compatibility
+executor is validation-only and cannot activate production or establish a
+capacity/effectiveness claim.
 
 The first compatibility harness freezes only `DamonTelemetry` plus
 `DamosReclaim`, because the existing bounded DAMOS validation already owns and
@@ -878,7 +878,7 @@ workflow is `prepare-capacity-compatibility`,
 production activation remains false and capacity/effectiveness remain
 `not_evaluated`.
 
-Preflight schema version 4 separates static contract support from typed
+Preflight schema version 5 separates static contract support from typed
 privilege-sensitive observations. DAMON probes distinguish observed,
 privilege-hidden, absent, and inspection-error states; permission denial is
 never collapsed into unsupported. An unprivileged report may pass all
@@ -893,3 +893,27 @@ verified before validation, and both keep
 environment, ownership, freshness, and authorization all pass. Unexpected
 inspection errors fail closed. The command can exit successfully after
 emitting a negative report; readiness is defined only by its typed fields.
+
+### Exact DAMON + DAMOS compatibility validation
+
+Lineage 6 completed the single combined live validation for the exact
+`DamonTelemetry` + `DamosReclaim` component set. Source
+`d67fedb648ce8542aa72fdec4ff6327fdeae049b`, preflight schema 5, and validation
+ID `capacity-compatibility-1785407816237007228` were used. The user preflight
+passed with `deferred_to_privileged_preflight`; the root preflight passed with
+`requires_owned_context_validation` and
+`bounded_validation_entry_ready=true`.
+
+The raw DAMOS report independently passed
+`vaddr_pageout_supported`, `shadow_session_passed`, `shadow_cleanup`, and
+`cold_address_fence`. The live result, cleanup, recovery, idempotent recovery,
+and structural restore all passed with final `nr_kdamonds=0`. Evidence is
+archived at
+`~/.local/share/nemor/validation-history/phase10-capacity-compatibility-6-completed`;
+its `SHA256SUMS` file hashes to
+`40d474027e8ee9fd5360cbc386926feeac6ecca28672ac68e9a07437f2b96005`.
+
+Storage tiering remains unavailable pending `ZswapNvmeBoot`; cgroup
+protection, zram, and KSM remain deferred from this component set. Capacity and
+effectiveness remain `not_evaluated`, and production activation remains
+false. This result does not mean that `nemor_capacity` is fully validated.
