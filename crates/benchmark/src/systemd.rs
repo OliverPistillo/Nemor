@@ -153,6 +153,26 @@ impl std::fmt::Display for SystemdOperationFailure {
 
 impl std::error::Error for SystemdOperationFailure {}
 
+pub const SYSTEMD_NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
+
+/// Returns true only when a typed error in the chain carries systemd's exact
+/// unit-absence error name. This deliberately does not inspect free-form
+/// messages such as "not loaded".
+pub fn is_systemd_no_such_unit(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<SystemdOperationFailure>()
+            .and_then(|failure| failure.dbus_error_name.as_deref())
+            == Some(SYSTEMD_NO_SUCH_UNIT)
+            || cause
+                .downcast_ref::<zbus::Error>()
+                .is_some_and(|error| match error {
+                    zbus::Error::MethodError(name, _, _) => name.as_str() == SYSTEMD_NO_SUCH_UNIT,
+                    _ => false,
+                })
+    })
+}
+
 fn bounded_message(message: impl AsRef<str>) -> String {
     message.as_ref().chars().take(512).collect()
 }

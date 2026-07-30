@@ -21,7 +21,10 @@ use crate::pressure_prepare::{derive_memory_max, paired_run_seed, PilotPolicyV1,
 use crate::pressure_worker::{
     command_for_level, PressureWorkerClient, WorkerIpcMessage, PRESSURE_WORKER_PROTOCOL_VERSION,
 };
-use crate::systemd::{SystemdDbusBackend, TransientScopeBackend, TransientScopePlan};
+use crate::systemd::{
+    is_systemd_no_such_unit, ScopeState, SystemdDbusBackend, TransientScopeBackend,
+    TransientScopePlan,
+};
 use crate::{
     deterministic_order, BenchmarkVariant, BuildProvenance, EnvironmentFingerprint,
     EvaluationState, StructuralSnapshot, BUILD_GIT_HEAD,
@@ -42,8 +45,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const COMPOSITION_CONTRACT_VERSION: u32 = 1;
 pub const COMPOSITION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const COMPOSITION_PREFLIGHT_SCHEMA_VERSION: u32 = 1;
-pub const COMPOSITION_EXECUTION_SCHEMA_VERSION: u32 = 1;
-pub const COMPOSITION_RUN_EVIDENCE_VERSION: u32 = 1;
+pub const COMPOSITION_EXECUTION_SCHEMA_VERSION: u32 = 2;
+pub const COMPOSITION_RUN_EVIDENCE_VERSION: u32 = 2;
 pub const COMPOSITION_LEVEL_EVIDENCE_VERSION: u32 = 1;
 pub const COMPOSITION_TARGET_EVIDENCE_VERSION: u32 = 1;
 pub const COMPOSITION_MANIFEST_NAME: &str = "capacity-composition.manifest.json";
@@ -455,9 +458,75 @@ pub struct CapacityCompositionRunEvidence {
     pub seed: u64,
     pub state: CompositionExperimentState,
     pub levels: Vec<CapacityCompositionLevelEvidence>,
+    pub scope_cleanup: CompositionScopeCleanupEvidence,
     pub pressure_scope_cleanup_passed: bool,
     pub structural_restore_passed: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositionScopeStopAction {
+    AlreadyAbsent,
+    StopUnitRequested,
+    StopUnitNoSuchUnitReconciled,
+    StopFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositionScopeCleanupClassification {
+    Clean,
+    ActiveOrMembered,
+    OwnershipAmbiguous,
+    StateUnreadable,
+    RemovalTimeout,
+    StopFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositionScopeCleanupEvidence {
+    pub frozen_unit_name: String,
+    pub frozen_object_path: String,
+    pub frozen_control_group: String,
+    pub worker_pid: u32,
+    pub worker_start_ticks: u64,
+    pub worker_absent: bool,
+    pub pre_stop_state_readable: bool,
+    pub pre_stop_unit_present: bool,
+    pub pre_stop_active_state: Option<String>,
+    pub pre_stop_sub_state: Option<String>,
+    pub pre_stop_cgroup_member_count: Option<usize>,
+    pub ownership_exact: bool,
+    pub stop_action: CompositionScopeStopAction,
+    pub stop_job_result: Option<String>,
+    pub no_such_unit_typed: bool,
+    pub post_error_reconciliation_attempted: bool,
+    pub final_state_readable: bool,
+    pub final_active_state: Option<String>,
+    pub final_sub_state: Option<String>,
+    pub final_cgroup_member_count: Option<usize>,
+    pub cgroup_absent_or_zero_members: bool,
+    pub unit_removed: bool,
+    pub removal_wait_ms: u64,
+    pub classification: CompositionScopeCleanupClassification,
+    pub failure_reason: Option<String>,
+}
+
+impl CompositionScopeCleanupEvidence {
+    pub fn passed(&self) -> bool {
+        self.worker_absent
+            && self.final_state_readable
+            && self.cgroup_absent_or_zero_members
+            && self.unit_removed
+            && self.classification == CompositionScopeCleanupClassification::Clean
+            && matches!(
+                self.stop_action,
+                CompositionScopeStopAction::AlreadyAbsent
+                    | CompositionScopeStopAction::StopUnitRequested
+                    | CompositionScopeStopAction::StopUnitNoSuchUnitReconciled
+            )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1162,6 +1231,177 @@ fn named_counter(path: &Path, name: &str) -> Option<u64> {
     })
 }
 
+fn cgroup_members(path: &Path) -> Option<usize> {
+    if !path.exists() {
+        return Some(0);
+    }
+    fs::read_to_string(path.join("cgroup.procs"))
+        .ok()
+        .map(|value| value.lines().filter(|line| !line.trim().is_empty()).count())
+}
+
+fn exact_worker_absent(pid: u32, start_ticks: u64) -> bool {
+    match proc_start_ticks(pid) {
+        Ok(None) => true,
+        Ok(Some(actual)) => actual != start_ticks,
+        Err(_) => false,
+    }
+}
+
+fn exact_scope_ownership(
+    current: &ScopeState,
+    original: &ScopeState,
+    plan: &TransientScopePlan,
+) -> bool {
+    current.unit_name == plan.unit_name
+        && current.object_path == original.object_path
+        && current.control_group == original.control_group
+        && current.memory_max == plan.memory_max
+        && current.runtime_max_usec == plan.runtime_max_usec
+        && current.members.iter().all(|pid| *pid == plan.identity.pid)
+}
+
+fn reconcile_composition_scope(
+    backend: &mut dyn TransientScopeBackend,
+    plan: &TransientScopePlan,
+    original: &ScopeState,
+    cgroup: &Path,
+    timeout: Duration,
+) -> CompositionScopeCleanupEvidence {
+    let worker_absent = exact_worker_absent(plan.identity.pid, plan.identity.start_ticks);
+    let pre = backend.read_scope_state(&plan.unit_name);
+    let pre_stop_state_readable = pre.is_ok();
+    let pre_state = pre.as_ref().ok().and_then(Option::as_ref);
+    let pre_stop_unit_present = pre_state.is_some();
+    let pre_stop_active_state = pre_state.map(|state| state.active_state.clone());
+    let pre_stop_sub_state = pre_state.map(|state| state.sub_state.clone());
+    let pre_stop_cgroup_member_count = cgroup_members(cgroup);
+    let ownership_exact = pre_state
+        .map(|state| exact_scope_ownership(state, original, plan))
+        .unwrap_or(pre_stop_state_readable);
+
+    let mut action = if !pre_stop_state_readable {
+        CompositionScopeStopAction::StopFailed
+    } else if !pre_stop_unit_present {
+        CompositionScopeStopAction::AlreadyAbsent
+    } else if ownership_exact && pre_stop_cgroup_member_count == Some(0) && worker_absent {
+        CompositionScopeStopAction::StopUnitRequested
+    } else {
+        CompositionScopeStopAction::StopFailed
+    };
+    let mut stop_job_result: Option<String>;
+    let mut no_such_unit_typed = false;
+    let mut post_error_reconciliation_attempted = false;
+    let removal_started = Instant::now();
+
+    match action {
+        CompositionScopeStopAction::AlreadyAbsent => {
+            stop_job_result = Some("not_requested_already_absent".into());
+        }
+        CompositionScopeStopAction::StopUnitRequested => match backend.stop_owned_scope(plan) {
+            Ok(()) => {
+                stop_job_result = Some("done".into());
+                if backend
+                    .wait_inactive_or_removed(&plan.unit_name, timeout)
+                    .is_err()
+                {
+                    action = CompositionScopeStopAction::StopFailed;
+                    stop_job_result = Some("removal_timeout".into());
+                }
+            }
+            Err(error) if is_systemd_no_such_unit(&error) => {
+                no_such_unit_typed = true;
+                post_error_reconciliation_attempted = true;
+                let reread_absent = backend
+                    .read_scope_state(&plan.unit_name)
+                    .is_ok_and(|state| state.is_none());
+                if exact_worker_absent(plan.identity.pid, plan.identity.start_ticks)
+                    && cgroup_members(cgroup) == Some(0)
+                    && reread_absent
+                {
+                    action = CompositionScopeStopAction::StopUnitNoSuchUnitReconciled;
+                    stop_job_result = Some("typed_no_such_unit_reconciled".into());
+                } else {
+                    action = CompositionScopeStopAction::StopFailed;
+                    stop_job_result = Some(format!("typed_no_such_unit_not_clean: {error:#}"));
+                }
+            }
+            Err(error) => {
+                action = CompositionScopeStopAction::StopFailed;
+                stop_job_result = Some(format!("stop_failed: {error:#}"));
+            }
+        },
+        CompositionScopeStopAction::StopFailed => {
+            stop_job_result = Some(if !pre_stop_state_readable {
+                "state_unreadable_stop_not_requested".into()
+            } else {
+                "ownership_or_membership_ambiguous_stop_not_requested".into()
+            });
+        }
+        CompositionScopeStopAction::StopUnitNoSuchUnitReconciled => unreachable!(),
+    }
+
+    let final_state = backend.read_scope_state(&plan.unit_name);
+    let final_state_readable = final_state.is_ok();
+    let final_scope = final_state.as_ref().ok().and_then(Option::as_ref);
+    let final_active_state = final_scope.map(|state| state.active_state.clone());
+    let final_sub_state = final_scope.map(|state| state.sub_state.clone());
+    let final_cgroup_member_count = cgroup_members(cgroup);
+    let cgroup_absent_or_zero_members = final_cgroup_member_count == Some(0);
+    let unit_removed = final_state.as_ref().is_ok_and(Option::is_none);
+    let worker_absent = exact_worker_absent(plan.identity.pid, plan.identity.start_ticks);
+    let classification = if !pre_stop_state_readable || !final_state_readable {
+        CompositionScopeCleanupClassification::StateUnreadable
+    } else if action == CompositionScopeStopAction::StopFailed {
+        if stop_job_result.as_deref() == Some("removal_timeout") {
+            CompositionScopeCleanupClassification::RemovalTimeout
+        } else if !ownership_exact
+            || pre_stop_cgroup_member_count.is_none()
+            || pre_stop_cgroup_member_count.is_some_and(|count| count > 0)
+        {
+            CompositionScopeCleanupClassification::OwnershipAmbiguous
+        } else {
+            CompositionScopeCleanupClassification::StopFailed
+        }
+    } else if !worker_absent || !cgroup_absent_or_zero_members || !unit_removed {
+        CompositionScopeCleanupClassification::ActiveOrMembered
+    } else {
+        CompositionScopeCleanupClassification::Clean
+    };
+    CompositionScopeCleanupEvidence {
+        frozen_unit_name: plan.unit_name.clone(),
+        frozen_object_path: original.object_path.clone(),
+        frozen_control_group: original.control_group.clone(),
+        worker_pid: plan.identity.pid,
+        worker_start_ticks: plan.identity.start_ticks,
+        worker_absent,
+        pre_stop_state_readable,
+        pre_stop_unit_present,
+        pre_stop_active_state,
+        pre_stop_sub_state,
+        pre_stop_cgroup_member_count,
+        ownership_exact,
+        stop_action: action,
+        stop_job_result,
+        no_such_unit_typed,
+        post_error_reconciliation_attempted,
+        final_state_readable,
+        final_active_state,
+        final_sub_state,
+        final_cgroup_member_count,
+        cgroup_absent_or_zero_members,
+        unit_removed,
+        removal_wait_ms: removal_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        classification,
+        failure_reason: (classification != CompositionScopeCleanupClassification::Clean)
+            .then(|| format!("{classification:?}")),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn level_is_sustainable(
     variant: BenchmarkVariant,
@@ -1475,14 +1715,20 @@ pub fn execute_capacity_composition(
             "STOP",
         );
         let worker_status = child.wait()?;
-        systemd.stop_owned_scope(&plan)?;
-        systemd.wait_inactive_or_removed(&plan.unit_name, Duration::from_secs(5))?;
+        let scope_cleanup = reconcile_composition_scope(
+            &mut systemd,
+            &plan,
+            &scope,
+            &Path::new("/sys/fs/cgroup").join(scope.control_group.trim_start_matches('/')),
+            Duration::from_secs(5),
+        );
         let restored = StructuralSnapshot::capture().matches(&before);
         let run_pass = levels.len() == 3
             && levels
                 .iter()
                 .all(|level| level.classification == CompositionLevelClassification::Sustainable)
             && worker_status.success()
+            && scope_cleanup.passed()
             && restored;
         evidence.runs.push(CapacityCompositionRunEvidence {
             version: COMPOSITION_RUN_EVIDENCE_VERSION,
@@ -1496,7 +1742,8 @@ pub fn execute_capacity_composition(
                 CompositionExperimentState::InvalidRun
             },
             levels,
-            pressure_scope_cleanup_passed: true,
+            pressure_scope_cleanup_passed: scope_cleanup.passed(),
+            scope_cleanup,
             structural_restore_passed: restored,
             reason: if run_pass {
                 "all three composition levels sustainable".into()
@@ -1545,6 +1792,7 @@ mod tests {
     use crate::capacity_external_target::{
         CAPACITY_EXTERNAL_TARGET_COLD_BYTES, CAPACITY_EXTERNAL_TARGET_ZONE_BYTES,
     };
+    use crate::systemd::{RecoveryOwnership, SystemdCapability, SystemdOperationFailure};
     use damon::AddressRange;
 
     fn progress(sequence: u64, hot: u64, warm: u64) -> CapacityExternalTargetProgress {
@@ -1608,6 +1856,276 @@ mod tests {
             only_cold_reclaimed: true,
             cleanup_passed: true,
         }
+    }
+
+    #[derive(Default)]
+    struct CleanupBackend {
+        state: Option<ScopeState>,
+        stops: usize,
+        no_such_unit: bool,
+        read_failure: bool,
+        removal_timeout: bool,
+    }
+
+    impl TransientScopeBackend for CleanupBackend {
+        fn capability(&self) -> Result<SystemdCapability> {
+            bail!("unused")
+        }
+        fn unit_exists(&self, _: &str) -> Result<bool> {
+            Ok(self.state.is_some())
+        }
+        fn list_owned_units(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        fn start_owned_scope(&mut self, _: &TransientScopePlan) -> Result<ScopeState> {
+            bail!("unused")
+        }
+        fn start_evidence(&self) -> Option<crate::systemd::SystemdStartEvidence> {
+            None
+        }
+        fn read_scope_state(&self, _: &str) -> Result<Option<ScopeState>> {
+            if self.read_failure {
+                bail!("simulated state read failure");
+            }
+            Ok(self.state.clone())
+        }
+        fn stop_owned_scope(&mut self, _: &TransientScopePlan) -> Result<()> {
+            self.stops += 1;
+            if self.no_such_unit {
+                self.state = None;
+                return Err(anyhow::Error::new(SystemdOperationFailure {
+                    stage: "stop".into(),
+                    dbus_error_name: Some(crate::systemd::SYSTEMD_NO_SUCH_UNIT.into()),
+                    error_category: "method_error".into(),
+                    bounded_message: "unit absent".into(),
+                    method: "StopUnit".into(),
+                    interface: None,
+                    property: None,
+                    job_path: None,
+                    job_result: None,
+                    unit_object_path: None,
+                    worker_unit_object_path: None,
+                    unit_absent_after_method_failure: Some(true),
+                    mutation_may_have_started: false,
+                    cleanup_required: false,
+                }));
+            }
+            self.state = None;
+            Ok(())
+        }
+        fn wait_inactive_or_removed(&self, _: &str, _: Duration) -> Result<()> {
+            if self.removal_timeout {
+                bail!("timeout");
+            }
+            Ok(())
+        }
+        fn recover_owned_scope(
+            &mut self,
+            _: &TransientScopePlan,
+            _: RecoveryOwnership,
+        ) -> Result<()> {
+            bail!("unused")
+        }
+    }
+
+    fn cleanup_fixture() -> (TransientScopePlan, ScopeState, tempfile::TempDir) {
+        let identity = crate::harness::OwnedProcessIdentity {
+            run_id: "cleanupfixture".into(),
+            pid: u32::MAX,
+            start_ticks: 1,
+        };
+        let plan =
+            TransientScopePlan::with_pressure_limits("cleanupfixture", identity, MIB, 20_000_000)
+                .unwrap();
+        let scope = ScopeState {
+            unit_name: plan.unit_name.clone(),
+            object_path: "/unit/exact".into(),
+            control_group: "/exact.scope".into(),
+            memory_max: plan.memory_max,
+            memory_accounting: true,
+            cpu_accounting: true,
+            io_accounting: true,
+            runtime_max_usec: plan.runtime_max_usec,
+            active_state: "active".into(),
+            sub_state: "running".into(),
+            members: BTreeSet::from([plan.identity.pid]),
+        };
+        (plan, scope, tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn already_absent_scope_requires_worker_unit_and_cgroup_absence() {
+        let (plan, scope, root) = cleanup_fixture();
+        let mut backend = CleanupBackend::default();
+        let evidence = reconcile_composition_scope(
+            &mut backend,
+            &plan,
+            &scope,
+            &root.path().join("absent"),
+            Duration::ZERO,
+        );
+        assert!(evidence.passed());
+        assert_eq!(
+            evidence.stop_action,
+            CompositionScopeStopAction::AlreadyAbsent
+        );
+        assert_eq!(backend.stops, 0);
+    }
+
+    #[test]
+    fn exact_present_scope_requests_one_stop_and_passes() {
+        let (plan, scope, root) = cleanup_fixture();
+        let mut backend = CleanupBackend {
+            state: Some(scope.clone()),
+            ..Default::default()
+        };
+        let evidence = reconcile_composition_scope(
+            &mut backend,
+            &plan,
+            &scope,
+            &root.path().join("absent"),
+            Duration::ZERO,
+        );
+        assert!(evidence.passed());
+        assert_eq!(
+            evidence.stop_action,
+            CompositionScopeStopAction::StopUnitRequested
+        );
+        assert_eq!(backend.stops, 1);
+    }
+
+    #[test]
+    fn typed_no_such_unit_is_reconciled_once_only_after_final_absence() {
+        let (plan, scope, root) = cleanup_fixture();
+        let mut backend = CleanupBackend {
+            state: Some(scope.clone()),
+            no_such_unit: true,
+            ..Default::default()
+        };
+        let evidence = reconcile_composition_scope(
+            &mut backend,
+            &plan,
+            &scope,
+            &root.path().join("absent"),
+            Duration::ZERO,
+        );
+        assert!(evidence.passed());
+        assert!(evidence.no_such_unit_typed);
+        assert!(evidence.post_error_reconciliation_attempted);
+        assert_eq!(
+            evidence.stop_action,
+            CompositionScopeStopAction::StopUnitNoSuchUnitReconciled
+        );
+        assert_eq!(backend.stops, 1);
+    }
+
+    #[test]
+    fn state_read_failure_is_fail_closed_without_stop() {
+        let (plan, scope, root) = cleanup_fixture();
+        let mut backend = CleanupBackend {
+            read_failure: true,
+            ..Default::default()
+        };
+        let evidence = reconcile_composition_scope(
+            &mut backend,
+            &plan,
+            &scope,
+            &root.path().join("absent"),
+            Duration::ZERO,
+        );
+        assert!(!evidence.passed());
+        assert_eq!(
+            evidence.classification,
+            CompositionScopeCleanupClassification::StateUnreadable
+        );
+        assert_eq!(backend.stops, 0);
+    }
+
+    #[test]
+    fn absent_unit_with_unreadable_cgroup_is_fail_closed() {
+        let (plan, scope, root) = cleanup_fixture();
+        let cgroup = root.path().join("existing-cgroup");
+        fs::create_dir(&cgroup).unwrap();
+        let mut backend = CleanupBackend::default();
+        let evidence =
+            reconcile_composition_scope(&mut backend, &plan, &scope, &cgroup, Duration::ZERO);
+        assert!(!evidence.passed());
+        assert_eq!(evidence.final_cgroup_member_count, None);
+        assert_eq!(backend.stops, 0);
+    }
+
+    #[test]
+    fn absent_unit_with_matching_live_worker_is_fail_closed() {
+        let (_, scope, root) = cleanup_fixture();
+        let pid = std::process::id();
+        let ticks = proc_start_ticks(pid).unwrap().unwrap();
+        let plan = TransientScopePlan::with_pressure_limits(
+            "liveworkerfixture",
+            crate::harness::OwnedProcessIdentity {
+                run_id: "liveworkerfixture".into(),
+                pid,
+                start_ticks: ticks,
+            },
+            MIB,
+            20_000_000,
+        )
+        .unwrap();
+        let mut original = scope;
+        original.unit_name = plan.unit_name.clone();
+        original.memory_max = plan.memory_max;
+        original.runtime_max_usec = plan.runtime_max_usec;
+        original.members = BTreeSet::from([pid]);
+        let mut backend = CleanupBackend::default();
+        let evidence = reconcile_composition_scope(
+            &mut backend,
+            &plan,
+            &original,
+            root.path(),
+            Duration::ZERO,
+        );
+        assert!(!evidence.passed());
+        assert!(!evidence.worker_absent);
+        assert_eq!(backend.stops, 0);
+    }
+
+    #[test]
+    fn changed_exact_ownership_never_requests_stop() {
+        let (plan, scope, root) = cleanup_fixture();
+        let mut changed = scope.clone();
+        changed.control_group = "/foreign.scope".into();
+        let mut backend = CleanupBackend {
+            state: Some(changed),
+            ..Default::default()
+        };
+        let evidence = reconcile_composition_scope(
+            &mut backend,
+            &plan,
+            &scope,
+            &root.path().join("absent"),
+            Duration::ZERO,
+        );
+        assert!(!evidence.passed());
+        assert_eq!(
+            evidence.classification,
+            CompositionScopeCleanupClassification::OwnershipAmbiguous
+        );
+        assert_eq!(backend.stops, 0);
+    }
+
+    #[test]
+    fn cleanup_evidence_round_trip_and_passed_semantics() {
+        let (plan, scope, root) = cleanup_fixture();
+        let mut backend = CleanupBackend::default();
+        let absent = root.path().join("absent");
+        let evidence =
+            reconcile_composition_scope(&mut backend, &plan, &scope, &absent, Duration::ZERO);
+        let encoded = serde_json::to_vec(&evidence).unwrap();
+        let decoded: CompositionScopeCleanupEvidence = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, evidence);
+        assert!(decoded.passed());
+        let mut failed = decoded;
+        failed.unit_removed = false;
+        assert!(!failed.passed());
     }
 
     #[test]
