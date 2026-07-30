@@ -12,6 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod capacity_compatibility;
+pub mod capacity_composition;
 pub mod capacity_external_target;
 pub mod capacity_external_validation;
 pub mod capacity_orchestration;

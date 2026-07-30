@@ -195,6 +195,32 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
+    PrepareCapacityComposition {
+        #[arg(long, default_value = ".")]
+        repository: PathBuf,
+        #[arg(long, default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        validator_binary: PathBuf,
+        #[arg(long)]
+        target_binary: Option<PathBuf>,
+        #[arg(long)]
+        external_target_archive: PathBuf,
+        #[arg(long)]
+        prepared_dir: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    CapacityCompositionPreflight {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    ExecuteCapacityComposition {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     PressurePreflight {
         #[arg(long)]
         manifest: PathBuf,
@@ -705,6 +731,48 @@ fn run() -> Result<i32> {
             println!(
                 "validation_id={} state={:?} capacity=not_evaluated effectiveness=not_evaluated",
                 report.payload.validation_id, report.state
+            );
+        }
+        Command::PrepareCapacityComposition {
+            repository,
+            config,
+            validator_binary,
+            target_binary,
+            external_target_archive,
+            prepared_dir,
+            output_dir,
+        } => {
+            let path = nemor_benchmark::capacity_composition::prepare_capacity_composition(
+                &repository,
+                &config,
+                &validator_binary,
+                target_binary.as_deref(),
+                &external_target_archive,
+                &prepared_dir,
+                &output_dir,
+            )?;
+            println!("manifest={}", path.display());
+        }
+        Command::CapacityCompositionPreflight { manifest, json } => {
+            let report =
+                nemor_benchmark::capacity_composition::capacity_composition_preflight(&manifest)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::ExecuteCapacityComposition { manifest } => {
+            let report =
+                nemor_benchmark::capacity_composition::execute_capacity_composition(&manifest)?;
+            println!(
+                "experiment_id={} state={:?} capacity=not_evaluated effectiveness=not_evaluated",
+                report.experiment_id, report.state
+            );
+            return Ok(
+                nemor_benchmark::capacity_composition::composition_execution_exit_status(
+                    report.state,
+                ),
             );
         }
         Command::PressurePreflight { manifest, json } => {
