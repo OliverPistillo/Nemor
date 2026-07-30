@@ -17,7 +17,7 @@ use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -235,6 +235,10 @@ struct Cli {
     external_target_creator_pid: Option<u32>,
     #[arg(long, hide = true, requires = "external_target_descriptor")]
     external_target_creator_start_ticks: Option<u64>,
+    #[arg(long, hide = true, requires = "report_root")]
+    report_path: Option<PathBuf>,
+    #[arg(long, hide = true, requires = "report_path")]
+    report_root: Option<PathBuf>,
 }
 
 impl Cli {
@@ -1351,6 +1355,8 @@ fn main() -> Result<()> {
         return cleanup_owned_residue();
     }
     let scope = cli.scope()?;
+    let report_destination =
+        explicit_report_destination(cli.report_path.as_deref(), cli.report_root.as_deref())?;
     let deadline = Deadline::new();
     let _state_dir = StateDir::create()?;
     let baseline = snapshot_host()?;
@@ -1545,11 +1551,15 @@ fn main() -> Result<()> {
         }
     }
     report.finished_ns = now_ns()?;
-    write_report(&report)?;
+    write_report(&report, report_destination.as_ref())?;
     if report.errors.is_empty() && report.host_unchanged {
         Ok(())
     } else {
-        bail!("validation incomplete; inspect {REPORT_PATH}")
+        let path = report_destination.as_ref().map_or_else(
+            || Path::new(REPORT_PATH),
+            |destination| destination.path.as_path(),
+        );
+        bail!("validation incomplete; inspect {}", path.display())
     }
 }
 
@@ -7516,8 +7526,63 @@ impl Drop for StateDir {
     }
 }
 
-fn write_report(report: &ValidationReport) -> Result<()> {
+#[derive(Debug, Clone)]
+struct ExplicitReportDestination {
+    path: PathBuf,
+    root: PathBuf,
+    root_device: u64,
+    root_inode: u64,
+}
+
+fn explicit_report_destination(
+    report_path: Option<&Path>,
+    report_root: Option<&Path>,
+) -> Result<Option<ExplicitReportDestination>> {
+    let (Some(path), Some(root)) = (report_path, report_root) else {
+        if report_path.is_some() || report_root.is_some() {
+            bail!("explicit report path and root must be supplied together");
+        }
+        return Ok(None);
+    };
+    if !path.is_absolute() || !root.is_absolute() {
+        bail!("explicit report path and root must be absolute");
+    }
+    if !matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("damos-component-report.json" | "raw-damos-report.json")
+    ) {
+        bail!("explicit report filename is not allow-listed");
+    }
+    if path.parent() != Some(root) {
+        bail!("explicit report must be a direct child of its authorized root");
+    }
+    let root_meta = fs::symlink_metadata(root)
+        .with_context(|| format!("inspect explicit report root {}", root.display()))?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        bail!("explicit report root must be a non-symlink directory");
+    }
+    if fs::canonicalize(root)? != root {
+        bail!("explicit report root is not canonical");
+    }
+    if fs::symlink_metadata(path).is_ok() {
+        bail!("explicit report path already exists");
+    }
+    Ok(Some(ExplicitReportDestination {
+        path: path.to_path_buf(),
+        root: root.to_path_buf(),
+        root_device: root_meta.dev(),
+        root_inode: root_meta.ino(),
+    }))
+}
+
+fn write_report(
+    report: &ValidationReport,
+    destination: Option<&ExplicitReportDestination>,
+) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(report)?;
+    if let Some(destination) = destination {
+        return write_explicit_report(&bytes, destination);
+    }
     let archive = report_archive_path(report.started_ns);
     write_archived_report(
         &bytes,
@@ -7525,6 +7590,39 @@ fn write_report(report: &ValidationReport) -> Result<()> {
         Path::new(REPORT_PATH),
         Path::new(STATE_DIR),
     )
+}
+
+fn write_explicit_report(bytes: &[u8], destination: &ExplicitReportDestination) -> Result<()> {
+    let root_meta = fs::symlink_metadata(&destination.root)?;
+    if root_meta.file_type().is_symlink()
+        || !root_meta.is_dir()
+        || root_meta.dev() != destination.root_device
+        || root_meta.ino() != destination.root_inode
+        || fs::canonicalize(&destination.root)? != destination.root
+    {
+        bail!("explicit report root identity changed before write");
+    }
+    if fs::symlink_metadata(&destination.path).is_ok() {
+        bail!("explicit report path appeared before write");
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&destination.path)
+        .with_context(|| format!("create explicit report {}", destination.path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.dev() != fs::metadata(&destination.root)?.dev()
+    {
+        bail!("explicit report metadata violates the report contract");
+    }
+    fs::File::open(&destination.root)?.sync_all()?;
+    Ok(())
 }
 
 fn report_archive_path(run_id: u128) -> PathBuf {
@@ -8183,6 +8281,71 @@ fn read_os_id() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_report_destination_requires_absolute_direct_child_and_exact_name() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let valid = canonical.join("raw-damos-report.json");
+        let destination = explicit_report_destination(Some(&valid), Some(&canonical))
+            .unwrap()
+            .unwrap();
+        assert_eq!(destination.path, valid);
+        assert!(explicit_report_destination(
+            Some(Path::new("raw-damos-report.json")),
+            Some(&canonical)
+        )
+        .is_err());
+        assert!(explicit_report_destination(
+            Some(&canonical.join("nested/raw-damos-report.json")),
+            Some(&canonical)
+        )
+        .is_err());
+        assert!(
+            explicit_report_destination(Some(&canonical.join("wrong.json")), Some(&canonical))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_report_destination_rejects_existing_file_directory_and_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let file = canonical.join("damos-component-report.json");
+        fs::write(&file, b"existing").unwrap();
+        assert!(explicit_report_destination(Some(&file), Some(&canonical)).is_err());
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        assert!(explicit_report_destination(Some(&file), Some(&canonical)).is_err());
+        fs::remove_dir(&file).unwrap();
+        std::os::unix::fs::symlink("/tmp", &file).unwrap();
+        assert!(explicit_report_destination(Some(&file), Some(&canonical)).is_err());
+    }
+
+    #[test]
+    fn explicit_report_write_is_create_new_mode_0600_single_link_and_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let path = canonical.join("raw-damos-report.json");
+        let destination = explicit_report_destination(Some(&path), Some(&canonical))
+            .unwrap()
+            .unwrap();
+        let bytes = br#"{"scope":"damos","raw":true}"#;
+        write_explicit_report(bytes, &destination).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(write_explicit_report(bytes, &destination).is_err());
+    }
+
+    #[test]
+    fn explicit_report_arguments_are_paired_and_legacy_mode_remains_available() {
+        assert!(explicit_report_destination(None, None).unwrap().is_none());
+        assert!(explicit_report_destination(Some(Path::new("/tmp/report")), None).is_err());
+        assert!(explicit_report_destination(None, Some(Path::new("/tmp"))).is_err());
+    }
 
     #[test]
     fn path_allow_list_is_closed() {

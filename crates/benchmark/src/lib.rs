@@ -25,6 +25,8 @@ pub mod pressure_live;
 pub mod pressure_prepare;
 pub mod pressure_worker;
 pub mod systemd;
+pub mod validator_report;
+pub mod validator_report_recovery;
 
 pub const BENCHMARK_SCHEMA_VERSION: u32 = 1;
 pub const MATERIAL_ENVIRONMENT_SCHEMA_VERSION: u32 = 1;

@@ -30,11 +30,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CAPACITY_BENCHMARK_CONTRACT_VERSION: u32 = 1;
 pub const CAPACITY_SEARCH_POLICY_VERSION: u32 = 1;
-pub const CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION: u32 = 2;
-pub const CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION: u32 = 2;
-pub const CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION: u32 = 2;
-pub const CAPACITY_BENCHMARK_RUN_VERSION: u32 = 2;
-pub const CAPACITY_BENCHMARK_LEVEL_VERSION: u32 = 2;
+pub const CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION: u32 = 3;
+pub const CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION: u32 = 3;
+pub const CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION: u32 = 3;
+pub const CAPACITY_BENCHMARK_RUN_VERSION: u32 = 3;
+pub const CAPACITY_BENCHMARK_LEVEL_VERSION: u32 = 3;
 pub const CAPACITY_EVALUATION_VERSION: u32 = 2;
 pub const CAPACITY_BENCHMARK_MANIFEST_NAME: &str = "capacity-benchmark.manifest.json";
 pub const ALIGNMENT_BYTES: u64 = 16 * 1024 * 1024;
@@ -208,6 +208,9 @@ pub struct CapacityBenchmarkPreflight {
     pub ownership_plan_supported: bool,
     pub output_fresh: bool,
     pub stale_resources_clear: bool,
+    pub report_lifecycle_version_supported: bool,
+    pub legacy_global_report_absent: bool,
+    pub validator_state_absent: bool,
     pub current_identity_authorized: bool,
     pub bounded_capacity_benchmark_entry_ready: bool,
     pub execution_ready: bool,
@@ -601,7 +604,10 @@ pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPref
         == BUILD_GIT_HEAD
         && verify_archive(&payload.composition_prerequisite, "experiment-report.json").is_ok();
     let output_fresh = fs::read_dir(&payload.output_root)?.next().is_none();
-    let stale_resources_clear = !Path::new("/tmp/nemor-privileged-validation-report.json").exists()
+    let legacy_global_report_absent = crate::validator_report::legacy_report_absent();
+    let validator_state_absent = crate::validator_report::validator_state_absent();
+    let stale_resources_clear = legacy_global_report_absent
+        && validator_state_absent
         && !super::capacity_composition::processes_contain("pressure-worker")
         && !super::capacity_composition::processes_contain("capacity-external-target-worker")
         && !payload.output_root.join("pressure-0.sock").exists();
@@ -665,6 +671,10 @@ pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPref
         ownership_plan_supported,
         output_fresh,
         stale_resources_clear,
+        report_lifecycle_version_supported:
+            crate::capacity_composition::COMPOSITION_TARGET_EVIDENCE_VERSION == 2,
+        legacy_global_report_absent,
+        validator_state_absent,
         current_identity_authorized: identity_authorized,
         bounded_capacity_benchmark_entry_ready: ready,
         execution_ready: ready,
@@ -1987,7 +1997,10 @@ mod tests {
             "classification": "pass"
         });
         assert!(serde_json::from_value::<CapacityRecoveryReport>(value).is_err());
-        assert_eq!(CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION, 2);
+        assert_eq!(CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION, 3);
+        assert_eq!(CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION, 3);
+        assert_eq!(CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION, 3);
+        assert_eq!(CAPACITY_EVALUATION_VERSION, 2);
         assert_eq!(
             crate::capacity_external_target::CAPACITY_EXTERNAL_TARGET_PROTOCOL_VERSION,
             1

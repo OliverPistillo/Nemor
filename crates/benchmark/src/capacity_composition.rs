@@ -25,6 +25,10 @@ use crate::systemd::{
     is_systemd_no_such_unit, ScopeState, SystemdDbusBackend, TransientScopeBackend,
     TransientScopePlan,
 };
+use crate::validator_report::{
+    baseline_report_lifecycle, inspect_scoped_report, legacy_report_absent, validator_state_absent,
+    ValidatorReportLifecycleEvidence,
+};
 use crate::{
     deterministic_order, BenchmarkVariant, BuildProvenance, EnvironmentFingerprint,
     EvaluationState, StructuralSnapshot, BUILD_GIT_HEAD,
@@ -43,12 +47,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const COMPOSITION_CONTRACT_VERSION: u32 = 1;
-pub const COMPOSITION_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const COMPOSITION_PREFLIGHT_SCHEMA_VERSION: u32 = 1;
-pub const COMPOSITION_EXECUTION_SCHEMA_VERSION: u32 = 2;
-pub const COMPOSITION_RUN_EVIDENCE_VERSION: u32 = 2;
-pub const COMPOSITION_LEVEL_EVIDENCE_VERSION: u32 = 1;
-pub const COMPOSITION_TARGET_EVIDENCE_VERSION: u32 = 1;
+pub const COMPOSITION_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const COMPOSITION_PREFLIGHT_SCHEMA_VERSION: u32 = 2;
+pub const COMPOSITION_EXECUTION_SCHEMA_VERSION: u32 = 3;
+pub const COMPOSITION_RUN_EVIDENCE_VERSION: u32 = 3;
+pub const COMPOSITION_LEVEL_EVIDENCE_VERSION: u32 = 2;
+pub const COMPOSITION_TARGET_EVIDENCE_VERSION: u32 = 2;
 pub const COMPOSITION_MANIFEST_NAME: &str = "capacity-composition.manifest.json";
 pub const COMPOSITION_PURPOSE: &str = "capacity_composition_framework_validation";
 pub const COMPOSITION_SERVICE_WINDOW_MS: u64 = 10_000;
@@ -56,8 +60,6 @@ pub const COMPOSITION_STABILIZATION_MS: u64 = 2_000;
 pub const COMPOSITION_SAMPLE_INTERVAL_MS: u64 = 1_000;
 pub const COMPOSITION_LEVEL_TIMEOUT_MS: u64 = 25_000;
 pub const COMPOSITION_RUN_TIMEOUT_MS: u64 = 90_000;
-const HARNESS_REPORT: &str = "/tmp/nemor-privileged-validation-report.json";
-const HARNESS_STATE: &str = "/tmp/nemor-privileged-validation";
 
 struct ExactSocketGuard {
     path: PathBuf,
@@ -371,6 +373,9 @@ pub struct CapacityCompositionPreflight {
     pub psi_supported: bool,
     pub output_fresh: bool,
     pub stale_resources_clear: bool,
+    pub report_lifecycle_version_supported: bool,
+    pub legacy_global_report_absent: bool,
+    pub validator_state_absent: bool,
     pub privileged_capability: CompositionPrivilegeStatus,
     pub user_preflight_passed: bool,
     pub current_identity_authorized: bool,
@@ -434,6 +439,8 @@ pub struct CompositionTargetEvidence {
     pub applied_bytes: u64,
     pub only_cold_reclaimed: bool,
     pub cleanup_passed: bool,
+    #[serde(default)]
+    pub validator_report_lifecycle: ValidatorReportLifecycleEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -841,9 +848,11 @@ pub fn capacity_composition_preflight(
     let psi_supported =
         Path::new("/proc/pressure/memory").is_file() && Path::new("/sys/fs/cgroup").is_dir();
     let output_fresh = fs::read_dir(&payload.output_root)?.next().is_none();
+    let legacy_global_report_absent = legacy_report_absent();
+    let validator_state_absent = validator_state_absent();
     let stale_resources_clear = owned_units_clear
-        && !Path::new(HARNESS_STATE).exists()
-        && !Path::new(HARNESS_REPORT).exists()
+        && validator_state_absent
+        && legacy_global_report_absent
         && !processes_contain("pressure-worker")
         && !processes_contain("capacity-external-target-worker");
     let current_mem = mem_available_bytes()?;
@@ -915,6 +924,9 @@ pub fn capacity_composition_preflight(
         psi_supported,
         output_fresh,
         stale_resources_clear,
+        report_lifecycle_version_supported: COMPOSITION_TARGET_EVIDENCE_VERSION == 2,
+        legacy_global_report_absent,
+        validator_state_absent,
         privileged_capability,
         user_preflight_passed: common,
         current_identity_authorized: identity_authorized,
@@ -1263,13 +1275,16 @@ fn target_for_level(
     }
     let descriptor_path = root.join("target-descriptor.json");
     let validator_invoked = run.variant == BenchmarkVariant::NemorCapacity;
-    let (direct, required, applied, only_cold, cleanup) = if validator_invoked {
-        if Path::new(HARNESS_REPORT).exists() {
-            fs::remove_file(HARNESS_REPORT)?;
+    let (direct, required, applied, only_cold, cleanup, mut report_lifecycle) = if validator_invoked
+    {
+        if !legacy_report_absent() {
+            bail!("legacy privileged validator report is present");
         }
-        if Path::new(HARNESS_STATE).exists() {
+        if !validator_state_absent() {
             bail!("stale privileged validator state");
         }
+        let raw_report_path = level_dir.join("raw-damos-report.json");
+        let legacy_absent_before = legacy_report_absent();
         let creator_pid = std::process::id();
         let creator_ticks =
             proc_start_ticks(creator_pid)?.context("creator start ticks unavailable")?;
@@ -1287,10 +1302,21 @@ fn target_for_level(
             .arg(creator_pid.to_string())
             .arg("--external-target-creator-start-ticks")
             .arg(creator_ticks.to_string())
+            .arg("--report-path")
+            .arg(&raw_report_path)
+            .arg("--report-root")
+            .arg(level_dir)
             .current_dir(&payload.repository)
             .status()?;
-        let raw: Value = serde_json::from_slice(&fs::read(HARNESS_REPORT)?)?;
-        write_new_json(&level_dir.join("raw-damos-report.json"), &raw)?;
+        let (raw, _raw_bytes, report_lifecycle) = inspect_scoped_report(
+            &raw_report_path,
+            level_dir,
+            "raw-damos-report.json",
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+            status.code(),
+            legacy_absent_before,
+        )?;
         let checks = raw["damos"]["checks"]
             .as_array()
             .cloned()
@@ -1323,7 +1349,14 @@ fn target_for_level(
             && passed("recovery")
             && passed("recovery_idempotent")
             && raw["host_unchanged"].as_bool().unwrap_or(false);
-        (gates, required, applied, only_cold, cleanup)
+        (
+            gates,
+            required,
+            applied,
+            only_cold,
+            cleanup,
+            report_lifecycle,
+        )
     } else {
         consume_descriptor_once(&descriptor_path, &descriptor.payload_sha256)?;
         write_command(
@@ -1339,7 +1372,14 @@ fn target_for_level(
                 nonce: nonce.clone(),
             },
         )?;
-        ([false; 4], false, 0, true, true)
+        (
+            [false; 4],
+            false,
+            0,
+            true,
+            true,
+            baseline_report_lifecycle(),
+        )
     };
     if read_progress(&descriptor.payload.progress_path).is_ok_and(|progress| {
         !matches!(
@@ -1358,6 +1398,9 @@ fn target_for_level(
     let after = read_progress(&descriptor.payload.progress_path)?;
     fs::copy(&descriptor_path, level_dir.join("target-descriptor.json"))?;
     write_new_json(&level_dir.join("target-progress.json"), &after)?;
+    remove_target_root(&root)?;
+    report_lifecycle.legacy_global_absent_after = legacy_report_absent();
+    report_lifecycle.validator_state_absent = validator_state_absent();
     let evidence = CompositionTargetEvidence {
         version: COMPOSITION_TARGET_EVIDENCE_VERSION,
         transaction_id,
@@ -1384,8 +1427,8 @@ fn target_for_level(
         applied_bytes: applied,
         only_cold_reclaimed: only_cold,
         cleanup_passed: cleanup && status.success(),
+        validator_report_lifecycle: report_lifecycle,
     };
-    remove_target_root(&root)?;
     Ok(evidence)
 }
 
@@ -1595,7 +1638,16 @@ fn level_is_sustainable(
         && structural_restore
         && match variant {
             BenchmarkVariant::CachyosBaseline => {
-                !target.validator_invoked && target.no_damon_damos_mutation
+                !target.validator_invoked
+                    && target.no_damon_damos_mutation
+                    && matches!(
+                target.validator_report_lifecycle.classification,
+                crate::validator_report::ValidatorReportLifecycleClassification::BaselineNoReport
+            ) && target
+                    .validator_report_lifecycle
+                    .legacy_global_absent_before
+                    && target.validator_report_lifecycle.legacy_global_absent_after
+                    && target.validator_report_lifecycle.validator_state_absent
             }
             BenchmarkVariant::NemorCapacity => {
                 target.validator_invoked
@@ -1603,6 +1655,15 @@ fn level_is_sustainable(
                     && target.direct_shadow_gates.into_iter().all(|gate| gate)
                     && target.required_damos_gates_passed
                     && target.only_cold_reclaimed
+                    && matches!(
+                        target.validator_report_lifecycle.classification,
+                        crate::validator_report::ValidatorReportLifecycleClassification::Pass
+                    )
+                    && target
+                        .validator_report_lifecycle
+                        .legacy_global_absent_before
+                    && target.validator_report_lifecycle.legacy_global_absent_after
+                    && target.validator_report_lifecycle.validator_state_absent
             }
             _ => false,
         }
@@ -2070,6 +2131,10 @@ mod tests {
             end: 0x3000_0000 + CAPACITY_EXTERNAL_TARGET_COLD_BYTES,
         };
         let capacity = variant == BenchmarkVariant::NemorCapacity;
+        let mut baseline_lifecycle = baseline_report_lifecycle();
+        baseline_lifecycle.legacy_global_absent_before = true;
+        baseline_lifecycle.legacy_global_absent_after = true;
+        baseline_lifecycle.validator_state_absent = true;
         CompositionTargetEvidence {
             version: COMPOSITION_TARGET_EVIDENCE_VERSION,
             transaction_id: "transaction".into(),
@@ -2096,6 +2161,24 @@ mod tests {
             applied_bytes: if capacity { 8 * MIB } else { 0 },
             only_cold_reclaimed: true,
             cleanup_passed: true,
+            validator_report_lifecycle: if capacity {
+                ValidatorReportLifecycleEvidence {
+                    version: 1,
+                    report_path: Some(PathBuf::from("/tmp/output/raw-damos-report.json")),
+                    raw_sha256: Some("a".repeat(64)),
+                    canonical_semantic_sha256: Some("b".repeat(64)),
+                    metadata: None,
+                    validator_exit_status: Some(0),
+                    explicit_path_mode: true,
+                    legacy_global_absent_before: true,
+                    legacy_global_absent_after: true,
+                    validator_state_absent: true,
+                    classification:
+                        crate::validator_report::ValidatorReportLifecycleClassification::Pass,
+                }
+            } else {
+                baseline_lifecycle
+            },
         }
     }
 

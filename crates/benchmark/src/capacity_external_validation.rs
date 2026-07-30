@@ -13,10 +13,13 @@ use crate::capacity_orchestration::{
     component_contracts_for, CapacityComponent, CapacityComponentContractIdentity,
 };
 use crate::performance::BinaryIdentity;
+use crate::validator_report::{
+    inspect_scoped_report, legacy_report_absent, validator_state_absent,
+    ValidatorReportLifecycleEvidence,
+};
 use crate::{BuildProvenance, EnvironmentFingerprint, EvaluationState};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
@@ -26,13 +29,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const EXTERNAL_TARGET_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const EXTERNAL_TARGET_PREFLIGHT_SCHEMA_VERSION: u32 = 1;
-pub const EXTERNAL_TARGET_EXECUTION_SCHEMA_VERSION: u32 = 1;
+pub const EXTERNAL_TARGET_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const EXTERNAL_TARGET_PREFLIGHT_SCHEMA_VERSION: u32 = 2;
+pub const EXTERNAL_TARGET_EXECUTION_SCHEMA_VERSION: u32 = 2;
 pub const EXTERNAL_TARGET_MANIFEST_NAME: &str = "capacity-external-target.manifest.json";
 pub const EXTERNAL_TARGET_MAX_RUNTIME_MS: u64 = 180_000;
-const HARNESS_REPORT: &str = "/tmp/nemor-privileged-validation-report.json";
-const HARNESS_STATE: &str = "/tmp/nemor-privileged-validation";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalTargetValidationPayload {
@@ -125,6 +126,8 @@ pub struct ExternalTargetPreflight {
     pub action_envelope_unchanged: bool,
     pub output_fresh: bool,
     pub stale_resources_clear: bool,
+    pub legacy_global_report_absent: bool,
+    pub validator_state_absent: bool,
     pub privileged_capability: ExternalTargetPrivilegeStatus,
     pub user_preflight_passed: bool,
     pub current_identity_authorized: bool,
@@ -166,6 +169,8 @@ pub struct ExternalTargetExecutionPayload {
     pub control_channel_identity: String,
     pub final_progress: CapacityExternalTargetProgress,
     pub validator_exit_success: bool,
+    #[serde(default)]
+    pub validator_report_lifecycle: ValidatorReportLifecycleEvidence,
     pub direct_shadow_gates: [bool; 4],
     pub required_damos_gates_passed: bool,
     pub zero_host_oom: bool,
@@ -203,6 +208,23 @@ impl ExternalTargetExecutionReport {
 
     pub fn verify(&self) -> Result<()> {
         if self.payload_sha256 != hash_json(&self.payload)?
+            || self.payload.schema_version != EXTERNAL_TARGET_EXECUTION_SCHEMA_VERSION
+            || !matches!(
+                self.payload.validator_report_lifecycle.classification,
+                crate::validator_report::ValidatorReportLifecycleClassification::Pass
+            )
+            || !self
+                .payload
+                .validator_report_lifecycle
+                .legacy_global_absent_before
+            || !self
+                .payload
+                .validator_report_lifecycle
+                .legacy_global_absent_after
+            || !self
+                .payload
+                .validator_report_lifecycle
+                .validator_state_absent
             || self.payload.capacity_evaluation != EvaluationState::NotEvaluated
             || self.payload.effectiveness_evaluation != EvaluationState::NotEvaluated
             || self.payload.production_activation_authorized
@@ -342,9 +364,10 @@ pub fn external_target_preflight(manifest_path: &Path) -> Result<ExternalTargetP
         .next()
         .is_none();
     let transaction_root = manifest.payload.output_root.join("target-transaction");
-    let stale_resources_clear = !Path::new(HARNESS_REPORT).exists()
-        && !Path::new(HARNESS_STATE).exists()
-        && !transaction_root.exists();
+    let legacy_global_report_absent = legacy_report_absent();
+    let validator_state_absent = validator_state_absent();
+    let stale_resources_clear =
+        legacy_global_report_absent && validator_state_absent && !transaction_root.exists();
     let observation = damon::inspect_linux_observability(Path::new("/"));
     let damon = damon::inspect_linux(Path::new("/"), None);
     let damos = damos::observe_capability(&damon);
@@ -386,6 +409,8 @@ pub fn external_target_preflight(manifest_path: &Path) -> Result<ExternalTargetP
         action_envelope_unchanged: true,
         output_fresh,
         stale_resources_clear,
+        legacy_global_report_absent,
+        validator_state_absent,
         privileged_capability,
         user_preflight_passed: common,
         current_identity_authorized: identity_authorized,
@@ -450,6 +475,7 @@ pub fn validate_external_target(manifest_path: &Path) -> Result<ExternalTargetEx
         bail!("actual external target differs from frozen target identity");
     }
     let started = Instant::now();
+    let legacy_absent_before = legacy_report_absent();
     let status = Command::new(&manifest.payload.validator_path)
         .arg("--damos")
         .arg("--external-target-descriptor")
@@ -464,6 +490,10 @@ pub fn validate_external_target(manifest_path: &Path) -> Result<ExternalTargetEx
         .arg(creator_pid.to_string())
         .arg("--external-target-creator-start-ticks")
         .arg(creator_start_ticks.to_string())
+        .arg("--report-path")
+        .arg(&manifest.payload.raw_damos_report_path)
+        .arg("--report-root")
+        .arg(&manifest.payload.output_root)
         .current_dir(&manifest.payload.repository)
         .status()
         .context("launch external-target DAMOS controller")?;
@@ -483,8 +513,15 @@ pub fn validate_external_target(manifest_path: &Path) -> Result<ExternalTargetEx
         )?;
     }
     let _ = target.wait();
-    let raw = fs::read(HARNESS_REPORT).context("read external-target DAMOS report")?;
-    let component: Value = serde_json::from_slice(&raw)?;
+    let (component, _raw, mut validator_report_lifecycle) = inspect_scoped_report(
+        &manifest.payload.raw_damos_report_path,
+        &manifest.payload.output_root,
+        "damos-component-report.json",
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+        status.code(),
+        legacy_absent_before,
+    )?;
     let final_progress = read_progress(&descriptor.payload.progress_path)?;
     let checks = component["damos"]["checks"]
         .as_array()
@@ -514,6 +551,20 @@ pub fn validate_external_target(manifest_path: &Path) -> Result<ExternalTargetEx
         && final_progress.controlled_refaults == 1
         && final_progress.state
             == crate::capacity_external_target::CapacityExternalTargetState::Stopped;
+    fs::copy(
+        &descriptor_path,
+        &manifest.payload.runtime_descriptor_evidence_path,
+    )?;
+    write_new_json(
+        &manifest.payload.target_progress_evidence_path,
+        &final_progress,
+    )?;
+    cleanup_transaction(&transaction_root)?;
+    validator_report_lifecycle.legacy_global_absent_after = legacy_report_absent();
+    validator_report_lifecycle.validator_state_absent = validator_state_absent();
+    let report_lifecycle_pass = validator_report_lifecycle.legacy_global_absent_before
+        && validator_report_lifecycle.legacy_global_absent_after
+        && validator_report_lifecycle.validator_state_absent;
     let pass = status.success()
         && elapsed_ns <= EXTERNAL_TARGET_MAX_RUNTIME_MS.saturating_mul(1_000_000)
         && direct.into_iter().all(|gate| gate)
@@ -523,15 +574,8 @@ pub fn validate_external_target(manifest_path: &Path) -> Result<ExternalTargetEx
         && recovery_idempotent
         && restore
         && zero_oom
-        && target_health;
-    fs::copy(
-        &descriptor_path,
-        &manifest.payload.runtime_descriptor_evidence_path,
-    )?;
-    write_new_json(
-        &manifest.payload.target_progress_evidence_path,
-        &final_progress,
-    )?;
+        && target_health
+        && report_lifecycle_pass;
     let payload = ExternalTargetExecutionPayload {
         schema_version: EXTERNAL_TARGET_EXECUTION_SCHEMA_VERSION,
         validation_id: manifest.payload.validation_id.clone(),
@@ -546,6 +590,7 @@ pub fn validate_external_target(manifest_path: &Path) -> Result<ExternalTargetEx
         control_channel_identity: descriptor.payload.identity.control_channel_identity.clone(),
         final_progress,
         validator_exit_success: status.success(),
+        validator_report_lifecycle,
         direct_shadow_gates: direct,
         required_damos_gates_passed: required,
         zero_host_oom: zero_oom,
@@ -581,9 +626,7 @@ pub fn validate_external_target(manifest_path: &Path) -> Result<ExternalTargetEx
         payload,
     )?;
     report.verify()?;
-    write_new_json(&manifest.payload.raw_damos_report_path, &component)?;
     write_new_json(&manifest.payload.report_path, &report)?;
-    cleanup_transaction(&transaction_root)?;
     Ok(report)
 }
 
@@ -659,6 +702,9 @@ mod tests {
     fn execution_evidence_cannot_authorize_capacity_or_production() {
         assert_eq!(CAPACITY_EXTERNAL_TARGET_CONTRACT_VERSION, 1);
         assert_eq!(CAPACITY_EXTERNAL_TARGET_PROTOCOL_VERSION, 1);
+        assert_eq!(EXTERNAL_TARGET_MANIFEST_SCHEMA_VERSION, 2);
+        assert_eq!(EXTERNAL_TARGET_PREFLIGHT_SCHEMA_VERSION, 2);
+        assert_eq!(EXTERNAL_TARGET_EXECUTION_SCHEMA_VERSION, 2);
         let contract = CapacityExternalTargetContract::v1();
         assert!(!contract.pressure_search_authorized);
         assert!(!contract.production_activation_authorized);

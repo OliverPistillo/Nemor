@@ -253,6 +253,22 @@ enum Command {
         #[arg(long)]
         idempotence_check: bool,
     },
+    PrivilegedValidatorReportRecoveryPreflight {
+        #[arg(long)]
+        external_target_archive: PathBuf,
+        #[arg(long)]
+        composition_blocked_archive: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    RecoverPrivilegedValidatorReport {
+        #[arg(long)]
+        external_target_archive: PathBuf,
+        #[arg(long)]
+        composition_blocked_archive: PathBuf,
+        #[arg(long)]
+        idempotence_check: bool,
+    },
     PressurePreflight {
         #[arg(long)]
         manifest: PathBuf,
@@ -867,6 +883,33 @@ fn run() -> Result<i32> {
         } => {
             let report = nemor_benchmark::capacity_benchmark::recover_capacity_benchmark(
                 &manifest,
+                idempotence_check,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::PrivilegedValidatorReportRecoveryPreflight {
+            external_target_archive,
+            composition_blocked_archive,
+            json,
+        } => {
+            let report = nemor_benchmark::validator_report_recovery::recovery_preflight(
+                &external_target_archive,
+                &composition_blocked_archive,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::RecoverPrivilegedValidatorReport {
+            external_target_archive,
+            composition_blocked_archive,
+            idempotence_check,
+        } => {
+            let report = nemor_benchmark::validator_report_recovery::recover_report(
+                &external_target_archive,
+                &composition_blocked_archive,
                 idempotence_check,
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);

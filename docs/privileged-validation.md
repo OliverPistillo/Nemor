@@ -43,8 +43,20 @@ The privileged surface is closed:
 - global execution is bounded to 180 seconds;
 - guards perform ownership-checked cleanup on errors, with a final independent
   host comparison;
-- the structured report is written atomically to
-  `/tmp/nemor-privileged-validation-report.json`.
+- standalone validation retains the historical atomic report at
+  `/tmp/nemor-privileged-validation-report.json`; benchmark-owned
+  external-target and composition calls instead pass a hidden exact
+  `--report-path`/`--report-root` pair and preserve the validator's original
+  bytes as transaction-scoped evidence.
+
+The explicit report destination is fail-closed: it must be an absent,
+allow-listed direct child of an existing canonical non-symlink evidence
+directory. Creation is exclusive, mode `0600`, single-link, on the same
+device as its parent, and both file and parent directory are synchronized.
+Callers hash the exact bytes, calculate a separate deterministic canonical
+JSON hash for semantic comparison, validate the same bytes, and record
+metadata and exit status. They never route benchmark evidence through the
+legacy global path or reserialize parsed JSON under a “raw” name.
 
 ## Host baseline
 
