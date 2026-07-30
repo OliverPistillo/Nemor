@@ -311,8 +311,27 @@ struct ComponentReportAssessment {
     damon_safety_passed: bool,
     exact_resource_identities_present: bool,
     shadow_session_passed: bool,
+    shadow_cleanup: bool,
     vaddr_pageout_supported: bool,
     cold_address_fence: bool,
+}
+
+impl ComponentReportAssessment {
+    fn compatibility_passes(&self, bounded_execution_passed: bool) -> bool {
+        bounded_execution_passed
+            && self.source_commit_matches
+            && self.scope_matches
+            && self.errors_empty
+            && self.required_gates_passed
+            && self.vaddr_pageout_supported
+            && self.shadow_session_passed
+            && self.shadow_cleanup
+            && self.cold_address_fence
+            && self.cleanup_passed
+            && self.structural_restore_passed
+            && self.exact_resource_identities_present
+            && !self.host_oom_observed
+    }
 }
 
 fn assess_damos_report(report: &Value, expected_commit: &str) -> ComponentReportAssessment {
@@ -364,6 +383,7 @@ fn assess_damos_report(report: &Value, expected_commit: &str) -> ComponentReport
                     .is_some()
         }),
         shadow_session_passed: check_passed("shadow_session_passed"),
+        shadow_cleanup: check_passed("shadow_cleanup"),
         vaddr_pageout_supported: check_passed("vaddr_pageout_supported"),
         cold_address_fence: check_passed("cold_address_fence"),
     }
@@ -630,18 +650,7 @@ pub fn validate_capacity_compatibility(
     let assessment = assess_damos_report(&report, &manifest.payload.provenance.git_head);
     let bounded_execution_passed = status.success()
         && elapsed <= CAPACITY_COMPATIBILITY_MAX_RUNTIME_MS.saturating_mul(1_000_000);
-    let pass = bounded_execution_passed
-        && assessment.source_commit_matches
-        && assessment.scope_matches
-        && assessment.errors_empty
-        && assessment.required_gates_passed
-        && assessment.vaddr_pageout_supported
-        && assessment.shadow_session_passed
-        && assessment.cold_address_fence
-        && assessment.cleanup_passed
-        && assessment.structural_restore_passed
-        && assessment.exact_resource_identities_present
-        && !assessment.host_oom_observed;
+    let pass = assessment.compatibility_passes(bounded_execution_passed);
     let classification = if pass {
         CapacityCompatibilityClassification::Pass
     } else {
@@ -845,6 +854,7 @@ mod tests {
             ("kdamond_started", true),
             ("kdamond_stopped", true),
             ("shadow_session_passed", true),
+            ("shadow_cleanup", true),
             ("vaddr_pageout_supported", true),
             ("cold_address_fence", true),
         ]);
@@ -885,10 +895,12 @@ mod tests {
                 damon_safety_passed: true,
                 exact_resource_identities_present: true,
                 shadow_session_passed: true,
+                shadow_cleanup: true,
                 vaddr_pageout_supported: true,
                 cold_address_fence: true,
             }
         );
+        assert!(assessment.compatibility_passes(true));
     }
 
     #[test]
@@ -903,6 +915,76 @@ mod tests {
         let assessment =
             assess_damos_report(&report(&[("vaddr_pageout_supported", false)]), "commit");
         assert!(!assessment.vaddr_pageout_supported);
+        assert!(!assessment.compatibility_passes(true));
+    }
+
+    #[test]
+    fn direct_shadow_bootstrap_gates_independently_forbid_compatibility_pass() {
+        for gate in [
+            "vaddr_pageout_supported",
+            "shadow_session_passed",
+            "shadow_cleanup",
+            "cold_address_fence",
+        ] {
+            let assessment = assess_damos_report(&report(&[(gate, false)]), "commit");
+            assert!(!assessment.compatibility_passes(true), "{gate}");
+        }
+    }
+
+    #[test]
+    fn missing_shadow_cleanup_forbids_compatibility_pass() {
+        let mut raw = report(&[]);
+        raw["damos"]["checks"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|check| check["name"] != "shadow_cleanup");
+        let assessment = assess_damos_report(&raw, "commit");
+        assert!(!assessment.shadow_cleanup);
+        assert!(assessment.required_gates_passed);
+        assert!(!assessment.compatibility_passes(true));
+    }
+
+    #[test]
+    fn summary_gate_is_required_independently_of_direct_shadow_gates() {
+        let mut raw = report(&[]);
+        raw["damos"]["required_gates_passed"] = json!(false);
+        let assessment = assess_damos_report(&raw, "commit");
+        assert!(assessment.vaddr_pageout_supported);
+        assert!(assessment.shadow_session_passed);
+        assert!(assessment.shadow_cleanup);
+        assert!(assessment.cold_address_fence);
+        assert!(!assessment.compatibility_passes(true));
+    }
+
+    #[test]
+    fn compatibility_decision_remains_fail_closed_for_existing_safety_gates() {
+        for gate in ["cleanup", "scheme_removed", "zero_oom"] {
+            let assessment = assess_damos_report(&report(&[(gate, false)]), "commit");
+            assert!(!assessment.compatibility_passes(true), "{gate}");
+        }
+
+        let mut cases = Vec::new();
+        let mut structural_restore = report(&[]);
+        structural_restore["host_unchanged"] = json!(false);
+        cases.push(("structural_restore", structural_restore, "commit"));
+
+        let mut identities = report(&[]);
+        identities["damos"]["shadow_session_id"] = json!("");
+        cases.push(("exact_identities", identities, "commit"));
+
+        let mut scope = report(&[]);
+        scope["scope"] = json!("damon");
+        cases.push(("scope", scope, "commit"));
+
+        for (name, raw, expected_commit) in cases {
+            assert!(
+                !assess_damos_report(&raw, expected_commit).compatibility_passes(true),
+                "{name}"
+            );
+        }
+
+        assert!(!assess_damos_report(&report(&[]), "other").compatibility_passes(true));
+        assert!(!assess_damos_report(&report(&[]), "commit").compatibility_passes(false));
     }
 
     #[test]
