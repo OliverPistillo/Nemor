@@ -917,3 +917,60 @@ Storage tiering remains unavailable pending `ZswapNvmeBoot`; cgroup
 protection, zram, and KSM remain deferred from this component set. Capacity and
 effectiveness remain `not_evaluated`, and production activation remains
 false. This result does not mean that `nemor_capacity` is fully validated.
+
+## Capacity composition framework validation
+
+Source `61d6a4e56efc52730114d34ea19e5cb25ad392d1` corrected the composition
+scope-cleanup contract without changing pressure manifest schema 6, pressure
+execution schema 4, external-target contract/protocol version 1, or production
+behavior. Composition execution and run evidence are version 2. Cleanup now
+preserves the frozen unit, object, cgroup and worker identities; it accepts a
+naturally collected scope only after proving the exact worker absent, the unit
+absent, and the original cgroup absent or empty. A typed systemd
+`NoSuchUnit` race is reconciled only after the same final checks, with no
+second `StopUnit`; unreadable, ambiguous, foreign, membered, timed-out, or
+other-error states remain fail-closed.
+
+Fresh prerequisite external-target Lineage 3
+`capacity-external-target-1785423683895606795` passed one live invocation:
+all four direct shadow gates and all 48 required DAMOS checks passed, HOT/WARM
+service and COLD-only reclaim/refault passed, and cleanup, recovery,
+idempotent recovery, structural restore, final zero-kdamond state, and
+no-residue checks passed. Its immutable archive is
+`~/.local/share/nemor/validation-history/phase10-capacity-external-target-3-completed`;
+manifest SHA-256 is
+`a186f4f32b12a67e6a65c168fa2a45b0abd9c1457da3d5f0fba6729ae84c551b`,
+evidence payload SHA-256 is
+`e2b4d1ff346f86a973946c0eae3fc43f79d7ecd07ed017616f09d17a975c0cbb`,
+and `SHA256SUMS` SHA-256 is
+`d1015607787c62fc4696d6d8317d47fb5d6057c49094ba9bdf65338777f4c889`.
+
+Composition Lineage 2
+`capacity-composition-1785423981758528689` then completed its single live
+invocation. All six planned runs and all eighteen conservative levels were
+Sustainable: three baseline runs proved no validator, DAMON, DAMOS, or trace
+mutation; three `nemor_capacity` framework runs passed the direct shadow
+gates, required DAMOS gates, COLD-only 8 MiB action, HOT/WARM preservation,
+controlled refault, cleanup, recovery, and restore. All six pressure scopes
+were naturally collected and persisted as `AlreadyAbsent`, with exact worker
+absence, unit removal, zero final cgroup members, and `Clean` classification.
+There were zero typed `NoSuchUnit` reconciliations in this live run, zero host
+OOM, zero cgroup OOM-kill, no watchdog, final `nr_kdamonds=0`, and no owned
+residue.
+
+The immutable composition archive is
+`~/.local/share/nemor/validation-history/phase10-capacity-composition-2-completed`.
+Its manifest SHA-256 is
+`10e87b04647071c2ce7793ee99f9a24fe4b84018ae816bbd93377f510918cd90`,
+manifest payload SHA-256 is
+`60eef52bf7736dc2db65cf0dbfd65f0c10928ab1f46c1c670e8761c86e3ac9b0`,
+execution payload SHA-256 is
+`0423ecfada33ff195e7efc1879aa7395faee26e13f7ff3770f0725daf3e8e84c`,
+and `SHA256SUMS` SHA-256 is
+`c4d79f475bf1d05fe7aea906f07bc53b20324e61995e6055395629293a03a893`.
+
+This is composition framework validation only: it provides no capacity
+estimate, maximum, gain, gaming-effectiveness result, or production
+authorization. Capacity and effectiveness remain `NotEvaluated`,
+`search_complete=false`, and production activation remains false. It does not
+validate cgroup protection, zram, storage tiering, or KSM composition.

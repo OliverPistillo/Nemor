@@ -440,8 +440,9 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - Phase 10 remains in development: the benchmark framework, privileged
   owned-cgroup harness, and privileged observer service pipeline are
   validated; exact `DamonTelemetry` + `DamosReclaim` combined compatibility is
-  validated, while the true capacity benchmark and real A/B evidence remain
-  pending.
+  validated, and the progressive pressure plus exact external HOT/WARM/COLD
+  target completed conservative composition framework validation. The true
+  capacity benchmark and real capacity A/B evidence remain pending.
 - Phase 11 is not started.
 
 ## Documentation
