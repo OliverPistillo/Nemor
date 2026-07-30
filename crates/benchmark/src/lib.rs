@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod capacity_benchmark;
 pub mod capacity_compatibility;
 pub mod capacity_composition;
 pub mod capacity_external_target;

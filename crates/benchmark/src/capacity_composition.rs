@@ -1504,7 +1504,30 @@ pub fn execute_capacity_composition(
     if !preflight.bounded_composition_entry_ready {
         bail!("composition bounded entry is not ready");
     }
-    let payload = &manifest.payload;
+    execute_capacity_composition_payload(
+        &manifest.payload,
+        3,
+        CompositionExperimentState::CompletedCompositionFrameworkValidation,
+    )
+}
+
+pub fn execute_capacity_composition_payload(
+    payload: &CapacityCompositionPayload,
+    expected_levels_per_run: usize,
+    successful_state: CompositionExperimentState,
+) -> Result<CapacityCompositionExecutionEvidence> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("composition payload execution requires root");
+    }
+    if expected_levels_per_run == 0
+        || payload.run_plan.len() != 6
+        || payload
+            .run_plan
+            .iter()
+            .any(|run| run.levels.len() != expected_levels_per_run)
+    {
+        bail!("composition payload run/level plan mismatch");
+    }
     let db = open_store(&payload.output_root)?;
     let mut evidence = CapacityCompositionExecutionEvidence {
         schema_version: COMPOSITION_EXECUTION_SCHEMA_VERSION,
@@ -1515,7 +1538,7 @@ pub fn execute_capacity_composition(
         runs: Vec::new(),
         planned_runs: 6,
         completed_runs: 0,
-        planned_levels: 18,
+        planned_levels: 6 * expected_levels_per_run,
         completed_levels: 0,
         invocation_count: 1,
         search_complete: false,
@@ -1723,7 +1746,7 @@ pub fn execute_capacity_composition(
             Duration::from_secs(5),
         );
         let restored = StructuralSnapshot::capture().matches(&before);
-        let run_pass = levels.len() == 3
+        let run_pass = levels.len() == expected_levels_per_run
             && levels
                 .iter()
                 .all(|level| level.classification == CompositionLevelClassification::Sustainable)
@@ -1737,7 +1760,7 @@ pub fn execute_capacity_composition(
             repetition_index: run.repetition_index,
             seed: run.seed,
             state: if run_pass {
-                CompositionExperimentState::CompletedCompositionFrameworkValidation
+                successful_state
             } else {
                 CompositionExperimentState::InvalidRun
             },
@@ -1746,7 +1769,7 @@ pub fn execute_capacity_composition(
             scope_cleanup,
             structural_restore_passed: restored,
             reason: if run_pass {
-                "all three composition levels sustainable".into()
+                format!("all {expected_levels_per_run} composition levels sustainable")
             } else {
                 "composition run mandatory evidence failed".into()
             },
@@ -1759,9 +1782,13 @@ pub fn execute_capacity_composition(
         }
         persist_execution(&payload.output_root, &evidence)?;
     }
-    if evidence.completed_runs == 6 && evidence.completed_levels == 18 {
-        evidence.state = CompositionExperimentState::CompletedCompositionFrameworkValidation;
-        evidence.reason = "6/6 runs and 18/18 composition levels passed".into();
+    if evidence.completed_runs == 6 && evidence.completed_levels == 6 * expected_levels_per_run {
+        evidence.state = successful_state;
+        evidence.reason = format!(
+            "6/6 runs and {}/{} composition levels passed",
+            evidence.completed_levels,
+            6 * expected_levels_per_run
+        );
         evidence.cleanup_passed = true;
         evidence.structural_restore_passed = true;
     } else if evidence.state == CompositionExperimentState::Running {

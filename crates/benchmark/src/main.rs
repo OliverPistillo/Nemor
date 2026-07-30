@@ -221,6 +221,26 @@ enum Command {
         #[arg(long)]
         manifest: PathBuf,
     },
+    PrepareCapacityBenchmark {
+        #[arg(long)]
+        external_target_archive: PathBuf,
+        #[arg(long)]
+        composition_archive: PathBuf,
+        #[arg(long)]
+        prepared_dir: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    CapacityBenchmarkPreflight {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    ExecuteCapacityBenchmark {
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     PressurePreflight {
         #[arg(long)]
         manifest: PathBuf,
@@ -773,6 +793,49 @@ fn run() -> Result<i32> {
                 nemor_benchmark::capacity_composition::composition_execution_exit_status(
                     report.state,
                 ),
+            );
+        }
+        Command::PrepareCapacityBenchmark {
+            external_target_archive,
+            composition_archive,
+            prepared_dir,
+            output_dir,
+        } => {
+            let path = nemor_benchmark::capacity_benchmark::prepare_capacity_benchmark(
+                &external_target_archive,
+                &composition_archive,
+                &prepared_dir,
+                &output_dir,
+            )?;
+            println!("manifest={}", path.display());
+        }
+        Command::CapacityBenchmarkPreflight { manifest, json } => {
+            let report =
+                nemor_benchmark::capacity_benchmark::capacity_benchmark_preflight(&manifest)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Command::ExecuteCapacityBenchmark { manifest } => {
+            let report =
+                nemor_benchmark::capacity_benchmark::execute_capacity_benchmark(&manifest)?;
+            println!(
+                "experiment_id={} state={:?} capacity={:?} effectiveness=not_evaluated",
+                report.experiment_id, report.composition_execution.state, report.evaluation.state
+            );
+            return Ok(
+                if matches!(
+                    report.evaluation.state,
+                    nemor_benchmark::capacity_benchmark::CapacityEvaluationState::Complete
+                        | nemor_benchmark::capacity_benchmark::CapacityEvaluationState::Censored
+                        | nemor_benchmark::capacity_benchmark::CapacityEvaluationState::Incomplete
+                ) {
+                    0
+                } else {
+                    1
+                },
             );
         }
         Command::PressurePreflight { manifest, json } => {
