@@ -22,13 +22,13 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::fs::{self, File};
+use std::io::Write;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CAPACITY_BENCHMARK_CONTRACT_VERSION: u32 = 2;
+pub const CAPACITY_BENCHMARK_CONTRACT_VERSION: u32 = 1;
 pub const CAPACITY_SEARCH_POLICY_VERSION: u32 = 1;
 pub const CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION: u32 = 4;
 pub const CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION: u32 = 4;
@@ -71,7 +71,7 @@ pub struct CapacityBenchmarkContract {
 }
 
 impl CapacityBenchmarkContract {
-    pub fn v2() -> Self {
+    pub fn v1() -> Self {
         Self {
             version: CAPACITY_BENCHMARK_CONTRACT_VERSION,
             purpose: "true_capacity_benchmark_search".into(),
@@ -119,10 +119,13 @@ impl CapacitySearchPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacityPrerequisite {
+    pub kind: CapacityPrerequisiteKind,
+    pub status_contract_version: u32,
     pub archive: PathBuf,
     pub manifest_sha256: String,
     pub report_sha256: String,
     pub sha256sums_sha256: String,
+    pub status_sha256: String,
     pub source_commit: String,
     pub identity: String,
 }
@@ -166,6 +169,8 @@ struct CapacityPrerequisiteStatus {
     manifest_sha256: String,
     manifest_payload_sha256: String,
     execution_payload_sha256: String,
+    validator_report_raw_sha256: Option<String>,
+    validator_report_canonical_sha256: Option<String>,
     external_target_identity: Option<String>,
     invocation_count: u32,
     cleanup_passed: bool,
@@ -176,6 +181,17 @@ struct CapacityPrerequisiteStatus {
     capacity_evaluation: EvaluationState,
     effectiveness_evaluation: EvaluationState,
     production_activation_authorized: bool,
+    _unknown_metadata: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityDirectoryIdentity {
+    pub canonical_path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,7 +212,10 @@ pub struct CapacityBenchmarkPayload {
     pub capacity_scope_runtime_max_usec: u64,
     pub per_level_timeout_ms: u64,
     pub per_run_timeout_ms: u64,
+    pub manifest_path: PathBuf,
     pub output_root: PathBuf,
+    pub prepared_root_identity: CapacityDirectoryIdentity,
+    pub output_root_identity: CapacityDirectoryIdentity,
     pub report_path: PathBuf,
     pub evaluation_path: PathBuf,
     pub database_path: PathBuf,
@@ -217,8 +236,21 @@ impl PreparedCapacityBenchmarkManifest {
         if self.payload_sha256 != hash_json(&self.payload)?
             || self.payload.schema_version != CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION
             || self.payload.execution_schema_version != CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION
-            || self.payload.contract != CapacityBenchmarkContract::v2()
+            || self.payload.contract != CapacityBenchmarkContract::v1()
             || self.payload.search_policy != CapacitySearchPolicy::v1()
+            || self.payload.external_target_prerequisite.kind
+                != CapacityPrerequisiteKind::ExternalTarget
+            || self.payload.composition_prerequisite.kind != CapacityPrerequisiteKind::Composition
+            || self
+                .payload
+                .external_target_prerequisite
+                .status_contract_version
+                != CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION
+            || self
+                .payload
+                .composition_prerequisite
+                .status_contract_version
+                != CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION
             || self.payload.levels.len() != LEVEL_COUNT
             || self.payload.levels != capacity_ladder(self.payload.safe_search_ceiling_bytes)?
             || self.payload.composition_payload.run_plan.len() != 6
@@ -232,6 +264,8 @@ impl PreparedCapacityBenchmarkManifest {
             || self.payload.request_oom
             || self.payload.production_activation_authorized
             || self.payload.effectiveness_evaluation != EvaluationState::NotEvaluated
+            || self.payload.target_percent != FAVORABLE_CAPACITY_TARGET_PERCENT
+            || self.payload.target_status != CapacityTargetStatus::Indeterminate
             || self.payload.capacity_scope_runtime_max_usec != CAPACITY_SCOPE_RUNTIME_MAX_USEC
             || self.payload.per_level_timeout_ms != CAPACITY_LEVEL_TIMEOUT_MS
             || self.payload.per_run_timeout_ms != CAPACITY_RUN_TIMEOUT_MS
@@ -266,6 +300,7 @@ pub struct CapacityBenchmarkPreflight {
     pub material_environment_match: bool,
     pub external_target_prerequisite_verified: bool,
     pub composition_prerequisite_verified: bool,
+    pub prerequisite_status_contract_supported: bool,
     pub prerequisite_lineage_link_verified: bool,
     pub exact_profile_supported: bool,
     pub search_policy_supported: bool,
@@ -274,17 +309,73 @@ pub struct CapacityBenchmarkPreflight {
     pub safe_search_ceiling_supported: bool,
     pub headroom_safe: bool,
     pub memory_max_safe: bool,
+    pub path_contract_supported: bool,
+    pub prepared_root_identity_verified: bool,
+    pub output_root_identity_verified: bool,
+    pub frozen_child_paths_verified: bool,
     pub ownership_plan_supported: bool,
     pub output_fresh: bool,
     pub stale_resources_clear: bool,
     pub report_lifecycle_version_supported: bool,
     pub legacy_global_report_absent: bool,
     pub validator_state_absent: bool,
+    pub all_non_authorization_gates_pass: bool,
     pub user_preflight_passed: bool,
     pub current_identity_authorized: bool,
     pub bounded_capacity_benchmark_entry_ready: bool,
     pub execution_ready: bool,
     pub preflight_mutated: bool,
+}
+
+impl CapacityBenchmarkPreflight {
+    pub fn all_non_authorization_gates_pass(&self) -> bool {
+        [
+            self.manifest_verified,
+            self.source_and_binaries_verified,
+            self.material_environment_match,
+            self.external_target_prerequisite_verified,
+            self.composition_prerequisite_verified,
+            self.prerequisite_status_contract_supported,
+            self.prerequisite_lineage_link_verified,
+            self.exact_profile_supported,
+            self.search_policy_supported,
+            self.run_plan_supported,
+            self.level_ladder_supported,
+            self.safe_search_ceiling_supported,
+            self.headroom_safe,
+            self.memory_max_safe,
+            self.path_contract_supported,
+            self.prepared_root_identity_verified,
+            self.output_root_identity_verified,
+            self.frozen_child_paths_verified,
+            self.ownership_plan_supported,
+            self.output_fresh,
+            self.stale_resources_clear,
+            self.report_lifecycle_version_supported,
+            self.legacy_global_report_absent,
+            self.validator_state_absent,
+        ]
+        .into_iter()
+        .all(|gate| gate)
+    }
+
+    pub fn verify_readiness_consistency(&self) -> Result<()> {
+        let non_authorization = self.all_non_authorization_gates_pass();
+        let ready = non_authorization && self.current_identity_authorized;
+        if self.schema_version != CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION
+            || self.prerequisite_status_contract_version
+                != CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION
+            || self.path_contract_version != CAPACITY_PATH_CONTRACT_VERSION
+            || self.all_non_authorization_gates_pass != non_authorization
+            || self.user_preflight_passed != non_authorization
+            || self.bounded_capacity_benchmark_entry_ready != ready
+            || self.execution_ready != ready
+            || self.preflight_mutated
+        {
+            bail!("capacity benchmark preflight readiness is internally inconsistent");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,9 +532,11 @@ pub fn capacity_ladder(ceiling: u64) -> Result<Vec<u64>> {
 }
 
 fn prerequisite(archive: &Path, kind: CapacityPrerequisiteKind) -> Result<CapacityPrerequisite> {
+    let archive = archive.canonicalize()?;
     let manifest = archive.join("manifest.json");
     let report_path = archive.join(kind.report_name());
     let sums = archive.join("SHA256SUMS");
+    let status = archive.join("STATUS");
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&report_path)?)?;
     let source_commit = value
         .pointer("/source_commit")
@@ -457,49 +550,21 @@ fn prerequisite(archive: &Path, kind: CapacityPrerequisiteKind) -> Result<Capaci
         .context("prerequisite identity absent")?
         .to_owned();
     Ok(CapacityPrerequisite {
-        archive: archive.canonicalize()?,
+        kind,
+        status_contract_version: CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION,
+        archive,
         manifest_sha256: hash_file(&manifest)?,
         report_sha256: hash_file(&report_path)?,
         sha256sums_sha256: hash_file(&sums)?,
+        status_sha256: hash_file(&status)?,
         source_commit,
         identity,
     })
 }
 
-fn parse_status_entries(status: &str) -> Result<BTreeMap<&str, &str>> {
-    let mut entries = BTreeMap::new();
-    if status.is_empty() {
-        bail!("capacity prerequisite STATUS is empty");
-    }
-    for line in status.lines() {
-        let (key, value) = line
-            .split_once('=')
-            .context("malformed capacity prerequisite STATUS line")?;
-        if key.is_empty()
-            || value.is_empty()
-            || !key
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-            || value.bytes().any(|byte| byte.is_ascii_whitespace())
-            || entries.insert(key, value).is_some()
-        {
-            bail!("ambiguous capacity prerequisite STATUS entry");
-        }
-    }
-    Ok(entries)
-}
-
-fn expect_status(entries: &BTreeMap<&str, &str>, key: &str, expected: &str) -> Result<()> {
-    if entries.get(key).copied() != Some(expected) {
-        bail!("capacity prerequisite STATUS {key} mismatch");
-    }
-    Ok(())
-}
-
-fn status_allowed_keys(kind: CapacityPrerequisiteKind) -> BTreeSet<&'static str> {
-    match kind {
+fn status_relevant_keys(kind: CapacityPrerequisiteKind) -> BTreeSet<&'static str> {
+    let mut keys = match kind {
         CapacityPrerequisiteKind::ExternalTarget => BTreeSet::from([
-            "status",
             "validation_id",
             "source_commit",
             "manifest_sha256",
@@ -526,7 +591,6 @@ fn status_allowed_keys(kind: CapacityPrerequisiteKind) -> BTreeSet<&'static str>
             "production_activation",
         ]),
         CapacityPrerequisiteKind::Composition => BTreeSet::from([
-            "status",
             "experiment_id",
             "source_commit",
             "manifest_sha256",
@@ -554,19 +618,113 @@ fn status_allowed_keys(kind: CapacityPrerequisiteKind) -> BTreeSet<&'static str>
             "effectiveness",
             "production_activation",
         ]),
+    };
+    keys.insert("status");
+    keys.insert("classification");
+    keys
+}
+
+type StatusEntries = BTreeMap<String, String>;
+type UnknownStatusMetadata = Vec<(String, String)>;
+
+fn parse_status_entries(
+    status: &str,
+    kind: CapacityPrerequisiteKind,
+) -> Result<(StatusEntries, UnknownStatusMetadata)> {
+    let mut entries = BTreeMap::new();
+    let mut unknown = Vec::new();
+    let relevant = status_relevant_keys(kind);
+    let normalized = status.replace("\r\n", "\n");
+    if normalized.contains('\r') {
+        bail!("capacity prerequisite STATUS contains an unsupported line ending");
     }
+    for raw_line in normalized.split('\n') {
+        let line = raw_line.trim_matches(|character: char| character.is_ascii_whitespace());
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('=');
+        let key = fields
+            .next()
+            .expect("split always returns one field")
+            .trim_matches(|character: char| character.is_ascii_whitespace());
+        let value = fields
+            .next()
+            .context("malformed capacity prerequisite STATUS line")?
+            .trim_matches(|character: char| character.is_ascii_whitespace());
+        if fields.next().is_some()
+            || key.is_empty()
+            || value.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            bail!("malformed capacity prerequisite STATUS line");
+        }
+        if relevant.contains(key) {
+            if entries.insert(key.to_owned(), value.to_owned()).is_some() {
+                bail!("duplicate relevant capacity prerequisite STATUS key");
+            }
+        } else {
+            unknown.push((key.to_owned(), value.to_owned()));
+        }
+    }
+    if entries.is_empty() && unknown.is_empty() {
+        bail!("capacity prerequisite STATUS is empty");
+    }
+    Ok((entries, unknown))
+}
+
+fn expect_status(entries: &StatusEntries, key: &str, expected: &str) -> Result<()> {
+    if entries.get(key).map(String::as_str) != Some(expected) {
+        bail!("capacity prerequisite STATUS {key} mismatch");
+    }
+    Ok(())
+}
+
+fn valid_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn parse_prerequisite_status(
     status: &str,
     kind: CapacityPrerequisiteKind,
 ) -> Result<CapacityPrerequisiteStatus> {
-    let entries = parse_status_entries(status)?;
-    let actual_keys = entries.keys().copied().collect::<BTreeSet<_>>();
-    if actual_keys != status_allowed_keys(kind) {
-        bail!("capacity prerequisite STATUS key set mismatch");
+    let (entries, unknown_metadata) = parse_status_entries(status, kind)?;
+    let status_terminal = entries.get("status").map(String::as_str);
+    let classification_terminal = entries.get("classification").map(String::as_str);
+    if status_terminal.is_none() && classification_terminal.is_none() {
+        bail!("capacity prerequisite STATUS terminal state is missing");
     }
-    expect_status(&entries, "status", "PASS")?;
+    if status_terminal.is_some_and(|value| value != "PASS") {
+        bail!("capacity prerequisite STATUS terminal status is not PASS");
+    }
+    let classification_allowed = match kind {
+        CapacityPrerequisiteKind::ExternalTarget => {
+            classification_terminal.is_none_or(|value| value == "PASS")
+        }
+        CapacityPrerequisiteKind::Composition => classification_terminal.is_none_or(|value| {
+            matches!(value, "PASS" | "COMPLETED_COMPOSITION_FRAMEWORK_VALIDATION")
+        }),
+    };
+    if !classification_allowed {
+        bail!("capacity prerequisite STATUS terminal classification conflicts with PASS");
+    }
+    for key in [
+        "manifest_sha256",
+        "manifest_payload_sha256",
+        "execution_payload_sha256",
+    ] {
+        if !entries
+            .get(key)
+            .is_some_and(|value| valid_lowercase_sha256(value))
+        {
+            bail!("capacity prerequisite STATUS {key} is not lowercase SHA-256");
+        }
+    }
     expect_status(&entries, "invocation_count", "1")?;
     expect_status(&entries, "structural_restore", "PASS")?;
     expect_status(&entries, "legacy_global_report_absent", "true")?;
@@ -594,12 +752,8 @@ fn parse_prerequisite_status(
                 "validator_report_raw_sha256",
                 "validator_report_canonical_sha256",
             ] {
-                let value = entries.get(key).copied().context("STATUS hash absent")?;
-                if value.len() != 64
-                    || !value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
+                let value = entries.get(key).context("STATUS hash absent")?;
+                if !valid_lowercase_sha256(value) {
                     bail!("capacity prerequisite STATUS hash is not lowercase SHA-256");
                 }
             }
@@ -626,18 +780,43 @@ fn parse_prerequisite_status(
     Ok(CapacityPrerequisiteStatus {
         version: CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION,
         kind,
-        identity: entries[kind.identity_key()].to_owned(),
-        source_commit: entries["source_commit"].to_owned(),
-        manifest_sha256: entries["manifest_sha256"].to_owned(),
-        manifest_payload_sha256: entries["manifest_payload_sha256"].to_owned(),
-        execution_payload_sha256: entries["execution_payload_sha256"].to_owned(),
+        identity: entries
+            .get(kind.identity_key())
+            .context("STATUS identity absent")?
+            .to_owned(),
+        source_commit: entries
+            .get("source_commit")
+            .context("STATUS source commit absent")?
+            .to_owned(),
+        manifest_sha256: entries
+            .get("manifest_sha256")
+            .context("STATUS manifest SHA-256 absent")?
+            .to_owned(),
+        manifest_payload_sha256: entries
+            .get("manifest_payload_sha256")
+            .context("STATUS manifest payload SHA-256 absent")?
+            .to_owned(),
+        execution_payload_sha256: entries
+            .get("execution_payload_sha256")
+            .context("STATUS execution payload SHA-256 absent")?
+            .to_owned(),
+        validator_report_raw_sha256: entries.get("validator_report_raw_sha256").cloned(),
+        validator_report_canonical_sha256: entries
+            .get("validator_report_canonical_sha256")
+            .cloned(),
         external_target_identity: match kind {
             CapacityPrerequisiteKind::ExternalTarget => None,
-            CapacityPrerequisiteKind::Composition => {
-                Some(entries["external_target_lineage"].to_owned())
-            }
+            CapacityPrerequisiteKind::Composition => Some(
+                entries
+                    .get("external_target_lineage")
+                    .context("STATUS external-target lineage absent")?
+                    .to_owned(),
+            ),
         },
-        invocation_count: entries["invocation_count"].parse()?,
+        invocation_count: entries
+            .get("invocation_count")
+            .context("STATUS invocation count absent")?
+            .parse()?,
         cleanup_passed: match kind {
             CapacityPrerequisiteKind::ExternalTarget => entries["cleanup"] == "PASS",
             CapacityPrerequisiteKind::Composition => {
@@ -647,14 +826,21 @@ fn parse_prerequisite_status(
         structural_restore_passed: entries["structural_restore"] == "PASS",
         legacy_global_report_absent: entries["legacy_global_report_absent"] == "true",
         validator_state_absent: entries["validator_state_absent"] == "true",
-        final_nr_kdamonds: entries["final_nr_kdamonds"].parse()?,
+        final_nr_kdamonds: entries
+            .get("final_nr_kdamonds")
+            .context("STATUS final nr_kdamonds absent")?
+            .parse()?,
         capacity_evaluation: EvaluationState::NotEvaluated,
         effectiveness_evaluation: EvaluationState::NotEvaluated,
         production_activation_authorized: false,
+        _unknown_metadata: unknown_metadata,
     })
 }
 
-fn verify_all_sums(archive: &Path) -> Result<()> {
+fn verify_ledger_entries(archive: &Path) -> Result<BTreeSet<PathBuf>> {
+    if archive.canonicalize()? != archive {
+        bail!("capacity prerequisite archive root is not canonical");
+    }
     let sums = fs::read_to_string(archive.join("SHA256SUMS"))?;
     let mut seen = BTreeSet::new();
     for line in sums.lines() {
@@ -684,7 +870,12 @@ fn verify_all_sums(archive: &Path) -> Result<()> {
             bail!("capacity prerequisite archive checksum mismatch");
         }
     }
-    for required in ["manifest.json", "STATUS", "evidence.tar"] {
+    Ok(seen)
+}
+
+fn verify_all_sums(archive: &Path, kind: CapacityPrerequisiteKind) -> Result<()> {
+    let seen = verify_ledger_entries(archive)?;
+    for required in ["manifest.json", "STATUS", kind.report_name()] {
         if !seen.contains(Path::new(required)) {
             bail!("capacity prerequisite SHA256SUMS omits required evidence");
         }
@@ -692,20 +883,130 @@ fn verify_all_sums(archive: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validator_lifecycle_common_supported(
+    lifecycle: &crate::validator_report::ValidatorReportLifecycleEvidence,
+) -> bool {
+    lifecycle.version == 1
+        && lifecycle.legacy_global_absent_before
+        && lifecycle.legacy_global_absent_after
+        && lifecycle.validator_state_absent
+}
+
+fn composition_run_is_complete(
+    run: &crate::capacity_composition::CapacityCompositionRunEvidence,
+) -> bool {
+    use crate::validator_report::ValidatorReportLifecycleClassification;
+
+    run.version == crate::capacity_composition::COMPOSITION_RUN_EVIDENCE_VERSION
+        && run.state == CompositionExperimentState::CompletedCompositionFrameworkValidation
+        && run.levels.len() == 3
+        && run.pressure_scope_cleanup_passed
+        && run.scope_cleanup.passed()
+        && run.structural_restore_passed
+        && run.levels.iter().all(|level| {
+            let lifecycle = &level.target.validator_report_lifecycle;
+            let lifecycle_supported = validator_lifecycle_common_supported(lifecycle)
+                && match run.variant {
+                    BenchmarkVariant::CachyosBaseline => {
+                        lifecycle.classification
+                            == ValidatorReportLifecycleClassification::BaselineNoReport
+                            && lifecycle.report_path.is_none()
+                            && lifecycle.raw_sha256.is_none()
+                            && lifecycle.canonical_semantic_sha256.is_none()
+                            && lifecycle.validator_exit_status.is_none()
+                            && !lifecycle.explicit_path_mode
+                            && !level.target.validator_invoked
+                            && level.target.no_damon_damos_mutation
+                    }
+                    BenchmarkVariant::NemorCapacity => {
+                        lifecycle.classification == ValidatorReportLifecycleClassification::Pass
+                            && lifecycle.report_path.is_some()
+                            && lifecycle.raw_sha256.is_some()
+                            && lifecycle.canonical_semantic_sha256.is_some()
+                            && lifecycle.validator_exit_status == Some(0)
+                            && lifecycle.explicit_path_mode
+                            && level.target.validator_invoked
+                            && level
+                                .target
+                                .direct_shadow_gates
+                                .into_iter()
+                                .all(|gate| gate)
+                            && level.target.required_damos_gates_passed
+                            && level.target.applied_bytes > 0
+                    }
+                    _ => false,
+                };
+            level.version == crate::capacity_composition::COMPOSITION_LEVEL_EVIDENCE_VERSION
+                && level.run_order == run.order_index
+                && level.variant == run.variant
+                && level.classification == CompositionLevelClassification::Sustainable
+                && level.pressure_heartbeat
+                && level.pressure_worker_alive
+                && level.cgroup_membership
+                && level.memory_max_verified
+                && level.oom == 0
+                && level.oom_kill == 0
+                && !level.watchdog_triggered
+                && level.target.version
+                    == crate::capacity_composition::COMPOSITION_TARGET_EVIDENCE_VERSION
+                && level.target.hot_progress
+                && level.target.warm_progress
+                && level.target.cold_inactive_before_action
+                && level.target.fingerprints_valid
+                && level.target.only_cold_reclaimed
+                && level.target.cleanup_passed
+                && level.cleanup_passed
+                && level.structural_restore_passed
+                && lifecycle_supported
+        })
+}
+
+fn composition_report_matches_manifest(
+    report: &CapacityCompositionExecutionEvidence,
+    manifest: &PreparedCapacityCompositionManifest,
+) -> bool {
+    report.runs.len() == manifest.payload.run_plan.len()
+        && report
+            .runs
+            .iter()
+            .zip(&manifest.payload.run_plan)
+            .all(|(run, planned)| {
+                run.order_index == planned.order_index
+                    && run.variant == planned.variant
+                    && run.repetition_index == planned.repetition_index
+                    && run.seed == planned.seed
+                    && run.levels.len() == planned.levels.len()
+                    && run
+                        .levels
+                        .iter()
+                        .zip(&planned.levels)
+                        .all(|(level, planned)| {
+                            level.level_index == planned.level_index
+                                && level.target_touched_bytes == planned.target_touched_bytes
+                        })
+            })
+}
+
 fn verify_archive(
     prerequisite: &CapacityPrerequisite,
     kind: CapacityPrerequisiteKind,
 ) -> Result<()> {
+    if prerequisite.kind != kind
+        || prerequisite.status_contract_version != CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION
+    {
+        bail!("capacity prerequisite kind or STATUS contract version mismatch");
+    }
     let archive = prerequisite.archive.canonicalize()?;
     let report_name = kind.report_name();
     if archive != prerequisite.archive
         || hash_file(&archive.join("manifest.json"))? != prerequisite.manifest_sha256
         || hash_file(&archive.join(report_name))? != prerequisite.report_sha256
         || hash_file(&archive.join("SHA256SUMS"))? != prerequisite.sha256sums_sha256
+        || hash_file(&archive.join("STATUS"))? != prerequisite.status_sha256
     {
         bail!("capacity prerequisite frozen identity mismatch");
     }
-    verify_all_sums(&archive)?;
+    verify_all_sums(&archive, kind)?;
     let report_bytes = fs::read(archive.join(report_name))?;
     let status = parse_prerequisite_status(&fs::read_to_string(archive.join("STATUS"))?, kind)?;
     if status.version != CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION
@@ -730,6 +1031,7 @@ fn verify_archive(
             let manifest:
                 crate::capacity_external_validation::PreparedExternalTargetValidationManifest =
                 serde_json::from_slice(&fs::read(archive.join("manifest.json"))?)?;
+            manifest.verify()?;
             let report: ExternalTargetExecutionReport = serde_json::from_slice(&report_bytes)?;
             report.verify()?;
             if status.manifest_payload_sha256 != manifest.payload_sha256
@@ -741,6 +1043,17 @@ fn verify_archive(
                 )
                 || report.payload.validation_id != status.identity
                 || report.payload.source_commit != status.source_commit
+                || manifest.payload.validation_id != status.identity
+                || manifest.payload.provenance.git_head != status.source_commit
+                || report.payload.component_set
+                    != BTreeSet::from([
+                        CapacityComponent::DamonTelemetry,
+                        CapacityComponent::DamosReclaim,
+                    ])
+                || report.payload.target_contract_version
+                    != crate::capacity_external_target::CAPACITY_EXTERNAL_TARGET_CONTRACT_VERSION
+                || report.payload.target_protocol_version
+                    != crate::capacity_external_target::CAPACITY_EXTERNAL_TARGET_PROTOCOL_VERSION
                 || !report.payload.validator_exit_success
                 || !report
                     .payload
@@ -753,6 +1066,28 @@ fn verify_archive(
                 || !report.payload.recovery_passed
                 || !report.payload.recovery_idempotent_passed
                 || !report.payload.structural_restore_passed
+                || report.payload.capacity_evaluation != EvaluationState::NotEvaluated
+                || report.payload.effectiveness_evaluation != EvaluationState::NotEvaluated
+                || report.payload.production_activation_authorized
+                || report.payload.validator_report_lifecycle.version != 1
+                || report
+                    .payload
+                    .validator_report_lifecycle
+                    .validator_exit_status
+                    != Some(0)
+                || !report.payload.validator_report_lifecycle.explicit_path_mode
+                || report
+                    .payload
+                    .validator_report_lifecycle
+                    .raw_sha256
+                    .as_deref()
+                    != status.validator_report_raw_sha256.as_deref()
+                || report
+                    .payload
+                    .validator_report_lifecycle
+                    .canonical_semantic_sha256
+                    .as_deref()
+                    != status.validator_report_canonical_sha256.as_deref()
             {
                 bail!("external-target prerequisite STATUS/report contract mismatch");
             }
@@ -760,6 +1095,7 @@ fn verify_archive(
         CapacityPrerequisiteKind::Composition => {
             let manifest: PreparedCapacityCompositionManifest =
                 serde_json::from_slice(&fs::read(archive.join("manifest.json"))?)?;
+            manifest.verify()?;
             let report: CapacityCompositionExecutionEvidence =
                 serde_json::from_slice(&report_bytes)?;
             report.verify()?;
@@ -777,9 +1113,20 @@ fn verify_archive(
                     != CompositionExperimentState::CompletedCompositionFrameworkValidation
                 || report.experiment_id != status.identity
                 || report.source_commit != status.source_commit
+                || manifest.payload.experiment_id != status.identity
+                || manifest.payload.provenance.git_head != status.source_commit
                 || report.invocation_count != 1
+                || report.planned_runs != 6
                 || report.completed_runs != 6
+                || report.planned_levels != 18
                 || report.completed_levels != 18
+                || report.runs.len() != 6
+                || !report.runs.iter().all(composition_run_is_complete)
+                || !composition_report_matches_manifest(&report, &manifest)
+                || report.search_complete
+                || report.capacity_evaluation != EvaluationState::NotEvaluated
+                || report.effectiveness_evaluation != EvaluationState::NotEvaluated
+                || report.production_activation_authorized
                 || !report.cleanup_passed
                 || !report.structural_restore_passed
             {
@@ -790,8 +1137,32 @@ fn verify_archive(
     Ok(())
 }
 
-fn capacity_path_lineage(path: &Path, role: &str) -> Option<u32> {
-    if path.parent()? != Path::new("/tmp") {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapacityPathContract {
+    lineage: u64,
+    prepared_root: PathBuf,
+    output_root: PathBuf,
+}
+
+impl CapacityPathContract {
+    fn parse(prepared_root: &Path, output_root: &Path) -> Result<Self> {
+        let prepared_lineage = capacity_path_lineage(prepared_root, "-prepared")
+            .context("invalid capacity prepared-root grammar")?;
+        let output_lineage = capacity_path_lineage(output_root, "-output")
+            .context("invalid capacity output-root grammar")?;
+        if prepared_lineage != output_lineage || prepared_root == output_root {
+            bail!("capacity prepared/output roots do not share one exact lineage");
+        }
+        Ok(Self {
+            lineage: prepared_lineage,
+            prepared_root: prepared_root.to_path_buf(),
+            output_root: output_root.to_path_buf(),
+        })
+    }
+}
+
+fn capacity_path_lineage(path: &Path, role: &str) -> Option<u64> {
+    if !path.is_absolute() || path.parent()? != Path::new("/tmp") {
         return None;
     }
     let name = path.file_name()?.to_str()?;
@@ -799,30 +1170,84 @@ fn capacity_path_lineage(path: &Path, role: &str) -> Option<u32> {
         .strip_prefix("nemor-capacity-benchmark-")?
         .strip_suffix(role)?;
     if lineage.is_empty()
-        || !lineage.bytes().all(|byte| byte.is_ascii_digit())
         || lineage.starts_with('0')
+        || !lineage.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
     }
-    let parsed = lineage.parse::<u32>().ok()?;
+    let parsed = lineage.parse::<u64>().ok()?;
     (parsed > 0 && parsed.to_string() == lineage).then_some(parsed)
 }
 
 fn capacity_path_plan_supported(prepared_root: &Path, output_root: &Path) -> bool {
-    let prepared_lineage = capacity_path_lineage(prepared_root, "-prepared");
-    let output_lineage = capacity_path_lineage(output_root, "-output");
-    prepared_lineage.is_some() && prepared_lineage == output_lineage
+    CapacityPathContract::parse(prepared_root, output_root).is_ok()
 }
 
-fn private_owned_directory(path: &Path, uid: u32, gid: u32) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
+fn directory_identity_fields_supported(
+    identity: &CapacityDirectoryIdentity,
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    tmp_device: u64,
+) -> bool {
+    identity.canonical_path == path
+        && identity.device == tmp_device
+        && identity.uid == uid
+        && identity.gid == gid
+        && identity.mode == 0o700
+}
+
+fn capture_capacity_directory_identity(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<CapacityDirectoryIdentity> {
+    let metadata = fs::symlink_metadata(path)?;
+    let tmp_metadata = fs::symlink_metadata("/tmp")?;
+    let canonical_path = path.canonicalize()?;
+    let identity = CapacityDirectoryIdentity {
+        canonical_path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode() & 0o7777,
     };
-    metadata.file_type().is_dir()
-        && metadata.uid() == uid
-        && metadata.gid() == gid
-        && metadata.mode() & 0o7777 == 0o700
-        && path.canonicalize().is_ok_and(|canonical| canonical == path)
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || !directory_identity_fields_supported(&identity, path, uid, gid, tmp_metadata.dev())
+    {
+        bail!("capacity root identity, ownership, mode, or mount boundary mismatch");
+    }
+    Ok(identity)
+}
+
+fn frozen_capacity_directory_identity_verified(
+    path: &Path,
+    frozen: &CapacityDirectoryIdentity,
+    uid: u32,
+    gid: u32,
+) -> bool {
+    capture_capacity_directory_identity(path, uid, gid).is_ok_and(|current| current == *frozen)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frozen_child_paths_supported(
+    prepared_root: &Path,
+    output_root: &Path,
+    manifest_path: &Path,
+    benchmark_report_path: &Path,
+    evaluation_path: &Path,
+    database_path: &Path,
+    composition_report_path: &Path,
+    runs_root: &Path,
+) -> bool {
+    manifest_path == prepared_root.join(CAPACITY_BENCHMARK_MANIFEST_NAME)
+        && benchmark_report_path == output_root.join("capacity-benchmark.report.json")
+        && evaluation_path == output_root.join("capacity-evaluation.json")
+        && database_path == output_root.join("capacity-composition.sqlite")
+        && composition_report_path == output_root.join("capacity-composition.report.json")
+        && runs_root == output_root.join("runs")
 }
 
 fn capacity_payload_path_layout_supported(payload: &CapacityBenchmarkPayload) -> bool {
@@ -838,12 +1263,27 @@ fn capacity_payload_path_layout_supported(payload: &CapacityBenchmarkPayload) ->
                 !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
             })
         && composition.output_root == *output_root
-        && payload.report_path == output_root.join("capacity-benchmark.report.json")
-        && payload.evaluation_path == output_root.join("capacity-evaluation.json")
-        && payload.database_path == output_root.join("capacity-composition.sqlite")
-        && composition.report_path == output_root.join("capacity-composition.report.json")
+        && frozen_child_paths_supported(
+            prepared_root,
+            output_root,
+            &payload.manifest_path,
+            &payload.report_path,
+            &payload.evaluation_path,
+            &payload.database_path,
+            &composition.report_path,
+            &composition.runs_root,
+        )
         && composition.database_path == payload.database_path
-        && composition.runs_root == output_root.join("runs")
+        && payload.prepared_root_identity.canonical_path == *prepared_root
+        && payload.output_root_identity.canonical_path == *output_root
+        && payload.prepared_root_identity.uid == composition.preparing_uid
+        && payload.prepared_root_identity.gid == composition.preparing_gid
+        && payload.output_root_identity.uid == composition.preparing_uid
+        && payload.output_root_identity.gid == composition.preparing_gid
+        && payload.prepared_root_identity.mode == 0o700
+        && payload.output_root_identity.mode == 0o700
+        && payload.prepared_root_identity.device == payload.output_root_identity.device
+        && payload.prepared_root_identity.inode != payload.output_root_identity.inode
 }
 
 fn capacity_payload_paths_supported(
@@ -854,14 +1294,16 @@ fn capacity_payload_paths_supported(
     let prepared_root = &composition.prepared_root;
     let output_root = &payload.output_root;
     capacity_payload_path_layout_supported(payload)
-        && manifest_path == prepared_root.join(CAPACITY_BENCHMARK_MANIFEST_NAME)
-        && private_owned_directory(
+        && manifest_path == payload.manifest_path
+        && frozen_capacity_directory_identity_verified(
             prepared_root,
+            &payload.prepared_root_identity,
             composition.preparing_uid,
             composition.preparing_gid,
         )
-        && private_owned_directory(
+        && frozen_capacity_directory_identity_verified(
             output_root,
+            &payload.output_root_identity,
             composition.preparing_uid,
             composition.preparing_gid,
         )
@@ -920,54 +1362,109 @@ fn capacity_run_plan_supported(payload: &CapacityBenchmarkPayload) -> bool {
             })
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CapacityReadinessGates {
-    manifest_verified: bool,
-    source_and_binaries_verified: bool,
-    material_environment_match: bool,
-    external_target_prerequisite_verified: bool,
-    composition_prerequisite_verified: bool,
-    prerequisite_lineage_link_verified: bool,
-    exact_profile_supported: bool,
-    search_policy_supported: bool,
-    run_plan_supported: bool,
-    level_ladder_supported: bool,
-    safe_search_ceiling_supported: bool,
-    headroom_safe: bool,
-    memory_max_safe: bool,
-    ownership_plan_supported: bool,
-    output_fresh: bool,
-    stale_resources_clear: bool,
-    report_lifecycle_version_supported: bool,
-    legacy_global_report_absent: bool,
-    validator_state_absent: bool,
+fn remove_exact_created_manifest(
+    path: &Path,
+    prepared_root: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    if path.parent() != Some(prepared_root)
+        || path.file_name().and_then(|name| name.to_str()) != Some(CAPACITY_BENCHMARK_MANIFEST_NAME)
+    {
+        bail!("refusing to remove a non-contract capacity manifest path");
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.nlink() != 1
+    {
+        bail!("refusing to remove a capacity manifest with unexpected identity");
+    }
+    fs::remove_file(path)?;
+    Ok(())
 }
 
-impl CapacityReadinessGates {
-    fn user_ready(self) -> bool {
-        [
-            self.manifest_verified,
-            self.source_and_binaries_verified,
-            self.material_environment_match,
-            self.external_target_prerequisite_verified,
-            self.composition_prerequisite_verified,
-            self.prerequisite_lineage_link_verified,
-            self.exact_profile_supported,
-            self.search_policy_supported,
-            self.run_plan_supported,
-            self.level_ladder_supported,
-            self.safe_search_ceiling_supported,
-            self.headroom_safe,
-            self.memory_max_safe,
-            self.ownership_plan_supported,
-            self.output_fresh,
-            self.stale_resources_clear,
-            self.report_lifecycle_version_supported,
-            self.legacy_global_report_absent,
-            self.validator_state_absent,
-        ]
-        .into_iter()
-        .all(|gate| gate)
+fn remove_exact_empty_created_root(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let tmp_metadata = fs::symlink_metadata("/tmp")?;
+    if path.parent() != Some(Path::new("/tmp"))
+        || metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.dev() != tmp_metadata.dev()
+        || path.canonicalize()? != path
+        || fs::read_dir(path)?.next().is_some()
+    {
+        bail!("refusing to remove a nonempty or unexpected capacity root");
+    }
+    fs::remove_dir(path)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cleanup_new_capacity_paths(
+    manifest_path: &Path,
+    prepared_root: &Path,
+    output_root: &Path,
+    uid: u32,
+    gid: u32,
+    manifest_created: bool,
+    prepared_created: bool,
+    output_created: bool,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if manifest_created && manifest_path.exists() {
+        if let Err(error) = remove_exact_created_manifest(manifest_path, prepared_root, uid, gid) {
+            failures.push(format!("manifest: {error:#}"));
+        }
+    }
+    if output_created && output_root.exists() {
+        if let Err(error) = remove_exact_empty_created_root(output_root, uid, gid) {
+            failures.push(format!("output root: {error:#}"));
+        }
+    }
+    if prepared_created && prepared_root.exists() {
+        if let Err(error) = remove_exact_empty_created_root(prepared_root, uid, gid) {
+            failures.push(format!("prepared root: {error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
+}
+
+fn create_new_private_synced_file(path: &Path, bytes: &[u8], created: &mut bool) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    *created = true;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn identity_context_supported(
+    root: bool,
+    current_uid: u32,
+    current_gid: u32,
+    sudo_uid: Option<u32>,
+    sudo_gid: Option<u32>,
+    preparing_uid: u32,
+    preparing_gid: u32,
+) -> bool {
+    if root {
+        sudo_uid == Some(preparing_uid) && sudo_gid == Some(preparing_gid)
+    } else {
+        current_uid == preparing_uid && current_gid == preparing_gid
     }
 }
 
@@ -977,13 +1474,13 @@ pub fn prepare_capacity_benchmark(
     prepared_root: &Path,
     output_root: &Path,
 ) -> Result<PathBuf> {
-    if nix::unistd::geteuid().is_root() {
+    let uid = nix::unistd::geteuid().as_raw();
+    let gid = nix::unistd::getegid().as_raw();
+    if uid == 0 {
         bail!("capacity preparation must be unprivileged");
     }
-    if prepared_root.exists()
-        || output_root.exists()
-        || !capacity_path_plan_supported(prepared_root, output_root)
-    {
+    let path_contract = CapacityPathContract::parse(prepared_root, output_root)?;
+    if fs::symlink_metadata(prepared_root).is_ok() || fs::symlink_metadata(output_root).is_ok() {
         bail!("capacity paths must be fresh and satisfy the exact v1 path contract");
     }
     let source_composition: PreparedCapacityCompositionManifest =
@@ -1063,48 +1560,113 @@ pub fn prepare_capacity_benchmark(
             }
         })
         .collect();
-    fs::create_dir(prepared_root)?;
-    fs::set_permissions(prepared_root, fs::Permissions::from_mode(0o700))?;
-    fs::create_dir(output_root)?;
-    fs::set_permissions(output_root, fs::Permissions::from_mode(0o700))?;
-    let payload = CapacityBenchmarkPayload {
-        schema_version: CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION,
-        execution_schema_version: CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION,
-        experiment_id: composition_payload.experiment_id.clone(),
-        contract: CapacityBenchmarkContract::v2(),
-        search_policy: CapacitySearchPolicy::v1(),
-        external_target_prerequisite,
-        composition_prerequisite,
-        safe_search_ceiling_bytes: ceiling,
-        levels,
-        target_percent: FAVORABLE_CAPACITY_TARGET_PERCENT,
-        target_source: "NEMOR_PROJECT_MASTER favorable capacity gain at least 30%".into(),
-        target_status: CapacityTargetStatus::Indeterminate,
-        capacity_scope_runtime_max_usec: CAPACITY_SCOPE_RUNTIME_MAX_USEC,
-        per_level_timeout_ms: CAPACITY_LEVEL_TIMEOUT_MS,
-        per_run_timeout_ms: CAPACITY_RUN_TIMEOUT_MS,
-        output_root: output_root.to_path_buf(),
-        report_path: output_root.join("capacity-benchmark.report.json"),
-        evaluation_path: output_root.join("capacity-evaluation.json"),
-        database_path: output_root.join("capacity-composition.sqlite"),
-        automatic_retry: false,
-        request_oom: false,
-        production_activation_authorized: false,
-        effectiveness_evaluation: EvaluationState::NotEvaluated,
-        composition_payload,
-    };
-    let manifest = PreparedCapacityBenchmarkManifest {
-        payload_sha256: hash_json(&payload)?,
-        payload,
-    };
-    manifest.verify()?;
-    let path = prepared_root.join(CAPACITY_BENCHMARK_MANIFEST_NAME);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    serde_json::to_writer_pretty(&mut file, &manifest)?;
-    Ok(path)
+    let manifest_path = prepared_root.join(CAPACITY_BENCHMARK_MANIFEST_NAME);
+    let mut prepared_created = false;
+    let mut output_created = false;
+    let mut manifest_created = false;
+    let result = (|| -> Result<PathBuf> {
+        fs::create_dir(prepared_root)?;
+        prepared_created = true;
+        fs::set_permissions(prepared_root, fs::Permissions::from_mode(0o700))?;
+        fs::create_dir(output_root)?;
+        output_created = true;
+        fs::set_permissions(output_root, fs::Permissions::from_mode(0o700))?;
+        let prepared_root_identity = capture_capacity_directory_identity(prepared_root, uid, gid)?;
+        let output_root_identity = capture_capacity_directory_identity(output_root, uid, gid)?;
+        if prepared_root_identity.device != output_root_identity.device
+            || prepared_root_identity.inode == output_root_identity.inode
+            || path_contract.prepared_root != prepared_root
+            || path_contract.output_root != output_root
+            || path_contract.lineage == 0
+            || fs::read_dir(output_root)?.next().is_some()
+        {
+            bail!("capacity roots failed post-creation identity or freshness verification");
+        }
+        let payload = CapacityBenchmarkPayload {
+            schema_version: CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION,
+            execution_schema_version: CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION,
+            experiment_id: composition_payload.experiment_id.clone(),
+            contract: CapacityBenchmarkContract::v1(),
+            search_policy: CapacitySearchPolicy::v1(),
+            external_target_prerequisite,
+            composition_prerequisite,
+            safe_search_ceiling_bytes: ceiling,
+            levels,
+            target_percent: FAVORABLE_CAPACITY_TARGET_PERCENT,
+            target_source: "NEMOR_PROJECT_MASTER favorable capacity gain at least 30%".into(),
+            target_status: CapacityTargetStatus::Indeterminate,
+            capacity_scope_runtime_max_usec: CAPACITY_SCOPE_RUNTIME_MAX_USEC,
+            per_level_timeout_ms: CAPACITY_LEVEL_TIMEOUT_MS,
+            per_run_timeout_ms: CAPACITY_RUN_TIMEOUT_MS,
+            manifest_path: manifest_path.clone(),
+            output_root: output_root.to_path_buf(),
+            prepared_root_identity,
+            output_root_identity,
+            report_path: output_root.join("capacity-benchmark.report.json"),
+            evaluation_path: output_root.join("capacity-evaluation.json"),
+            database_path: output_root.join("capacity-composition.sqlite"),
+            automatic_retry: false,
+            request_oom: false,
+            production_activation_authorized: false,
+            effectiveness_evaluation: EvaluationState::NotEvaluated,
+            composition_payload,
+        };
+        let manifest = PreparedCapacityBenchmarkManifest {
+            payload_sha256: hash_json(&payload)?,
+            payload,
+        };
+        manifest.verify()?;
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        manifest_bytes.push(b'\n');
+        create_new_private_synced_file(&manifest_path, &manifest_bytes, &mut manifest_created)?;
+        File::open(prepared_root)?.sync_all()?;
+        let manifest_metadata = fs::symlink_metadata(&manifest_path)?;
+        if !manifest_metadata.file_type().is_file()
+            || manifest_metadata.file_type().is_symlink()
+            || manifest_metadata.uid() != uid
+            || manifest_metadata.gid() != gid
+            || manifest_metadata.mode() & 0o7777 != 0o600
+            || manifest_metadata.nlink() != 1
+            || manifest_metadata.dev() != manifest.payload.prepared_root_identity.device
+            || !frozen_capacity_directory_identity_verified(
+                prepared_root,
+                &manifest.payload.prepared_root_identity,
+                uid,
+                gid,
+            )
+            || !frozen_capacity_directory_identity_verified(
+                output_root,
+                &manifest.payload.output_root_identity,
+                uid,
+                gid,
+            )
+            || fs::read_dir(output_root)?.next().is_some()
+        {
+            bail!("capacity manifest or root post-write identity verification failed");
+        }
+        Ok(manifest_path.clone())
+    })();
+    match result {
+        Ok(path) => Ok(path),
+        Err(primary) => {
+            let cleanup = cleanup_new_capacity_paths(
+                &manifest_path,
+                prepared_root,
+                output_root,
+                uid,
+                gid,
+                manifest_created,
+                prepared_created,
+                output_created,
+            );
+            match cleanup {
+                Ok(()) => Err(primary),
+                Err(cleanup_error) => Err(primary.context(format!(
+                    "post-failure cleanup also failed: {cleanup_error:#}"
+                ))),
+            }
+        }
+    }
 }
 
 pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPreflight> {
@@ -1145,12 +1707,39 @@ pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPref
             CapacityPrerequisiteKind::Composition,
         )
         .is_ok();
+    let prerequisite_status_contract_supported = [
+        (
+            &payload.external_target_prerequisite,
+            CapacityPrerequisiteKind::ExternalTarget,
+        ),
+        (
+            &payload.composition_prerequisite,
+            CapacityPrerequisiteKind::Composition,
+        ),
+    ]
+    .into_iter()
+    .all(|(prerequisite, kind)| {
+        prerequisite.kind == kind
+            && prerequisite.status_contract_version == CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION
+            && hash_file(&prerequisite.archive.join("STATUS"))
+                .is_ok_and(|sha256| sha256 == prerequisite.status_sha256)
+            && fs::read_to_string(prerequisite.archive.join("STATUS"))
+                .ok()
+                .and_then(|status| parse_prerequisite_status(&status, kind).ok())
+                .is_some_and(|status| {
+                    status.version == prerequisite.status_contract_version
+                        && status.kind == prerequisite.kind
+                        && status.identity == prerequisite.identity
+                        && status.source_commit == prerequisite.source_commit
+                })
+    });
     let prerequisite_lineage_link_verified = external_prerequisite_matches_composition(
         &payload.external_target_prerequisite,
         &payload.composition_payload,
     )
     .unwrap_or(false);
-    let output_fresh = fs::read_dir(&payload.output_root)?.next().is_none();
+    let output_fresh =
+        fs::read_dir(&payload.output_root).is_ok_and(|mut entries| entries.next().is_none());
     let legacy_global_report_absent = crate::validator_report::legacy_report_absent();
     let validator_state_absent = crate::validator_report::validator_state_absent();
     let stale_resources_clear = legacy_global_report_absent
@@ -1159,15 +1748,22 @@ pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPref
         && !super::capacity_composition::processes_contain("capacity-external-target-worker")
         && !payload.output_root.join("pressure-0.sock").exists();
     let root = nix::unistd::geteuid().is_root();
-    let identity_authorized = root
-        && std::env::var("SUDO_UID")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            == Some(payload.composition_payload.preparing_uid)
-        && std::env::var("SUDO_GID")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            == Some(payload.composition_payload.preparing_gid);
+    let sudo_uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let sudo_gid = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let identity_context_supported = identity_context_supported(
+        root,
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+        sudo_uid,
+        sudo_gid,
+        payload.composition_payload.preparing_uid,
+        payload.composition_payload.preparing_gid,
+    );
+    let identity_authorized = root && identity_context_supported;
     let current_mem = super::capacity_composition::mem_available_bytes()?;
     let recomputed_ceiling = safe_search_ceiling(
         payload
@@ -1197,41 +1793,42 @@ pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPref
                     .headroom
                     .pressure_effective_maximum_bytes
     });
+    let path_contract_supported = CapacityPathContract::parse(
+        &payload.composition_payload.prepared_root,
+        &payload.output_root,
+    )
+    .is_ok();
+    let prepared_root_identity_verified = frozen_capacity_directory_identity_verified(
+        &payload.composition_payload.prepared_root,
+        &payload.prepared_root_identity,
+        payload.composition_payload.preparing_uid,
+        payload.composition_payload.preparing_gid,
+    );
+    let output_root_identity_verified = frozen_capacity_directory_identity_verified(
+        &payload.output_root,
+        &payload.output_root_identity,
+        payload.composition_payload.preparing_uid,
+        payload.composition_payload.preparing_gid,
+    );
+    let frozen_child_paths_verified =
+        capacity_payload_path_layout_supported(payload) && path == payload.manifest_path;
     let ownership_plan_supported = payload.composition_payload.preparing_uid != 0
         && payload.composition_payload.preparing_gid != 0
+        && path_contract_supported
+        && prepared_root_identity_verified
+        && output_root_identity_verified
+        && frozen_child_paths_verified
+        && identity_context_supported
         && capacity_payload_paths_supported(path, payload);
     let exact_profile_supported =
-        payload.contract.exact_profile == CapacityBenchmarkContract::v2().exact_profile;
+        payload.contract.exact_profile == CapacityBenchmarkContract::v1().exact_profile;
     let search_policy_supported = payload.search_policy == CapacitySearchPolicy::v1();
     let run_plan_supported = capacity_run_plan_supported(payload);
     let level_ladder_supported =
         payload.levels == capacity_ladder(payload.safe_search_ceiling_bytes)?;
     let report_lifecycle_version_supported =
         crate::capacity_composition::COMPOSITION_TARGET_EVIDENCE_VERSION == 2;
-    let gates = CapacityReadinessGates {
-        manifest_verified: verified,
-        source_and_binaries_verified,
-        material_environment_match,
-        external_target_prerequisite_verified,
-        composition_prerequisite_verified,
-        prerequisite_lineage_link_verified,
-        exact_profile_supported,
-        search_policy_supported,
-        run_plan_supported,
-        level_ladder_supported,
-        safe_search_ceiling_supported,
-        headroom_safe,
-        memory_max_safe,
-        ownership_plan_supported,
-        output_fresh,
-        stale_resources_clear,
-        report_lifecycle_version_supported,
-        legacy_global_report_absent,
-        validator_state_absent,
-    };
-    let user_preflight_passed = gates.user_ready();
-    let ready = user_preflight_passed && identity_authorized;
-    Ok(CapacityBenchmarkPreflight {
+    let mut report = CapacityBenchmarkPreflight {
         schema_version: CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION,
         prerequisite_status_contract_version: CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION,
         path_contract_version: CAPACITY_PATH_CONTRACT_VERSION,
@@ -1240,6 +1837,7 @@ pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPref
         material_environment_match,
         external_target_prerequisite_verified,
         composition_prerequisite_verified,
+        prerequisite_status_contract_supported,
         prerequisite_lineage_link_verified,
         exact_profile_supported,
         search_policy_supported,
@@ -1248,18 +1846,31 @@ pub fn capacity_benchmark_preflight(path: &Path) -> Result<CapacityBenchmarkPref
         safe_search_ceiling_supported,
         headroom_safe,
         memory_max_safe,
+        path_contract_supported,
+        prepared_root_identity_verified,
+        output_root_identity_verified,
+        frozen_child_paths_verified,
         ownership_plan_supported,
         output_fresh,
         stale_resources_clear,
         report_lifecycle_version_supported,
         legacy_global_report_absent,
         validator_state_absent,
-        user_preflight_passed,
+        all_non_authorization_gates_pass: false,
+        user_preflight_passed: false,
         current_identity_authorized: identity_authorized,
-        bounded_capacity_benchmark_entry_ready: ready,
-        execution_ready: ready,
+        bounded_capacity_benchmark_entry_ready: false,
+        execution_ready: false,
         preflight_mutated: false,
-    })
+    };
+    let non_authorization = report.all_non_authorization_gates_pass();
+    let ready = non_authorization && identity_authorized;
+    report.all_non_authorization_gates_pass = non_authorization;
+    report.user_preflight_passed = non_authorization;
+    report.bounded_capacity_benchmark_entry_ready = ready;
+    report.execution_ready = ready;
+    report.verify_readiness_consistency()?;
+    Ok(report)
 }
 
 fn boundary(
@@ -2007,7 +2618,7 @@ pub fn capacity_benchmark_recovery_preflight(
     let identity = legacy_capacity_identity(manifest_path)?;
     let archive = Path::new(LINEAGE1_ARCHIVE);
     let archive_verified = hash_file(&archive.join("manifest.json"))? == hash_file(manifest_path)?
-        && verify_all_sums(archive).is_ok()
+        && verify_ledger_entries(archive).is_ok()
         && fs::read_to_string(archive.join("STATUS"))?.contains("classification=EXECUTION_ERROR");
     let consumed_lineage =
         fs::read_to_string(archive.join("STATUS"))?.contains("invocation_count=1");
@@ -2193,8 +2804,8 @@ mod tests {
 
     #[test]
     fn contract_is_capacity_only_and_never_production_or_gaming() {
-        let contract = CapacityBenchmarkContract::v2();
-        assert_eq!(contract.version, 2);
+        let contract = CapacityBenchmarkContract::v1();
+        assert_eq!(contract.version, 1);
         assert!(contract.capacity_evaluation_authorized);
         assert!(!contract.gaming_effectiveness_authorized);
         assert!(!contract.production_activation_authorized);
@@ -2355,13 +2966,10 @@ mod tests {
     }
 
     #[test]
-    fn prerequisite_status_rejects_substrings_duplicates_and_legacy_aliases() {
+    fn prerequisite_status_rejects_substrings_duplicates_and_failed_supporting_gates() {
         let status = external_status();
         assert!(parse_prerequisite_status(
-            &status.replace(
-                "production_activation=false",
-                "xproduction_activation=false"
-            ),
+            &status.replace("production_activation=false", "production_activation=true"),
             CapacityPrerequisiteKind::ExternalTarget,
         )
         .is_err());
@@ -2374,7 +2982,7 @@ mod tests {
             &status.replace("status=PASS", "classification=PASS"),
             CapacityPrerequisiteKind::ExternalTarget,
         )
-        .is_err());
+        .is_ok());
         assert!(parse_prerequisite_status(
             &status.replace("cleanup=PASS", "cleanup=PASS extra"),
             CapacityPrerequisiteKind::ExternalTarget,
@@ -2383,10 +2991,454 @@ mod tests {
     }
 
     #[test]
+    fn status_contract_accepts_current_legacy_and_matching_terminal_forms() {
+        let external = external_status();
+        assert!(parse_prerequisite_status(
+            &external.replace("status=PASS", "classification=PASS"),
+            CapacityPrerequisiteKind::ExternalTarget,
+        )
+        .is_ok());
+        let composition = composition_status();
+        for terminal in [
+            "status=PASS",
+            "classification=PASS",
+            "classification=COMPLETED_COMPOSITION_FRAMEWORK_VALIDATION",
+            "status=PASS\nclassification=PASS",
+            "status=PASS\nclassification=COMPLETED_COMPOSITION_FRAMEWORK_VALIDATION",
+        ] {
+            assert!(parse_prerequisite_status(
+                &composition.replace("status=PASS", terminal),
+                CapacityPrerequisiteKind::Composition,
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn status_contract_rejects_missing_duplicate_conflicting_and_nonpass_terminals() {
+        let status = external_status();
+        for candidate in [
+            status.replace("status=PASS\n", ""),
+            format!("{status}\nstatus=PASS"),
+            status.replace("status=PASS", "status=PASS\nclassification=FAIL"),
+            status.replace("status=PASS", "status=PASSING"),
+            status.replace("status=PASS", "status=FAIL"),
+            status.replace("status=PASS", "status=ERROR"),
+            status.replace("status=PASS", "status=BLOCKED"),
+            status.replace("status=PASS", "status=INCOMPLETE"),
+        ] {
+            assert!(parse_prerequisite_status(
+                &candidate,
+                CapacityPrerequisiteKind::ExternalTarget,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn status_contract_normalizes_crlf_trims_ascii_and_preserves_unknown_metadata() {
+        let status = external_status()
+            .lines()
+            .map(|line| format!(" \t{line} \t"))
+            .chain(["future_metadata = harmless".to_owned(), String::new()])
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let parsed =
+            parse_prerequisite_status(&status, CapacityPrerequisiteKind::ExternalTarget).unwrap();
+        assert_eq!(
+            parsed._unknown_metadata,
+            vec![("future_metadata".into(), "harmless".into())]
+        );
+    }
+
+    #[test]
+    fn status_contract_rejects_malformed_unknown_lines_and_supporting_gate_failures() {
+        let status = external_status();
+        assert!(parse_prerequisite_status(
+            &format!("{status}\nmalformed future metadata"),
+            CapacityPrerequisiteKind::ExternalTarget,
+        )
+        .is_err());
+        for (from, to) in [
+            ("cleanup=PASS", "cleanup=FAIL"),
+            ("structural_restore=PASS", "structural_restore=FAIL"),
+            ("production_activation=false", "production_activation=true"),
+        ] {
+            assert!(parse_prerequisite_status(
+                &status.replace(from, to),
+                CapacityPrerequisiteKind::ExternalTarget,
+            )
+            .is_err());
+        }
+    }
+
+    fn write_ledger(root: &Path, paths: &[&str]) {
+        let ledger = paths
+            .iter()
+            .map(|relative| format!("{}  {relative}", hash_file(&root.join(relative)).unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("SHA256SUMS"), format!("{ledger}\n")).unwrap();
+    }
+
+    fn ledger_fixture(kind: CapacityPrerequisiteKind) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("manifest.json"), b"manifest").unwrap();
+        fs::write(root.path().join(kind.report_name()), b"report").unwrap();
+        fs::write(root.path().join("STATUS"), b"status").unwrap();
+        fs::write(root.path().join("future-metadata.txt"), b"future").unwrap();
+        write_ledger(
+            root.path(),
+            &[
+                "manifest.json",
+                kind.report_name(),
+                "STATUS",
+                "future-metadata.txt",
+            ],
+        );
+        root
+    }
+
+    #[test]
+    fn prerequisite_ledger_accepts_complete_archives_and_extra_metadata() {
+        for kind in [
+            CapacityPrerequisiteKind::ExternalTarget,
+            CapacityPrerequisiteKind::Composition,
+        ] {
+            let fixture = ledger_fixture(kind);
+            verify_all_sums(&fixture.path().canonicalize().unwrap(), kind).unwrap();
+        }
+    }
+
+    #[test]
+    fn prerequisite_ledger_rejects_hash_mismatch_duplicate_and_path_escape() {
+        for changed in ["STATUS", "manifest.json", "external-target-validation.json"] {
+            let fixture = ledger_fixture(CapacityPrerequisiteKind::ExternalTarget);
+            let root = fixture.path().canonicalize().unwrap();
+            fs::write(root.join(changed), b"tampered").unwrap();
+            assert!(verify_all_sums(&root, CapacityPrerequisiteKind::ExternalTarget).is_err());
+        }
+        let fixture = ledger_fixture(CapacityPrerequisiteKind::ExternalTarget);
+        let root = fixture.path().canonicalize().unwrap();
+        write_ledger(
+            &root,
+            &[
+                "manifest.json",
+                "external-target-validation.json",
+                "STATUS",
+                "STATUS",
+            ],
+        );
+        assert!(verify_all_sums(&root, CapacityPrerequisiteKind::ExternalTarget).is_err());
+        fs::write(
+            root.join("SHA256SUMS"),
+            format!("{}  ../escape\n", "0".repeat(64)),
+        )
+        .unwrap();
+        assert!(verify_all_sums(&root, CapacityPrerequisiteKind::ExternalTarget).is_err());
+    }
+
+    #[test]
+    fn prerequisite_ledger_rejects_symlinks_and_missing_required_files() {
+        for missing in ["manifest.json", "external-target-validation.json", "STATUS"] {
+            let fixture = ledger_fixture(CapacityPrerequisiteKind::ExternalTarget);
+            let root = fixture.path().canonicalize().unwrap();
+            let paths = [
+                "manifest.json",
+                "external-target-validation.json",
+                "STATUS",
+                "future-metadata.txt",
+            ]
+            .into_iter()
+            .filter(|path| *path != missing)
+            .collect::<Vec<_>>();
+            write_ledger(&root, &paths);
+            assert!(verify_all_sums(&root, CapacityPrerequisiteKind::ExternalTarget).is_err());
+        }
+        let fixture = ledger_fixture(CapacityPrerequisiteKind::ExternalTarget);
+        let root = fixture.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink("manifest.json", root.join("manifest-link")).unwrap();
+        let mut ledger = fs::read_to_string(root.join("SHA256SUMS")).unwrap();
+        ledger.push_str(&format!(
+            "{}  manifest-link\n",
+            hash_file(&root.join("manifest.json")).unwrap()
+        ));
+        fs::write(root.join("SHA256SUMS"), ledger).unwrap();
+        assert!(verify_all_sums(&root, CapacityPrerequisiteKind::ExternalTarget).is_err());
+    }
+
+    fn copy_archive_tree(source: &Path, destination: &Path) {
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                fs::create_dir(&target).unwrap();
+                copy_archive_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn archive_copy(source: &Path) -> tempfile::TempDir {
+        let destination = tempfile::tempdir().unwrap();
+        copy_archive_tree(source, destination.path());
+        destination
+    }
+
+    fn rewrite_status_key(root: &Path, key: &str, value: &str) {
+        let status_path = root.join("STATUS");
+        let status = fs::read_to_string(&status_path).unwrap();
+        let mut replaced = false;
+        let rewritten = status
+            .lines()
+            .map(|line| {
+                if line
+                    .split_once('=')
+                    .is_some_and(|(candidate, _)| candidate == key)
+                {
+                    replaced = true;
+                    format!("{key}={value}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(replaced, "missing STATUS key {key}");
+        fs::write(status_path, format!("{rewritten}\n")).unwrap();
+    }
+
+    fn rebuild_archive_ledger(root: &Path) {
+        let paths = fs::read_to_string(root.join("SHA256SUMS"))
+            .unwrap()
+            .lines()
+            .map(|line| line.split_once("  ").unwrap().1.to_owned())
+            .collect::<Vec<_>>();
+        let ledger = paths
+            .iter()
+            .map(|relative| format!("{}  {relative}", hash_file(&root.join(relative)).unwrap()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("SHA256SUMS"), format!("{ledger}\n")).unwrap();
+    }
+
+    fn reseal_external_archive(root: &Path, report: &mut ExternalTargetExecutionReport) {
+        report.payload_sha256 = hash_json(&report.payload).unwrap();
+        fs::write(
+            root.join(CapacityPrerequisiteKind::ExternalTarget.report_name()),
+            serde_json::to_vec_pretty(report).unwrap(),
+        )
+        .unwrap();
+        rewrite_status_key(root, "execution_payload_sha256", &report.payload_sha256);
+        rebuild_archive_ledger(root);
+    }
+
+    fn reseal_composition_archive(root: &Path, report: &mut CapacityCompositionExecutionEvidence) {
+        report.payload_sha256.clear();
+        report.payload_sha256 = hash_json(report).unwrap();
+        fs::write(
+            root.join(CapacityPrerequisiteKind::Composition.report_name()),
+            serde_json::to_vec_pretty(report).unwrap(),
+        )
+        .unwrap();
+        rewrite_status_key(root, "execution_payload_sha256", &report.payload_sha256);
+        rebuild_archive_ledger(root);
+    }
+
+    #[test]
+    fn prerequisite_current_external_lineage6_and_composition_lineage5_archives_pass() {
+        for (path, kind) in [
+            (
+                "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-external-target-6-completed",
+                CapacityPrerequisiteKind::ExternalTarget,
+            ),
+            (
+                "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-composition-5-completed",
+                CapacityPrerequisiteKind::Composition,
+            ),
+        ] {
+            let archive = Path::new(path);
+            if archive.exists() {
+                if kind == CapacityPrerequisiteKind::Composition {
+                    let report: CapacityCompositionExecutionEvidence = serde_json::from_slice(
+                        &fs::read(archive.join(kind.report_name())).unwrap(),
+                    )
+                    .unwrap();
+                    for (index, run) in report.runs.iter().enumerate() {
+                        assert!(composition_run_is_complete(run), "composition run {index}");
+                    }
+                }
+                let prerequisite = prerequisite(archive, kind).unwrap();
+                verify_archive(&prerequisite, kind).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn prerequisite_external_typed_report_rejects_each_required_false_gate() {
+        let source = Path::new(
+            "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-external-target-6-completed",
+        );
+        if !source.exists() {
+            return;
+        }
+        for case in 0..18 {
+            let fixture = archive_copy(source);
+            let root = fixture.path().canonicalize().unwrap();
+            let mut report: ExternalTargetExecutionReport = serde_json::from_slice(
+                &fs::read(root.join(CapacityPrerequisiteKind::ExternalTarget.report_name()))
+                    .unwrap(),
+            )
+            .unwrap();
+            match case {
+                0 => {
+                    report.state =
+                        crate::capacity_external_validation::ExternalTargetClassification::Invalid
+                }
+                1 => report.payload.validator_exit_success = false,
+                2 => report.payload.direct_shadow_gates[0] = false,
+                3 => report.payload.required_damos_gates_passed = false,
+                4 => report.payload.zero_host_oom = false,
+                5 => report.payload.cleanup_passed = false,
+                6 => report.payload.recovery_passed = false,
+                7 => report.payload.recovery_idempotent_passed = false,
+                8 => report.payload.structural_restore_passed = false,
+                9 => report.payload.validator_report_lifecycle.version = 0,
+                10 => {
+                    report
+                        .payload
+                        .validator_report_lifecycle
+                        .legacy_global_absent_after = false
+                }
+                11 => {
+                    report
+                        .payload
+                        .validator_report_lifecycle
+                        .validator_state_absent = false
+                }
+                12 => report.payload.target_contract_version += 1,
+                13 => report.payload.target_protocol_version += 1,
+                14 => {
+                    report
+                        .payload
+                        .component_set
+                        .remove(&CapacityComponent::DamosReclaim);
+                }
+                15 => report.payload.capacity_evaluation = EvaluationState::Pass,
+                16 => report.payload.effectiveness_evaluation = EvaluationState::Pass,
+                17 => report.payload.production_activation_authorized = true,
+                _ => unreachable!(),
+            }
+            reseal_external_archive(&root, &mut report);
+            let prerequisite =
+                prerequisite(&root, CapacityPrerequisiteKind::ExternalTarget).unwrap();
+            assert!(
+                verify_archive(&prerequisite, CapacityPrerequisiteKind::ExternalTarget).is_err(),
+                "external gate case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn prerequisite_composition_typed_report_rejects_each_terminal_failure() {
+        let source = Path::new(
+            "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-composition-5-completed",
+        );
+        if !source.exists() {
+            return;
+        }
+        for case in 0..21 {
+            let fixture = archive_copy(source);
+            let root = fixture.path().canonicalize().unwrap();
+            let mut report: CapacityCompositionExecutionEvidence = serde_json::from_slice(
+                &fs::read(root.join(CapacityPrerequisiteKind::Composition.report_name())).unwrap(),
+            )
+            .unwrap();
+            match case {
+                0 => report.state = CompositionExperimentState::InvalidRun,
+                1 => report.planned_runs = 5,
+                2 => report.completed_runs = 5,
+                3 => report.planned_levels = 17,
+                4 => report.completed_levels = 17,
+                5 => {
+                    report.runs.pop();
+                }
+                6 => report.runs[0].state = CompositionExperimentState::InvalidRun,
+                7 => {
+                    report.runs[0].levels.pop();
+                }
+                8 => {
+                    report.runs[0].levels[0].classification =
+                        CompositionLevelClassification::InvalidEvidence
+                }
+                9 => report.runs[0].pressure_scope_cleanup_passed = false,
+                10 => report.runs[0].scope_cleanup.worker_absent = false,
+                11 => report.runs[0].structural_restore_passed = false,
+                12 => report.runs[0].levels[0].cleanup_passed = false,
+                13 => report.runs[0].levels[0].structural_restore_passed = false,
+                14 => {
+                    report.runs[0].levels[0]
+                        .target
+                        .validator_report_lifecycle
+                        .version = 0
+                }
+                15 => report.cleanup_passed = false,
+                16 => report.structural_restore_passed = false,
+                17 => report.search_complete = true,
+                18 => report.capacity_evaluation = EvaluationState::Pass,
+                19 => report.production_activation_authorized = true,
+                20 => report.effectiveness_evaluation = EvaluationState::Pass,
+                _ => unreachable!(),
+            }
+            reseal_composition_archive(&root, &mut report);
+            let prerequisite = prerequisite(&root, CapacityPrerequisiteKind::Composition).unwrap();
+            assert!(
+                verify_archive(&prerequisite, CapacityPrerequisiteKind::Composition).is_err(),
+                "composition gate case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn prerequisite_rejects_status_report_conflict_wrong_kind_hash_source_and_identity() {
+        let source = Path::new(
+            "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-external-target-6-completed",
+        );
+        if !source.exists() {
+            return;
+        }
+        let fixture = archive_copy(source);
+        let root = fixture.path().canonicalize().unwrap();
+        rewrite_status_key(&root, "cleanup", "FAIL");
+        rebuild_archive_ledger(&root);
+        let conflicted = prerequisite(&root, CapacityPrerequisiteKind::ExternalTarget).unwrap();
+        assert!(verify_archive(&conflicted, CapacityPrerequisiteKind::ExternalTarget).is_err());
+
+        let valid = prerequisite(source, CapacityPrerequisiteKind::ExternalTarget).unwrap();
+        let mut changed = valid.clone();
+        changed.kind = CapacityPrerequisiteKind::Composition;
+        assert!(verify_archive(&changed, CapacityPrerequisiteKind::ExternalTarget).is_err());
+        changed = valid.clone();
+        changed.status_sha256 = "0".repeat(64);
+        assert!(verify_archive(&changed, CapacityPrerequisiteKind::ExternalTarget).is_err());
+        changed = valid.clone();
+        changed.source_commit = "0".repeat(40);
+        assert!(verify_archive(&changed, CapacityPrerequisiteKind::ExternalTarget).is_err());
+        changed = valid;
+        changed.identity = "wrong-validation".into();
+        assert!(verify_archive(&changed, CapacityPrerequisiteKind::ExternalTarget).is_err());
+    }
+
+    #[test]
     fn capacity_path_contract_matches_exact_components_and_lineage() {
         assert!(capacity_path_plan_supported(
             Path::new("/tmp/nemor-capacity-benchmark-3-prepared"),
             Path::new("/tmp/nemor-capacity-benchmark-3-output"),
+        ));
+        assert!(capacity_path_plan_supported(
+            Path::new("/tmp/nemor-capacity-benchmark-12345-prepared"),
+            Path::new("/tmp/nemor-capacity-benchmark-12345-output"),
         ));
         for (prepared, output) in [
             (
@@ -2413,6 +3465,30 @@ mod tests {
                 "/tmp/foreign-nemor-capacity-benchmark-3-prepared",
                 "/tmp/foreign-nemor-capacity-benchmark-3-output",
             ),
+            (
+                "nemor-capacity-benchmark-3-prepared",
+                "nemor-capacity-benchmark-3-output",
+            ),
+            (
+                "/tmp/nemor-capacity-benchmark-0-prepared",
+                "/tmp/nemor-capacity-benchmark-0-output",
+            ),
+            (
+                "/tmp/nemor-capacity-benchmark-+3-prepared",
+                "/tmp/nemor-capacity-benchmark-+3-output",
+            ),
+            (
+                "/tmp/nemor-capacity-benchmark-x-prepared",
+                "/tmp/nemor-capacity-benchmark-x-output",
+            ),
+            (
+                "/tmp/nemor-capacity-benchmark-3-prepared",
+                "/tmp/nemor-capacity-benchmark-3-output-extra",
+            ),
+            (
+                "/tmp/nemor-capacity-benchmark-3-prepared/child",
+                "/tmp/nemor-capacity-benchmark-3-output/child",
+            ),
         ] {
             assert!(!capacity_path_plan_supported(
                 Path::new(prepared),
@@ -2422,13 +3498,127 @@ mod tests {
     }
 
     #[test]
+    fn path_contract_rejects_symlink_wrong_identity_mode_and_mount_device() {
+        let root = fixture_root();
+        let uid = nix::unistd::geteuid().as_raw();
+        let gid = nix::unistd::getegid().as_raw();
+        let identity = capture_capacity_directory_identity(root.path(), uid, gid).unwrap();
+        let tmp_device = fs::symlink_metadata("/tmp").unwrap().dev();
+        let mut wrong = identity.clone();
+        wrong.uid = wrong.uid.saturating_add(1);
+        assert!(!directory_identity_fields_supported(
+            &wrong,
+            root.path(),
+            uid,
+            gid,
+            tmp_device
+        ));
+        wrong = identity.clone();
+        wrong.gid = wrong.gid.saturating_add(1);
+        assert!(!directory_identity_fields_supported(
+            &wrong,
+            root.path(),
+            uid,
+            gid,
+            tmp_device
+        ));
+        wrong = identity.clone();
+        wrong.mode = 0o755;
+        assert!(!directory_identity_fields_supported(
+            &wrong,
+            root.path(),
+            uid,
+            gid,
+            tmp_device
+        ));
+        wrong = identity;
+        wrong.device = wrong.device.saturating_add(1);
+        assert!(!directory_identity_fields_supported(
+            &wrong,
+            root.path(),
+            uid,
+            gid,
+            tmp_device
+        ));
+        let link = root.path().with_extension("capacity-link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        assert!(capture_capacity_directory_identity(&link, uid, gid).is_err());
+        fs::remove_file(link).unwrap();
+    }
+
+    #[test]
+    fn path_contract_freezes_every_child_path_under_its_exact_root() {
+        let prepared = Path::new("/tmp/nemor-capacity-benchmark-3-prepared");
+        let output = Path::new("/tmp/nemor-capacity-benchmark-3-output");
+        let valid = || {
+            frozen_child_paths_supported(
+                prepared,
+                output,
+                &prepared.join(CAPACITY_BENCHMARK_MANIFEST_NAME),
+                &output.join("capacity-benchmark.report.json"),
+                &output.join("capacity-evaluation.json"),
+                &output.join("capacity-composition.sqlite"),
+                &output.join("capacity-composition.report.json"),
+                &output.join("runs"),
+            )
+        };
+        assert!(valid());
+        let foreign = Path::new("/tmp/foreign");
+        for position in 0..6 {
+            let mut paths = [
+                prepared.join(CAPACITY_BENCHMARK_MANIFEST_NAME),
+                output.join("capacity-benchmark.report.json"),
+                output.join("capacity-evaluation.json"),
+                output.join("capacity-composition.sqlite"),
+                output.join("capacity-composition.report.json"),
+                output.join("runs"),
+            ];
+            paths[position] = foreign.join("alias");
+            assert!(!frozen_child_paths_supported(
+                prepared, output, &paths[0], &paths[1], &paths[2], &paths[3], &paths[4], &paths[5],
+            ));
+        }
+    }
+
+    #[test]
+    fn path_contract_contains_no_component_prefix_naming_check() {
+        let source = include_str!("capacity_benchmark.rs");
+        assert!(!source.contains("starts_with(Path::new(\"/tmp/nemor-capacity-benchmark-\")"));
+        assert!(source.contains("strip_prefix(\"nemor-capacity-benchmark-\")"));
+    }
+
+    #[test]
+    fn preparation_file_is_create_new_private_synced_and_output_can_remain_empty() {
+        let root = fixture_root();
+        let manifest = root.path().join(CAPACITY_BENCHMARK_MANIFEST_NAME);
+        let mut created = false;
+        create_new_private_synced_file(&manifest, b"manifest\n", &mut created).unwrap();
+        assert!(created);
+        let metadata = fs::symlink_metadata(&manifest).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(fs::read(&manifest).unwrap(), b"manifest\n");
+        let mut collision_created = false;
+        assert!(
+            create_new_private_synced_file(&manifest, b"replacement", &mut collision_created)
+                .is_err()
+        );
+        assert!(!collision_created);
+        let output = tempfile::tempdir().unwrap();
+        assert!(fs::read_dir(output.path()).unwrap().next().is_none());
+    }
+
+    #[test]
     fn readiness_is_the_conjunction_of_every_reported_user_gate() {
-        let ready = CapacityReadinessGates {
+        let ready = CapacityBenchmarkPreflight {
+            schema_version: CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION,
+            prerequisite_status_contract_version: CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION,
+            path_contract_version: CAPACITY_PATH_CONTRACT_VERSION,
             manifest_verified: true,
             source_and_binaries_verified: true,
             material_environment_match: true,
             external_target_prerequisite_verified: true,
             composition_prerequisite_verified: true,
+            prerequisite_status_contract_supported: true,
             prerequisite_lineage_link_verified: true,
             exact_profile_supported: true,
             search_policy_supported: true,
@@ -2437,20 +3627,34 @@ mod tests {
             safe_search_ceiling_supported: true,
             headroom_safe: true,
             memory_max_safe: true,
+            path_contract_supported: true,
+            prepared_root_identity_verified: true,
+            output_root_identity_verified: true,
+            frozen_child_paths_verified: true,
             ownership_plan_supported: true,
             output_fresh: true,
             stale_resources_clear: true,
             report_lifecycle_version_supported: true,
             legacy_global_report_absent: true,
             validator_state_absent: true,
+            all_non_authorization_gates_pass: true,
+            user_preflight_passed: true,
+            current_identity_authorized: false,
+            bounded_capacity_benchmark_entry_ready: false,
+            execution_ready: false,
+            preflight_mutated: false,
         };
-        assert!(ready.user_ready());
+        assert!(ready.all_non_authorization_gates_pass());
+        ready.verify_readiness_consistency().unwrap();
         macro_rules! reject_false_gate {
             ($($field:ident),+ $(,)?) => {
                 $(
-                    let mut candidate = ready;
+                    let mut candidate = ready.clone();
                     candidate.$field = false;
-                    assert!(!candidate.user_ready(), stringify!($field));
+                    candidate.all_non_authorization_gates_pass = false;
+                    candidate.user_preflight_passed = false;
+                    assert!(!candidate.all_non_authorization_gates_pass(), stringify!($field));
+                    candidate.verify_readiness_consistency().unwrap();
                 )+
             };
         }
@@ -2460,6 +3664,7 @@ mod tests {
             material_environment_match,
             external_target_prerequisite_verified,
             composition_prerequisite_verified,
+            prerequisite_status_contract_supported,
             prerequisite_lineage_link_verified,
             exact_profile_supported,
             search_policy_supported,
@@ -2468,6 +3673,10 @@ mod tests {
             safe_search_ceiling_supported,
             headroom_safe,
             memory_max_safe,
+            path_contract_supported,
+            prepared_root_identity_verified,
+            output_root_identity_verified,
+            frozen_child_paths_verified,
             ownership_plan_supported,
             output_fresh,
             stale_resources_clear,
@@ -2475,6 +3684,91 @@ mod tests {
             legacy_global_report_absent,
             validator_state_absent,
         );
+        let mut root_ready = ready;
+        root_ready.current_identity_authorized = true;
+        root_ready.bounded_capacity_benchmark_entry_ready = true;
+        root_ready.execution_ready = true;
+        root_ready.verify_readiness_consistency().unwrap();
+        let round_trip: CapacityBenchmarkPreflight =
+            serde_json::from_slice(&serde_json::to_vec(&root_ready).unwrap()).unwrap();
+        round_trip.verify_readiness_consistency().unwrap();
+    }
+
+    #[test]
+    fn readiness_requires_exact_sudo_uid_and_gid_independently() {
+        assert!(identity_context_supported(
+            true,
+            0,
+            0,
+            Some(1000),
+            Some(1000),
+            1000,
+            1000,
+        ));
+        assert!(!identity_context_supported(
+            true,
+            0,
+            0,
+            Some(1001),
+            Some(1000),
+            1000,
+            1000,
+        ));
+        assert!(!identity_context_supported(
+            true,
+            0,
+            0,
+            Some(1000),
+            Some(1001),
+            1000,
+            1000,
+        ));
+        assert!(identity_context_supported(
+            false, 1000, 1000, None, None, 1000, 1000,
+        ));
+    }
+
+    #[test]
+    fn readiness_serialization_rejects_a_true_summary_with_a_false_displayed_gate() {
+        let mut report = CapacityBenchmarkPreflight {
+            schema_version: CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION,
+            prerequisite_status_contract_version: CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION,
+            path_contract_version: CAPACITY_PATH_CONTRACT_VERSION,
+            manifest_verified: false,
+            source_and_binaries_verified: true,
+            material_environment_match: true,
+            external_target_prerequisite_verified: true,
+            composition_prerequisite_verified: true,
+            prerequisite_status_contract_supported: true,
+            prerequisite_lineage_link_verified: true,
+            exact_profile_supported: true,
+            search_policy_supported: true,
+            run_plan_supported: true,
+            level_ladder_supported: true,
+            safe_search_ceiling_supported: true,
+            headroom_safe: true,
+            memory_max_safe: true,
+            path_contract_supported: true,
+            prepared_root_identity_verified: true,
+            output_root_identity_verified: true,
+            frozen_child_paths_verified: true,
+            ownership_plan_supported: true,
+            output_fresh: true,
+            stale_resources_clear: true,
+            report_lifecycle_version_supported: true,
+            legacy_global_report_absent: true,
+            validator_state_absent: true,
+            all_non_authorization_gates_pass: true,
+            user_preflight_passed: true,
+            current_identity_authorized: true,
+            bounded_capacity_benchmark_entry_ready: true,
+            execution_ready: true,
+            preflight_mutated: false,
+        };
+        let encoded = serde_json::to_vec(&report).unwrap();
+        report = serde_json::from_slice(&encoded).unwrap();
+        assert!(!report.all_non_authorization_gates_pass());
+        assert!(report.verify_readiness_consistency().is_err());
     }
 
     #[test]
@@ -2782,16 +4076,111 @@ mod tests {
             "classification": "pass"
         });
         assert!(serde_json::from_value::<CapacityRecoveryReport>(value).is_err());
-        assert_eq!(CAPACITY_BENCHMARK_CONTRACT_VERSION, 2);
+        assert_eq!(CAPACITY_BENCHMARK_CONTRACT_VERSION, 1);
         assert_eq!(CAPACITY_BENCHMARK_MANIFEST_SCHEMA_VERSION, 4);
         assert_eq!(CAPACITY_BENCHMARK_PREFLIGHT_SCHEMA_VERSION, 4);
         assert_eq!(CAPACITY_BENCHMARK_EXECUTION_SCHEMA_VERSION, 3);
+        assert_eq!(CAPACITY_BENCHMARK_RUN_VERSION, 3);
+        assert_eq!(CAPACITY_BENCHMARK_LEVEL_VERSION, 3);
         assert_eq!(CAPACITY_PREREQUISITE_STATUS_CONTRACT_VERSION, 1);
         assert_eq!(CAPACITY_PATH_CONTRACT_VERSION, 1);
         assert_eq!(CAPACITY_EVALUATION_VERSION, 2);
+        assert_eq!(CapacitySearchPolicy::v1().version, 1);
+        assert_eq!(FAVORABLE_CAPACITY_TARGET_PERCENT, 30);
+        assert_eq!(CAPACITY_LEVEL_TIMEOUT_MS, 30_000);
+        assert_eq!(CAPACITY_RUN_TIMEOUT_MS, 280_000);
+        assert_eq!(crate::pressure_worker::PRESSURE_WORKER_PROTOCOL_VERSION, 1);
         assert_eq!(
             crate::capacity_external_target::CAPACITY_EXTERNAL_TARGET_PROTOCOL_VERSION,
             1
+        );
+        assert_eq!(
+            crate::capacity_composition::COMPOSITION_TARGET_EVIDENCE_VERSION,
+            2
+        );
+    }
+
+    #[test]
+    fn versioning_rejects_historical_lineage2_schema_v3_as_manifest_v4() {
+        let path = Path::new(
+            "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-benchmark-2-user-preflight-blocked/manifest.json",
+        );
+        if path.exists() {
+            assert!(serde_json::from_slice::<PreparedCapacityBenchmarkManifest>(
+                &fs::read(path).unwrap()
+            )
+            .is_err());
+        }
+        let legacy = serde_json::json!({
+            "payload": {"schema_version": 3},
+            "payload_sha256": "legacy"
+        });
+        assert!(serde_json::from_value::<PreparedCapacityBenchmarkManifest>(legacy).is_err());
+    }
+
+    #[test]
+    fn versioning_manifest_v4_round_trip_preserves_new_frozen_contract_fields() {
+        let path = Path::new(
+            "/home/oliver/.local/share/nemor/validation-history/phase10-capacity-benchmark-2-user-preflight-blocked/manifest.json",
+        );
+        if !path.exists() {
+            return;
+        }
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let payload = value["payload"].as_object_mut().unwrap();
+        payload.insert("schema_version".into(), serde_json::json!(4));
+        payload.insert(
+            "manifest_path".into(),
+            serde_json::json!(
+                "/tmp/nemor-capacity-benchmark-2-prepared/capacity-benchmark.manifest.json"
+            ),
+        );
+        for (field, path, inode) in [
+            (
+                "prepared_root_identity",
+                "/tmp/nemor-capacity-benchmark-2-prepared",
+                1,
+            ),
+            (
+                "output_root_identity",
+                "/tmp/nemor-capacity-benchmark-2-output",
+                2,
+            ),
+        ] {
+            payload.insert(
+                field.into(),
+                serde_json::json!({
+                    "canonical_path": path,
+                    "device": 53,
+                    "inode": inode,
+                    "uid": 1000,
+                    "gid": 1000,
+                    "mode": 448
+                }),
+            );
+        }
+        for (field, kind) in [
+            ("external_target_prerequisite", "external_target"),
+            ("composition_prerequisite", "composition"),
+        ] {
+            let prerequisite = payload[field].as_object_mut().unwrap();
+            prerequisite.insert("kind".into(), serde_json::json!(kind));
+            prerequisite.insert("status_contract_version".into(), serde_json::json!(1));
+            prerequisite.insert("status_sha256".into(), serde_json::json!("0".repeat(64)));
+        }
+        let manifest: PreparedCapacityBenchmarkManifest = serde_json::from_value(value).unwrap();
+        let round_trip: PreparedCapacityBenchmarkManifest =
+            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(round_trip.payload.schema_version, 4);
+        assert_eq!(
+            round_trip.payload.external_target_prerequisite.kind,
+            CapacityPrerequisiteKind::ExternalTarget
+        );
+        assert_eq!(round_trip.payload.prepared_root_identity.mode, 0o700);
+        assert_eq!(
+            round_trip.payload.manifest_path,
+            Path::new("/tmp/nemor-capacity-benchmark-2-prepared/capacity-benchmark.manifest.json")
         );
     }
 }
