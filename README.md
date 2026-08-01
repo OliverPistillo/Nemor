@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 3A/3B/3C CLOSED / PASS; `nemor_capacity` orchestration contract implemented, activation pending |
+| Phase 10 | reproducible A/B benchmark framework | 🔵 first valid capacity benchmark Censored at the safe ceiling; 30% target Indeterminate; governance closure review pending |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -36,7 +36,7 @@ development; ⚪ planned.
 | Workspace crates | 15 |
 | Tests defined / executed | 649 / 649 (current local workspace suite) |
 | Passed / failed / ignored | 649 / 0 / 0 locally; exact-commit GitHub CI required for each integrated change |
-| Phase 10 validation | 3A/3B/3C CLOSED / PASS; exact `DamonTelemetry` + `DamosReclaim` combined compatibility PASS; capacity/effectiveness still not evaluated |
+| Phase 10 validation | 3A/3B/3C CLOSED / PASS; External-target Lineage 7 and Composition Lineage 6 PASS; Capacity Benchmark Lineage 3 valid Censored evidence, with the 30% target Indeterminate |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
@@ -437,12 +437,12 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
   validation of Phases 3, 5, 6, 7 and 8.
 - Phase 9 validated both profitable selective KSM and real ineffective-workload
   auto-disable/cooldown on cooperative owned targets.
-- Phase 10 remains in development: the benchmark framework, privileged
-  owned-cgroup harness, and privileged observer service pipeline are
-  validated; exact `DamonTelemetry` + `DamosReclaim` combined compatibility is
-  validated, and the progressive pressure plus exact external HOT/WARM/COLD
-  target completed conservative composition framework validation. The true
-  capacity benchmark and real capacity A/B evidence remain pending.
+- Phase 10 has its first valid capacity A/B evidence on exact source
+  `648dd849`: all six matched runs and all sixty levels were Sustainable
+  through the 6,996,099,072-byte safe ceiling. Both variants are
+  right-censored at that ceiling, so the result is `Censored`, the demonstrated
+  paired delta is zero bytes, no finite gain bound is supported, and the 30%
+  target remains `Indeterminate`. Governance closure review remains pending.
 - Phase 11 is not started.
 
 ## Documentation

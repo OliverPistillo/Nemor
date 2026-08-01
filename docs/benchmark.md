@@ -974,3 +974,74 @@ estimate, maximum, gain, gaming-effectiveness result, or production
 authorization. Capacity and effectiveness remain `NotEvaluated`,
 `search_complete=false`, and production activation remains false. It does not
 validate cgroup protection, zram, storage tiering, or KSM composition.
+
+## First valid capacity benchmark: Lineage 3
+
+Capacity Benchmark Lineage 3
+`capacity-benchmark-1785524018540371036` executed once on exact source
+`648dd849e102598efb45a8da585b5db8a5f801a1`, after source-bound
+External-target Lineage 7 and Composition Lineage 6 completed and their full
+archive ledgers verified. Benchmark contract, search policy, prerequisite
+STATUS contract and path contract are version 1; manifest/preflight are schema
+4, execution/run/level evidence schema 3, and evaluation schema 2.
+
+The lineage was prepared once. Its first user preflight stopped without
+mutation on volatile headroom. After natural headroom recovered, the
+authorized second user preflight passed every non-authorization gate. The
+first root preflight passed, but its later execution wrapper timed out waiting
+for interactive sudo before Nemor started. A final natural-headroom check then
+passed; the second authenticated wrapper used `sudo -v`, and root preflight
+attempt 2 passed every semantic gate with `preflight_mutated=false`. Exactly
+one real benchmark invocation followed. The earlier wrapper is not an
+invocation and did not consume the lineage.
+
+The fixed ascending ladder was 687,865,856; 1,392,508,928; 2,097,152,000;
+2,785,017,856; 3,489,660,928; 4,194,304,000; 4,882,169,856; 5,586,812,928;
+6,291,456,000; and 6,996,099,072 bytes. All three baseline runs and all three
+matched `nemor_capacity` runs completed all ten levels as Sustainable. Every
+run therefore has a demonstrated lower bound of 6,996,099,072 bytes, no
+observed upper bound, and `safe_ceiling_reached` right-censoring.
+
+All three matched pairs are valid. Each has baseline and capacity lower bounds
+of 6,996,099,072 bytes, unknown upper bounds, and a demonstrated delta of zero
+bytes. Median demonstrated baseline and capacity are both 6,996,099,072
+bytes; median paired demonstrated delta is zero. Because both sides are
+right-censored at the same safe ceiling, neither a finite conservative gain
+lower bound nor a finite possible gain upper bound is supported. No exact
+maximum or zero-gain conclusion is inferred. The authoritative 30% target is
+therefore `Indeterminate`. The experiment has only three matched pairs and
+supports no broad statistical-significance claim.
+
+All 60/60 levels had exact touched-byte acknowledgement, pressure heartbeat
+and integrity, verified cgroup membership and MemoryMax, zero OOM, zero
+OOM-kill, no watchdog, target cleanup, scope cleanup and structural restore.
+The 30 baseline levels invoked no validator and performed no DAMON/DAMOS
+mutation. The 30 capacity levels produced 30 unique transaction-scoped raw
+reports and canonical identities; every report lifecycle passed, all four
+direct shadow gates and all required DAMOS gates passed, HOT/WARM service was
+preserved, only COLD was reclaimed, and controlled refault passed. SQLite
+integrity is `ok` with one experiment and sixty levels. Final
+`nr_kdamonds=0`; no process, report/state, socket, transaction, unit, cgroup,
+DAMON, DAMOS or trace residue remained.
+
+The immutable result archive is
+`~/.local/share/nemor/validation-history/phase10-capacity-benchmark-3-censored`.
+The experiment report SHA-256 is
+`8597aa0bb8f1ebefc2c34e56ac10c7c88f3a3dfbc7e4bb1bd5dd70afffae03f3`;
+evaluation SHA-256 is
+`8599af57a354442d8fc5f6a820e745c970dc87a056b646fa3d4722a8726a69ee`;
+SQLite SHA-256 is
+`af059f290e25a2643e4abce07768e9cb3cbe326a5ce4c8bb65f8da49797e852a`;
+STATUS SHA-256 is
+`4b679e0b1d9322b0f7712229d831ae5bf95cadc8ae5a5e4d8688028d6f7d4d61`;
+`SHA256SUMS` SHA-256 is
+`82f5eb427930051c640859fc1953e7eff6dd86c59de2592e7fc66e43fa52809c`;
+and the complete evidence tar SHA-256 is
+`c76b28b073706f79a990349277cac637cf8793e0264ef949c27b265427117f61`.
+Every ledger entry verifies.
+
+This result evaluates capacity only within the frozen component set, host,
+source, environment, ladder and ceiling. It does not evaluate gaming
+effectiveness, excluded mechanisms, or production behavior; effectiveness
+remains `NotEvaluated`, production activation remains false, and it is not a
+Phase 11 result.
