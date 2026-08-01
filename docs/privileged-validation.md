@@ -399,8 +399,9 @@ Three repetitions support no significance claim, and capacity remains
 `not_evaluated`. Final read-only inspection found no benchmark unit, observer
 service, transaction runtime directory or benchmark-owned process residue;
 production Nemor state was not adopted. Checkpoint 3B is CLOSED / PASS.
-Phase 10 remains in development, with controlled progressive memory pressure
-as the next framework/design target.
+At this historical Checkpoint 3B stage, Phase 10 remained in development and
+controlled progressive memory pressure was the next framework/design target.
+The later Phase 10 lineages completed that bounded validation scope.
 
 Checkpoint 3C now provides the model, manifest-ready plan, versioned level/run
 evidence, scoped health gates, conservative headroom calculation, emergency
@@ -644,3 +645,17 @@ its `SHA256SUMS` hash is
 This result is not capacity evidence, is not pressure-search integration, does
 not validate components outside the exact pair, and leaves capacity and
 effectiveness `NotEvaluated` with production activation false.
+
+## Phase 10 governance closure
+
+The later source-bound validation chain completed External-target Lineage 7
+and Composition Lineage 6 with live PASS results. Capacity Benchmark Lineage 3
+then completed all six runs and all sixty levels as Sustainable, producing
+valid right-censored evidence at the safe ceiling. Governance review on
+2026-08-01 therefore classified Phase 10 as **CLOSED / VALIDATED
+(CENSORED)**.
+
+This closure does not authorize production operation or establish a capacity
+gain. The 30% target remains `Indeterminate`, gaming effectiveness remains
+`NotEvaluated`, production `nemor_capacity` remains unimplemented and
+unauthorized, and Phase 11 is `NotStarted`.

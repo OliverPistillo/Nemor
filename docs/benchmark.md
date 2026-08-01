@@ -1,9 +1,11 @@
 # Phase 10 benchmark framework
 
-Phase 10 demonstrates results with reproducible A/B experiments. The framework,
-safe instrumentation smoke path, and Checkpoint 2 privileged harness are
-validated; real A/B validation is pending. Smoke and harness-validation results
-are never capacity, gaming, OOM-avoidance or production performance evidence.
+Phase 10 demonstrates results with reproducible A/B experiments. Its
+engineering and validation scope is CLOSED / VALIDATED (CENSORED): the
+framework, safety harnesses, fixed-load checkpoints, progressive-pressure
+checkpoint, source-bound prerequisites, and first true capacity benchmark are
+validated. Smoke and harness-validation results remain distinct from capacity,
+gaming, OOM-avoidance, or production performance evidence.
 
 ## Scenarios and execution level
 
@@ -70,9 +72,10 @@ privileged cgroup mutation. External adapters require an absolute executable
 from an explicit allow-list plus an argv vector; configuration cannot provide
 shell text.
 
-The Checkpoint 3C progressive-pressure scheduler and evidence contracts are
-implemented as a model-only framework; live preparation/execution remains
-pending. Checkpoint 2 validated the explicit privileged owned-cgroup
+Checkpoint 3C began as a model-only progressive-pressure scheduler and later
+completed its bounded live framework validation. The source-bound capacity
+chain subsequently executed exactly once and produced valid Censored evidence.
+Checkpoint 2 separately validated the explicit privileged owned-cgroup
 transaction without applying performance pressure. `MemoryMax` must remain
 below measured host headroom, a watchdog and timeout are mandatory, and host
 OOM is always a safety failure. Controlled cgroup OOM is a distinct outcome.
@@ -109,10 +112,11 @@ enter capacity, gaming or CPU acceptance aggregates.
 
 Variant resolution records requested variant, executable/alias/pending state,
 effective-state hash, reason and exact difference. Baseline and observe are
-executable for an explicit observer-overhead comparison. Safe, gaming and
-capacity orchestration remain pending. A zram name that resolves to the
-existing CachyOS zram configuration is an alias, not an A/B variant. Zswap
-remains pending Phase 6.
+executable for an explicit observer-overhead comparison. Safe and gaming
+orchestration remain pending. Production capacity orchestration remains
+unimplemented and unauthorized; the separate bounded capacity-validation
+path is complete. A zram name that resolves to the existing CachyOS zram
+configuration is an alias, not an A/B variant. Zswap remains pending Phase 6.
 
 ## Owned-cgroup harness
 
@@ -384,8 +388,9 @@ CPU regression. It does not invalidate the six valid comparable runs.
 Only three repetitions were collected, so no statistical significance is
 claimed. `capacity_gain_percent`, capacity, gaming, OOM avoidance and
 optimization effectiveness remain `not_evaluated`. Checkpoint 3B is CLOSED /
-PASS. Phase 10 remains in development; controlled progressive memory pressure
-is the next live validation target.
+PASS. At this historical checkpoint, Phase 10 remained in development and
+controlled progressive memory pressure was the next live validation target;
+the later sections record its completion and the final governance decision.
 
 ### Checkpoint 3C controlled progressive pressure
 
@@ -445,7 +450,8 @@ The unprivileged simulator allocates no workload memory and performs no
 privileged operation. It deterministically covers all-sustainable,
 unsustainable, PSI/OOM/worker/observer/watchdog/restore abort, touched-byte
 mismatch, refinement and comparison-mismatch paths. Checkpoint 3C remains
-**OPEN**, not PASS.
+**OPEN**, not PASS, at this model-only historical stage. The later live
+lineages and governance section record its eventual closure.
 
 The live worker is a separate process whose payload begins at zero bytes. The
 runner binds its PID/start ticks to the audited transient systemd D-Bus scope,
@@ -1045,3 +1051,17 @@ source, environment, ladder and ceiling. It does not evaluate gaming
 effectiveness, excluded mechanisms, or production behavior; effectiveness
 remains `NotEvaluated`, production activation remains false, and it is not a
 Phase 11 result.
+
+## Phase 10 governance closure
+
+Governance review on 2026-08-01 accepted repository state
+`677917fa925d2278a7aa38fa60e340b3dea59a13` and the immutable Lineage 3
+archive above. Phase 10 is **CLOSED / VALIDATED (CENSORED)**: the engineering
+and validation scope is complete and the first true capacity evidence is
+scientifically valid, with every run right-censored at the safe ceiling.
+
+The authoritative 30% target remains **Indeterminate**. The evidence supports
+no finite capacity-gain interval, zero-gain conclusion, or equal-maximum
+conclusion. Gaming effectiveness remains `NotEvaluated`; production
+`nemor_capacity` remains unimplemented and unauthorized; and Phase 11 is
+`NotStarted`.

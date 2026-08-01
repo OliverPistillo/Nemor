@@ -20,7 +20,7 @@ not AI.
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
-| Phase 10 | reproducible A/B benchmark framework | 🔵 first valid capacity benchmark Censored at the safe ceiling; 30% target Indeterminate; governance closure review pending |
+| Phase 10 | reproducible A/B benchmark framework | ✅ CLOSED / VALIDATED — valid Censored capacity evidence; 30% target Indeterminate |
 | Phase 11 | predictive optimization | ⚪ Not started |
 
 Legend: ✅ validated; 🟡 development complete with validation pending; 🔵 in
@@ -34,9 +34,9 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 649 / 649 (current local workspace suite) |
-| Passed / failed / ignored | 649 / 0 / 0 locally; exact-commit GitHub CI required for each integrated change |
-| Phase 10 validation | 3A/3B/3C CLOSED / PASS; External-target Lineage 7 and Composition Lineage 6 PASS; Capacity Benchmark Lineage 3 valid Censored evidence, with the 30% target Indeterminate |
+| Tests defined / executed | 737 / 737 (current accepted source workspace suite) |
+| Passed / failed / ignored | 737 / 0 / 0; exact-commit GitHub CI remains authoritative |
+| Phase 10 validation | CLOSED / VALIDATED (CENSORED): 3A/3B/3C CLOSED / PASS; combined compatibility LIVE PASS; External-target Lineage 7 LIVE PASS; Composition Lineage 6 LIVE PASS; Capacity Benchmark Lineage 3 valid Censored evidence; 30% target Indeterminate; effectiveness NotEvaluated; production activation false |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
 | Checkpoint 3B | CLOSED / PASS — Experiment `checkpoint3b-1785272587990631899`, 3 baseline + 3 observe runs valid and comparable |
@@ -162,8 +162,10 @@ production performance claims.
   contract with exact combined-compatibility evidence binding, explicit
   capability/evidence prerequisites, exact ownership, dependencies,
   incompatibilities, apply/rollback order and permanently disabled
-  activation/evaluation fields. A separate bounded DAMON+DAMOS compatibility
-  harness exists; live validation remains a distinct privileged gate.
+  activation fields. The bounded DAMON+DAMOS compatibility, external-target,
+  composition, and capacity-validation chains completed; production
+  `nemor_capacity` remains unimplemented and unauthorized, and gaming
+  effectiveness remains `NotEvaluated`.
 - an explicit Checkpoint 2 owned-cgroup harness with dirty-source provenance,
   evidence-kind isolation, effective-state variant resolution, audited
   PID/start-ticks ownership, a 64 MiB steady worker, watchdog and restore
@@ -442,7 +444,9 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
   through the 6,996,099,072-byte safe ceiling. Both variants are
   right-censored at that ceiling, so the result is `Censored`, the demonstrated
   paired delta is zero bytes, no finite gain bound is supported, and the 30%
-  target remains `Indeterminate`. Governance closure review remains pending.
+  target remains `Indeterminate`. The engineering and validation scope is
+  CLOSED / VALIDATED (CENSORED); this does not authorize production or resolve
+  gaming effectiveness.
 - Phase 11 is not started.
 
 ## Documentation
