@@ -7,7 +7,7 @@ use policy_engine::PressureState;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const TIERING_RULE_VERSION: &str = "tiering-rules-v3-storage-profile-comparison";
+pub const TIERING_RULE_VERSION: &str = "tiering-rules-v4-storage-profile-comparison";
 pub const TIERING_AUDIT_REASON: &str = "tiering_observe_audit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +325,8 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
             Some(StorageProfile::NvmeSsd) => "nvme_boot_validation_missing".to_owned(),
             _ => "profile_boot_validation_missing".to_owned(),
         });
+    } else if !comparison_policy_passes(input) {
+        reasons.push("storage_profile_comparison_missing_or_not_beneficial".to_owned());
     } else {
         selected = BackendKind::ZswapStorageBacked;
         reasons.push("matching_same_host_profile_evidence".to_owned());
@@ -354,4 +356,25 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
         rule_version: TIERING_RULE_VERSION.to_owned(),
         production_activation: false,
     }
+}
+
+fn comparison_policy_passes(input: &RecommendationInput<'_>) -> bool {
+    let (Some(zram), Some(profile)) = (input.zram_benchmark, input.zswap_benchmark) else {
+        return false;
+    };
+    if !zram.real || !profile.real || zram.oom || profile.oom {
+        return false;
+    }
+    let Some(base_latency) = zram.swap_latency_ns else {
+        return false;
+    };
+    let Some(profile_latency) = profile.swap_latency_ns else {
+        return false;
+    };
+    let latency_ok = profile_latency <= base_latency.saturating_mul(110) / 100;
+    let benefit = match (zram.compression_ratio, profile.compression_ratio) {
+        (Some(base), Some(candidate)) => candidate > base,
+        _ => false,
+    };
+    latency_ok && benefit && profile.backing_write_bytes.is_some()
 }

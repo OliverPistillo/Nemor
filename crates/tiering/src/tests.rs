@@ -272,7 +272,11 @@ fn benchmark(backend: BackendKind) -> BenchmarkEvidence {
         real: true,
         cpu_time_ns: 1,
         wall_time_ns: 2,
-        compression_ratio: Some(2.0),
+        compression_ratio: Some(if backend == BackendKind::ZswapStorageBacked {
+            3.0
+        } else {
+            2.0
+        }),
         swap_latency_ns: Some(3),
         backing_write_bytes: Some(4),
         oom: false,
@@ -519,13 +523,14 @@ fn sata_and_nvme_evidence_bind_only_the_exact_profile() {
         let storage = topology(class);
         let matching = profile_evidence(profile);
         let (same_host_baseline, same_host_profile) = same_host_evidence(profile);
+        let zswap = benchmark(BackendKind::ZswapStorageBacked);
         let selected = recommend_backend(&RecommendationInput {
             current: BackendKind::Zram,
             gaming: false,
             pressure: PressureState::Normal,
             storage: &storage,
             zram_benchmark: Some(&zram),
-            zswap_benchmark: None,
+            zswap_benchmark: Some(&zswap),
             profile_evidence: Some(&matching),
             same_host_zram_baseline: Some(&same_host_baseline),
             same_host_profile_evidence: Some(&same_host_profile),
@@ -548,7 +553,7 @@ fn sata_and_nvme_evidence_bind_only_the_exact_profile() {
             pressure: PressureState::Normal,
             storage: &storage,
             zram_benchmark: Some(&zram),
-            zswap_benchmark: None,
+            zswap_benchmark: Some(&zswap),
             profile_evidence: Some(&wrong),
             same_host_zram_baseline: Some(&same_host_baseline),
             same_host_profile_evidence: Some(&wrong_same_host_profile),

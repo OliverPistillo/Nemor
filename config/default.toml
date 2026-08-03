@@ -96,6 +96,10 @@ benchmark_max_bytes = 67108864
 zswap_pool_min_percent = 5
 zswap_pool_max_percent = 20
 allow_shrinker = false
+comparison_enabled = false
+comparison_max_latency_regression_percent = 10
+comparison_min_useful_benefit_percent = 5
+comparison_accepted_confidence = "bounded-physical-device-attributed"
 
 [ksm]
 enabled = false

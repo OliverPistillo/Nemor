@@ -149,6 +149,14 @@ pub struct TieringConfig {
     pub zswap_pool_max_percent: u8,
     pub allow_shrinker: bool,
     pub rated_tbw: Option<f64>,
+    #[serde(default)]
+    pub comparison_enabled: bool,
+    #[serde(default)]
+    pub comparison_max_latency_regression_percent: u8,
+    #[serde(default)]
+    pub comparison_min_useful_benefit_percent: u8,
+    #[serde(default)]
+    pub comparison_accepted_confidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
