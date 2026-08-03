@@ -1345,10 +1345,27 @@ fn reconcile_transaction_new(path: &Path) -> Result<()> {
     if !candidate_path.exists() {
         return Ok(());
     }
-    let old: DurableTransactionV3 = read_json(path)?;
     let candidate: DurableTransactionV3 = read_json(&candidate_path)?;
-    old.validate()?;
     candidate.validate()?;
+    if !path.exists() {
+        let manifest_path = path
+            .parent()
+            .context("transaction parent")?
+            .join("prepared-manifest-v3.json");
+        let manifest: TieringBootValidationPreparedManifestV3 = read_json(&manifest_path)?;
+        manifest.validate()?;
+        if candidate.payload.validation_id != manifest.payload.validation_id
+            || candidate.payload.manifest_sha256 != canonical_json_sha256(&manifest)
+            || candidate.payload.stage != TransactionStageV3::Prepared
+            || !candidate.payload.mutation_records.is_empty()
+        {
+            bail!("orphan transaction .new is not the initial exact candidate")
+        }
+        fs::rename(&candidate_path, path)?;
+        return sync_parent(path);
+    }
+    let old: DurableTransactionV3 = read_json(path)?;
+    old.validate()?;
     let identity_matches = old.payload.validation_id == candidate.payload.validation_id
         && old.payload.manifest_sha256 == candidate.payload.manifest_sha256
         && old.payload.baseline_boot_id == candidate.payload.baseline_boot_id;
@@ -1389,6 +1406,25 @@ fn experimental_activate(a: TransactionArgs) -> Result<()> {
     {
         bail!("validation marker absent")
     };
+    // Freeze and re-read the protected fallback immediately before the first
+    // zswap write.  A valid entry alone is not sufficient authority.
+    let current_swaps = collect_swaps()?;
+    let current_zram = collect_zram(&current_swaps)?;
+    if current_zram != m.payload.protected_zram
+        || !current_zram.active
+        || current_zram.priority <= 0
+        || m.payload.baseline_swaps.is_empty()
+        || current_swaps.iter().any(|swap| {
+            m.payload
+                .baseline_swaps
+                .iter()
+                .find(|baseline| baseline.path == swap.path)
+                .is_some_and(|baseline| baseline != swap)
+                && swap.path != m.payload.swapfile.path
+        })
+    {
+        bail!("protected zram or baseline swap precondition changed")
+    }
     let status = command_output("/usr/bin/bootctl", &["status"])?;
     let booted_entry = parse_field(&status, "Current Boot Loader Entry:")
         .or_else(|| parse_field(&status, "Current Entry:"))
@@ -1843,9 +1879,18 @@ fn run_bounded_workload_scope(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut stdout = BufReader::new(child.stdout.take().context("worker stdout")?);
-    let mut ready = String::new();
-    stdout.read_line(&mut ready)?;
+    let stdout_pipe = child.stdout.take().context("worker stdout")?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout_pipe);
+        let mut ready = String::new();
+        let result = stdout.read_line(&mut ready).map(|_| (ready, stdout));
+        let _ = ready_tx.send(result);
+    });
+    let ready_timeout = std::time::Duration::from_secs(5);
+    let (ready, mut stdout) = ready_rx
+        .recv_timeout(ready_timeout)
+        .map_err(|_| anyhow::anyhow!("bounded worker readiness timeout"))??;
     let ready_json: serde_json::Value = serde_json::from_str(ready.trim())?;
     if ready_json.get("event").and_then(|value| value.as_str()) != Some("ready")
         || ready_json
@@ -1985,9 +2030,10 @@ fn bounded_workload(a: TransactionArgs) -> Result<()> {
         started: true,
         stopped: true,
         progress_steps,
-        bytes_touched: primary_bytes.saturating_mul(3).saturating_add(
-            pressure_bytes.saturating_mul(u64::from(m.payload.workload.iterations)),
-        ),
+        bytes_touched: primary_bytes
+            .saturating_add(pressure_bytes.saturating_mul(u64::from(m.payload.workload.iterations)))
+            .saturating_add(primary_bytes)
+            .saturating_add(primary_bytes),
         service_latency_ns: started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
         content_verified,
         refault_content_verified,
@@ -2486,7 +2532,7 @@ fn transaction_hierarchy_safe(root: &Path) -> bool {
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
                 || metadata.uid() != 0
-                || metadata.mode() & 0o022 != 0
+                || (path.starts_with("/var/lib/nemor") && metadata.mode() & 0o7777 != 0o700)
                 || device.is_some_and(|expected| expected != metadata.dev())
             {
                 return false;

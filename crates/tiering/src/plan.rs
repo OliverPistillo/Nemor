@@ -7,7 +7,7 @@ use policy_engine::PressureState;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const TIERING_RULE_VERSION: &str = "tiering-rules-v2-storage-profile";
+pub const TIERING_RULE_VERSION: &str = "tiering-rules-v3-storage-profile-comparison";
 pub const TIERING_AUDIT_REASON: &str = "tiering_observe_audit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

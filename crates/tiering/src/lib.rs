@@ -6,6 +6,7 @@ pub mod boot_validation;
 #[allow(dead_code)]
 pub mod boot_validation_v2;
 mod boot_validation_v3;
+pub mod boot_validation_v4;
 mod inventory;
 mod metrics;
 mod plan;
@@ -15,6 +16,7 @@ mod topology;
 mod zswap_backend;
 
 pub use boot_validation_v3::*;
+pub use boot_validation_v4::*;
 pub use inventory::{inspect_linux, DebugCounter, ProviderState, ZswapInventory, ZswapParameters};
 pub use metrics::{
     estimate_tbw, parse_block_stat, BlockIoDelta, BlockStat, BudgetDecision, TbEstimate,
