@@ -52,6 +52,8 @@ pub fn inspect_host(
         zram_benchmark: None,
         zswap_benchmark: None,
         profile_evidence: None,
+        same_host_zram_baseline: None,
+        same_host_profile_evidence: None,
         budget: &budget,
         safety_events: 0,
         source_state: "unverified",

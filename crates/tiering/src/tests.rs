@@ -1,4 +1,5 @@
 use super::*;
+use crate::boot_validation::*;
 use common::Config;
 use policy_engine::PressureState;
 use std::collections::BTreeMap;
@@ -296,6 +297,8 @@ fn selector_defaults_to_zram_for_missing_or_unsafe_evidence() {
             zram_benchmark: None,
             zswap_benchmark: None,
             profile_evidence: None,
+            same_host_zram_baseline: None,
+            same_host_profile_evidence: None,
             budget: &budget(allowed),
             safety_events: 0,
             source_state: "clean",
@@ -326,6 +329,7 @@ fn selector_chooses_only_matching_profile_evidence_deterministically() {
         backing_write_bytes: Some(4),
         oom: false,
     };
+    let (same_host_baseline, same_host_profile) = same_host_evidence(StorageProfile::NvmeSsd);
     let input = RecommendationInput {
         current: BackendKind::Zram,
         gaming: false,
@@ -334,6 +338,8 @@ fn selector_chooses_only_matching_profile_evidence_deterministically() {
         zram_benchmark: Some(&zram),
         zswap_benchmark: Some(&zswap),
         profile_evidence: Some(&profile),
+        same_host_zram_baseline: Some(&same_host_baseline),
+        same_host_profile_evidence: Some(&same_host_profile),
         budget: &budget(true),
         safety_events: 0,
         source_state: "clean",
@@ -426,6 +432,8 @@ fn legacy_zswap_nvme_is_readable_but_cannot_authorize_sata() {
         zram_benchmark: Some(&zram),
         zswap_benchmark: Some(&legacy_benchmark),
         profile_evidence: None,
+        same_host_zram_baseline: None,
+        same_host_profile_evidence: None,
         budget: &budget(true),
         safety_events: 0,
         source_state: "clean",
@@ -456,6 +464,46 @@ fn profile_evidence(profile: StorageProfile) -> ProfileBenchmarkEvidence {
     }
 }
 
+fn same_host_evidence(
+    profile: StorageProfile,
+) -> (SameHostZramBaselineEvidenceV1, SameHostProfileEvidenceV2) {
+    let baseline = SameHostZramBaselineEvidenceV1 {
+        schema: ZRAM_BASELINE_EVIDENCE_V1.to_owned(),
+        validation_id: "same-host-validation".to_owned(),
+        source_commit: "a".repeat(40),
+        source_state_sha256: "1".repeat(64),
+        environment_sha256: "2".repeat(64),
+        topology_sha256: "3".repeat(64),
+        workload_sha256: "4".repeat(64),
+        real: true,
+        oom: false,
+        safety_failure: false,
+        cleanup_passed: true,
+        final_restore_passed: true,
+        archive_sha256: "5".repeat(64),
+    };
+    let evidence = SameHostProfileEvidenceV2 {
+        schema: PROFILE_BENCHMARK_EVIDENCE_V2.to_owned(),
+        validation_id: baseline.validation_id.clone(),
+        profile,
+        source_commit: baseline.source_commit.clone(),
+        source_state_sha256: baseline.source_state_sha256.clone(),
+        environment_sha256: baseline.environment_sha256.clone(),
+        topology_sha256: baseline.topology_sha256.clone(),
+        workload_sha256: baseline.workload_sha256.clone(),
+        real: true,
+        oom: false,
+        safety_failure: false,
+        cleanup_passed: true,
+        final_restore_passed: true,
+        write_budget_passed: true,
+        backing_write_bytes: Some(4),
+        latency_ns: Some(3),
+        archive_sha256: "6".repeat(64),
+    };
+    (baseline, evidence)
+}
+
 #[test]
 fn sata_and_nvme_evidence_bind_only_the_exact_profile() {
     let zram = benchmark(BackendKind::Zram);
@@ -465,6 +513,7 @@ fn sata_and_nvme_evidence_bind_only_the_exact_profile() {
     ] {
         let storage = topology(class);
         let matching = profile_evidence(profile);
+        let (same_host_baseline, same_host_profile) = same_host_evidence(profile);
         let selected = recommend_backend(&RecommendationInput {
             current: BackendKind::Zram,
             gaming: false,
@@ -473,6 +522,8 @@ fn sata_and_nvme_evidence_bind_only_the_exact_profile() {
             zram_benchmark: Some(&zram),
             zswap_benchmark: None,
             profile_evidence: Some(&matching),
+            same_host_zram_baseline: Some(&same_host_baseline),
+            same_host_profile_evidence: Some(&same_host_profile),
             budget: &budget(true),
             safety_events: 0,
             source_state: "clean",
@@ -484,6 +535,8 @@ fn sata_and_nvme_evidence_bind_only_the_exact_profile() {
         } else {
             StorageProfile::SataSsd
         });
+        let (_, mut wrong_same_host_profile) = same_host_evidence(profile);
+        wrong_same_host_profile.environment_sha256 = "7".repeat(64);
         let rejected = recommend_backend(&RecommendationInput {
             current: BackendKind::Zram,
             gaming: false,
@@ -492,6 +545,8 @@ fn sata_and_nvme_evidence_bind_only_the_exact_profile() {
             zram_benchmark: Some(&zram),
             zswap_benchmark: None,
             profile_evidence: Some(&wrong),
+            same_host_zram_baseline: Some(&same_host_baseline),
+            same_host_profile_evidence: Some(&wrong_same_host_profile),
             budget: &budget(true),
             safety_events: 0,
             source_state: "clean",

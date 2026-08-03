@@ -115,37 +115,60 @@ change boot configuration.
 
 ## Validation-only boot contract
 
-`tiering-boot-validation-v1` is separate from production recommendation. It
-freezes source, binaries, configuration, storage profile and physical and
-filesystem identities, current/default/rollback entry, BootOrder, ESP, kernel,
-UKI/initrd, command lines, exact create-new artifacts, protected zram fallback,
-zswap parameters, swapfile, write budget, timeout and recovery. The command
-contract separates prepare, user/root preflight, exact apply, readback,
-one-shot selection, post-boot validation, baseline rollback, final restore and
-idempotent recovery. Normal `nemorctl` only prints this contract.
+`tiering-boot-validation-v1` is retained only as failed historical source. Its
+caller-supplied manifest/evidence paths, self-consistent artifact strings and
+caller-supplied post-boot booleans never authorize a v2 transaction.
 
-The separately compiled `nemor-tiering-boot-validation` binary exposes
-`prepare`, user/root preflight, apply/readback, one-shot selection, post-boot
-validation, baseline selection, final restore, recovery and idempotence as
-distinct `--command` values. It requires an integrity-bound manifest and
-create-new evidence output. Root preflight evidence is required by apply;
-every mutating stage writes a durable pre-mutation record and a separate
-completed record. Root-only stages are not reachable through `nemorctl` or
-`nemord` and remain separately authorized.
+`tiering-boot-validation-v2` adds separate prepared-manifest, durable
+transaction, preflight, apply, one-shot, post-boot and final-restore schemas.
+Unprivileged `prepare` takes bounded inputs, reads the host, verifies the clean
+source and embedded release identity, requires an unambiguous SATA or NVMe
+topology with stable physical and filesystem identities, parses a known-good
+systemd-boot Type #1 entry and derives a create-new entry. Type #2 UKI and
+EFI-only entries fail closed because no binary UKI builder is authorized.
 
-Artifacts are restricted to validation-ID-bound systemd-boot entry or UKI
-paths, may not target `/usr/lib`, must be absent and non-symlink before apply,
-and require exact owner/mode/hash readback. Permanent default and firmware
-BootOrder are immutable. Experimental artifacts remain until a verified
-baseline boot; only then may exact-owned removal occur.
+The experimental Type #1 entry preserves the known-good kernel and initrd
+hashes and changes only its frozen options. Those options carry an exact
+validation marker, exact zswap parameters and an entry-scoped `systemd.wants`
+unit. The unit runs only with that marker, waits for CachyOS zram setup,
+reapplies and reads back the exact zswap state, keeps protected zram as the
+fallback, and activates the pre-created validation swap at a higher priority.
+The baseline entry does not request the unit. No `/etc/fstab`,
+`/etc/kernel/cmdline` or `/usr/lib` file is edited.
 
-The CachyOS provider disables zswap when generated zram appears. The manifest
-requires protected zram to remain an active fallback and post-boot zswap
-readback to prove that an entry-scoped profile worked. It never authorizes a
-global `/etc/kernel/cmdline` or vendor-rule edit; provider conflict fails closed.
+Authenticated root stages require exact `SUDO_UID` and `SUDO_GID`. Apply first
+creates a mode-0700 root transaction under
+`/var/lib/nemor/validation/phase6/<validation-id>`, persists the sealed
+manifest and root preflight, then records and fsyncs each mutation intent and
+completion. Mutating stages accept only the validation ID and derive evidence
+and artifact paths from that transaction. Partial apply preserves its primary
+error, attempts only reverse exact-owned cleanup and records secondary errors.
+
+One-shot selection requires `bootctl` readback and rechecks the permanent
+default and firmware BootOrder. Post-boot validation accepts no result JSON:
+it collects the boot ID, entry, command line, zswap/zram/swap identities,
+storage topology, counters, bounded workload, physical writes, safety state
+and observe-only production configuration itself. Rollback preserves all
+artifacts until a different baseline boot proves the full command line,
+zswap, zram, swap set, default, BootOrder and one-shot baseline. Recovery is
+stage-aware and idempotence verification does not share its mutation path.
+
+Profile recommendation now requires matching versioned same-host zram and
+storage-backed evidence, including source, environment, topology, workload,
+safety, cleanup, final restore and archive identities. Historical generic
+benchmark evidence remains readable but cannot authorize SATA or NVMe.
+
+Version decisions are explicit: the boot contract and its prepared,
+transaction, preflight, apply, post-boot and final-restore evidence are v2;
+profile benchmark evidence is v2 and same-host zram baseline evidence starts at
+v1. Storage profile v1 is unchanged because its serialized class meanings did
+not change. Tiering rule v2, historical `zswap_nvme` deserialization and normal
+telemetry/report schemas are also unchanged. None of those historical schemas
+is reinterpreted as v2 boot authority.
 
 A real zswap+SATA boot benchmark has not yet been performed, and this host
-cannot demonstrate NVMe. Dedicated profile-specific boot validation remains pending. It
+cannot demonstrate NVMe. The v2 source remains pending independent static
+acceptance before even manifest preparation. Dedicated profile-specific boot validation remains pending. It
 requires separate approval before any persistent change and must validate pool
 readback, zswap writeback, bounded workload evidence, rollback and restoration
 of the CachyOS baseline.

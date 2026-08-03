@@ -1,4 +1,7 @@
-use crate::{BudgetDecision, StorageProfile, StorageTopology, SwapfilePlan, ZswapInventory};
+use crate::{
+    matching_same_host_evidence_v2, BudgetDecision, SameHostProfileEvidenceV2,
+    SameHostZramBaselineEvidenceV1, StorageProfile, StorageTopology, SwapfilePlan, ZswapInventory,
+};
 use common::TieringConfig;
 use policy_engine::PressureState;
 use serde::{Deserialize, Serialize};
@@ -260,6 +263,11 @@ pub struct RecommendationInput<'a> {
     pub zram_benchmark: Option<&'a BenchmarkEvidence>,
     pub zswap_benchmark: Option<&'a BenchmarkEvidence>,
     pub profile_evidence: Option<&'a ProfileBenchmarkEvidence>,
+    /// V1 generic evidence is retained for report compatibility but cannot
+    /// authorize the storage-backed backend. These two sealed, same-host
+    /// records are the sole v2 authorization path.
+    pub same_host_zram_baseline: Option<&'a SameHostZramBaselineEvidenceV1>,
+    pub same_host_profile_evidence: Option<&'a SameHostProfileEvidenceV2>,
     pub budget: &'a BudgetDecision,
     pub safety_events: usize,
     pub source_state: &'a str,
@@ -290,25 +298,14 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
     );
     let profile = input.storage.profile;
     let supported = profile.is_some_and(StorageProfile::boot_supported);
-    let baseline_ready = input
-        .zram_benchmark
-        .is_some_and(|value| value.real && !value.oom);
-    let zswap_evidence = input.profile_evidence.is_some_and(|value| {
-        value.contract_version == TIERING_RULE_VERSION
-            && Some(value.profile) == profile
-            && input.storage.device_identity.as_deref() == Some(value.device_identity.as_str())
-            && input.storage.filesystem_identity.as_deref()
-                == Some(value.filesystem_identity.as_str())
-            && value.source_state == input.source_state
-            && value.environment_identity == input.environment_identity
-            && value.real
-            && value.cleanup_passed
-            && value.restore_passed
-            && !value.safety_failure
-            && !value.oom
-            && value.compression_ratio.is_some()
-            && value.swap_latency_ns.is_some()
-            && value.backing_write_bytes.is_some()
+    let baseline_ready = input.same_host_zram_baseline.is_some_and(|baseline| {
+        input
+            .same_host_profile_evidence
+            .is_some_and(|profile_evidence| {
+                profile.is_some_and(|profile| {
+                    matching_same_host_evidence_v2(baseline, profile_evidence, profile)
+                })
+            })
     });
     let mut selected = BackendKind::Zram;
     if input.gaming {
@@ -323,7 +320,6 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
         reasons.push("storage_profile_unsupported".to_owned());
     } else if !baseline_ready {
         reasons.push("same_host_zram_baseline_missing".to_owned());
-    } else if !zswap_evidence {
         reasons.push(match profile {
             Some(StorageProfile::SataSsd) => "sata_boot_validation_missing".to_owned(),
             Some(StorageProfile::NvmeSsd) => "nvme_boot_validation_missing".to_owned(),

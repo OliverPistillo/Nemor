@@ -192,8 +192,17 @@ impl LinuxSwapfileBackend {
         let validation = value.starts_with("/var/tmp/nemor-validation-tiering-")
             && value.ends_with(".swap")
             && !value["/var/tmp/".len()..].contains('/');
+        let phase6 = value
+            .strip_prefix("/var/lib/nemor/validation/phase6/")
+            .and_then(|tail| tail.strip_suffix("/backing.swap"))
+            .is_some_and(|validation_id| {
+                (8..=64).contains(&validation_id.len())
+                    && validation_id.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            });
         let production = value == "/var/lib/nemor/swap/nemor-tiering.swap";
-        if (validation || production)
+        if (validation || phase6 || production)
             && path.is_absolute()
             && !path
                 .components()

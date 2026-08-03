@@ -436,7 +436,10 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - Completed and validated on CachyOS: Phases 0–5 and Phases 7–9.
 - Phase 6 core storage-backed implementation and SATA live-safe swapfile
   validation are complete; SATA boot validation and NVMe validation remain
-  pending, and production activation remains false.
+  pending. The failed historical boot contract v1 has an additive v2
+  correction with durable exact-owned transactions and real host-collected
+  evidence; independent static acceptance remains the sole gate before any
+  preparation or boot mutation. Production activation remains false.
 - The runtime default remains observe-only despite isolated privileged
   validation of Phases 3, 5, 6, 7 and 8.
 - Phase 9 validated both profitable selective KSM and real ineffective-workload

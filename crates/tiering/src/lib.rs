@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+#[cfg(test)]
 mod boot_validation;
+mod boot_validation_v2;
 mod inventory;
 mod metrics;
 mod plan;
@@ -10,14 +12,7 @@ mod swapfile;
 mod topology;
 mod zswap_backend;
 
-pub use boot_validation::{
-    apply_boot_validation, post_boot_validate, prepare_baseline_rollback, recover_boot_validation,
-    root_preflight, select_one_shot, user_preflight, verify_applied, verify_final_restore,
-    BootArtifact, BootValidationBackend, BootValidationCommand, BootValidationError,
-    BootValidationStage, TieringBootApplyEvidence, TieringBootValidationManifest,
-    TieringBootValidationPreflight, TieringFinalRestoreEvidence, TieringPostBootEvidence,
-    TieringRollbackEvidence, BOOT_VALIDATION_CONTRACT_VERSION,
-};
+pub use boot_validation_v2::*;
 pub use inventory::{inspect_linux, DebugCounter, ProviderState, ZswapInventory, ZswapParameters};
 pub use metrics::{
     estimate_tbw, parse_block_stat, BlockIoDelta, BlockStat, BudgetDecision, TbEstimate,

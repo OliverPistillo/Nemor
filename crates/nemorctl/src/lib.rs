@@ -327,7 +327,7 @@ pub fn tiering_report_latest(config_path: &Path) -> Result<tiering::TieringAudit
 }
 
 pub fn tiering_boot_contract() -> serde_json::Value {
-    use tiering::BootValidationCommand as Command;
+    use tiering::BootValidationCommandV2 as Command;
     let commands = [
         Command::Prepare,
         Command::UserPreflight,
@@ -342,7 +342,9 @@ pub fn tiering_boot_contract() -> serde_json::Value {
         Command::VerifyIdempotence,
     ];
     serde_json::json!({
-        "contract_version": tiering::BOOT_VALIDATION_CONTRACT_VERSION,
+        "contract_version": tiering::BOOT_VALIDATION_CONTRACT_VERSION_V2,
+        "prepared_manifest_schema": tiering::PREPARED_MANIFEST_SCHEMA_V2,
+        "durable_transaction_schema": tiering::DURABLE_TRANSACTION_SCHEMA_V2,
         "rule_version": tiering::TIERING_RULE_VERSION,
         "normal_cli_mutation": false,
         "production_activation_command": false,
@@ -1132,6 +1134,19 @@ mod tests {
         assert_eq!(parsed["session_id"], session);
         let after = std::fs::read(fixture.database_path()).expect("database after report");
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn tiering_boot_contract_reports_only_v2_validation_authority() {
+        let contract = tiering_boot_contract();
+        assert_eq!(
+            contract["contract_version"],
+            tiering::BOOT_VALIDATION_CONTRACT_VERSION_V2
+        );
+        assert_eq!(contract["normal_cli_mutation"], false);
+        assert_eq!(contract["production_activation_command"], false);
+        assert!(!contract.to_string().contains("tiering-boot-validation-v1"));
+        assert!(!contract.to_string().contains("experimental-activate"));
     }
 
     fn assert_valid_status_json(report: &StatusReport) {
