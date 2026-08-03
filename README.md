@@ -16,7 +16,7 @@ not AI.
 | Phase 3 | cgroup v2 protection primitives | ✅ Validated on CachyOS |
 | Phase 4 | deterministic policy engine | ✅ Validated on CachyOS |
 | Phase 5 | safe zram backend and profiles | ✅ Validated on CachyOS |
-| Phase 6 | zswap + storage-backed SSD tiering | 🟡 Generalized contract / boot validation pending |
+| Phase 6 | zswap + storage-backed SSD tiering | 🟡 V3 authority pending static acceptance / boot validation pending |
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
@@ -34,8 +34,8 @@ development; ⚪ planned.
 | Kernel | 7.1.4-1-cachyos |
 | Rust / Cargo | 1.97.1 / 1.97.1 |
 | Workspace crates | 15 |
-| Tests defined / executed | 737 / 737 (current accepted source workspace suite) |
-| Passed / failed / ignored | 737 / 0 / 0; exact-commit GitHub CI remains authoritative |
+| Tests defined / executed | 812 / 812 (current source workspace suite) |
+| Passed / failed / ignored | 812 / 0 / 0; exact-commit GitHub CI remains authoritative |
 | Phase 10 validation | CLOSED / VALIDATED (CENSORED): 3A/3B/3C CLOSED / PASS; combined compatibility LIVE PASS; External-target Lineage 7 LIVE PASS; Composition Lineage 6 LIVE PASS; Capacity Benchmark Lineage 3 valid Censored evidence; 30% target Indeterminate; effectiveness NotEvaluated; production activation false |
 | Checkpoint 3A-P | privileged observer pipeline validated on CachyOS; ATTEMPT 1/2 negative history retained |
 | Checkpoint 3A | CLOSED / PASS — six V3 runs preserved and exact bounded offline revalidation returned `REVALIDATED_PASS` |
@@ -436,10 +436,13 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - Completed and validated on CachyOS: Phases 0–5 and Phases 7–9.
 - Phase 6 core storage-backed implementation and SATA live-safe swapfile
   validation are complete; SATA boot validation and NVMe validation remain
-  pending. The failed historical boot contract v1 has an additive v2
-  correction with durable exact-owned transactions and real host-collected
-  evidence; independent static acceptance remains the sole gate before any
-  preparation or boot mutation. Production activation remains false.
+  pending. Boot contracts v1 and v2 are readable historical,
+  non-authorizing evidence. The additive v3 authority stages a root-owned
+  helper, measures the same-host zram baseline before boot artifacts, uses
+  durable activation/recovery sub-stages, collects cgroup-scoped workload
+  evidence, and seals exact terminal ledgers. Independent static acceptance of
+  the v3 source is the sole gate before any preparation or boot mutation.
+  Production activation remains false.
 - The runtime default remains observe-only despite isolated privileged
   validation of Phases 3, 5, 6, 7 and 8.
 - Phase 9 validated both profitable selective KSM and real ineffective-workload

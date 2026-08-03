@@ -466,9 +466,9 @@ fn profile_evidence(profile: StorageProfile) -> ProfileBenchmarkEvidence {
 
 fn same_host_evidence(
     profile: StorageProfile,
-) -> (SameHostZramBaselineEvidenceV1, SameHostProfileEvidenceV2) {
-    let baseline = SameHostZramBaselineEvidenceV1 {
-        schema: ZRAM_BASELINE_EVIDENCE_V1.to_owned(),
+) -> (SameHostZramBaselineEvidenceV2, SameHostProfileEvidenceV3) {
+    let baseline = SameHostZramBaselineEvidenceV2 {
+        schema: ZRAM_BASELINE_EVIDENCE_V2.to_owned(),
         validation_id: "same-host-validation".to_owned(),
         source_commit: "a".repeat(40),
         source_state_sha256: "1".repeat(64),
@@ -481,9 +481,11 @@ fn same_host_evidence(
         cleanup_passed: true,
         final_restore_passed: true,
         archive_sha256: "5".repeat(64),
+        raw_evidence_sha256: "7".repeat(64),
+        workload_protocol: WORKLOAD_PROTOCOL_V1.to_owned(),
     };
-    let evidence = SameHostProfileEvidenceV2 {
-        schema: PROFILE_BENCHMARK_EVIDENCE_V2.to_owned(),
+    let evidence = SameHostProfileEvidenceV3 {
+        schema: PROFILE_BENCHMARK_EVIDENCE_V3.to_owned(),
         validation_id: baseline.validation_id.clone(),
         profile,
         source_commit: baseline.source_commit.clone(),
@@ -500,6 +502,9 @@ fn same_host_evidence(
         backing_write_bytes: Some(4),
         latency_ns: Some(3),
         archive_sha256: "6".repeat(64),
+        raw_evidence_sha256: "8".repeat(64),
+        workload_protocol: WORKLOAD_PROTOCOL_V1.to_owned(),
+        backing_write_confidence: "bounded-physical-device-attributed".to_owned(),
     };
     (baseline, evidence)
 }

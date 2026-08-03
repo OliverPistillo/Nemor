@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod backend;
-#[cfg(test)]
-mod boot_validation;
-mod boot_validation_v2;
+#[allow(dead_code)]
+pub mod boot_validation;
+#[allow(dead_code)]
+pub mod boot_validation_v2;
+mod boot_validation_v3;
 mod inventory;
 mod metrics;
 mod plan;
@@ -12,7 +14,7 @@ mod swapfile;
 mod topology;
 mod zswap_backend;
 
-pub use boot_validation_v2::*;
+pub use boot_validation_v3::*;
 pub use inventory::{inspect_linux, DebugCounter, ProviderState, ZswapInventory, ZswapParameters};
 pub use metrics::{
     estimate_tbw, parse_block_stat, BlockIoDelta, BlockStat, BudgetDecision, TbEstimate,

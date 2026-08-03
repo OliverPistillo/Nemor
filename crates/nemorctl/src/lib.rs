@@ -327,11 +327,12 @@ pub fn tiering_report_latest(config_path: &Path) -> Result<tiering::TieringAudit
 }
 
 pub fn tiering_boot_contract() -> serde_json::Value {
-    use tiering::BootValidationCommandV2 as Command;
+    use tiering::BootValidationCommandV3 as Command;
     let commands = [
         Command::Prepare,
         Command::UserPreflight,
         Command::RootPreflight,
+        Command::MeasureBaseline,
         Command::Apply,
         Command::VerifyApplied,
         Command::SelectOneShot,
@@ -342,9 +343,9 @@ pub fn tiering_boot_contract() -> serde_json::Value {
         Command::VerifyIdempotence,
     ];
     serde_json::json!({
-        "contract_version": tiering::BOOT_VALIDATION_CONTRACT_VERSION_V2,
-        "prepared_manifest_schema": tiering::PREPARED_MANIFEST_SCHEMA_V2,
-        "durable_transaction_schema": tiering::DURABLE_TRANSACTION_SCHEMA_V2,
+        "contract_version": tiering::BOOT_VALIDATION_CONTRACT_VERSION_V3,
+        "prepared_manifest_schema": tiering::PREPARED_MANIFEST_SCHEMA_V3,
+        "durable_transaction_schema": tiering::DURABLE_TRANSACTION_SCHEMA_V3,
         "rule_version": tiering::TIERING_RULE_VERSION,
         "normal_cli_mutation": false,
         "production_activation_command": false,
@@ -1137,11 +1138,11 @@ mod tests {
     }
 
     #[test]
-    fn tiering_boot_contract_reports_only_v2_validation_authority() {
+    fn tiering_boot_contract_reports_only_v3_validation_authority() {
         let contract = tiering_boot_contract();
         assert_eq!(
             contract["contract_version"],
-            tiering::BOOT_VALIDATION_CONTRACT_VERSION_V2
+            tiering::BOOT_VALIDATION_CONTRACT_VERSION_V3
         );
         assert_eq!(contract["normal_cli_mutation"], false);
         assert_eq!(contract["production_activation_command"], false);

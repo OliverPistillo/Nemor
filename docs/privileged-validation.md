@@ -371,15 +371,29 @@ preflight before authorization, exact transaction/output roles, and execution
 via `sudo` by the preparing user identity. Phase 6 SATA and NVMe boot
 validation remain pending on matching hardware.
 
-The Phase 6 `tiering-boot-validation-v1` lifecycle failed static acceptance:
-its preparation copied caller input, root authority was only UID 0, stage paths
-were caller-controlled, one-shot had no readback and post-boot conclusions were
-caller-supplied. The additive v2 source replaces that authority path with a
-sealed unprivileged host-derived manifest, exact `SUDO_UID`/`SUDO_GID`
-preflights, a root-owned cross-reboot transaction, semantic Type #1 entry and
-marker-conditioned swap/zswap unit, real one-shot readback, host-collected
-measurements and baseline-before-delete recovery. It has not prepared or
-mutated this host; independent static acceptance is required first.
+The Phase 6 `tiering-boot-validation-v1` lifecycle failed static acceptance
+because authority and results were caller supplied. V2 added host-derived
+preparation and durable stages, but also failed static acceptance: its unit
+executed the preparing user's binary, activation bypassed the transaction,
+recovery reset failed stages, boot preflight was incomplete, and workload
+metrics were not sufficiently attributable.
+
+V3 is a distinct authority contract. It freezes a source executable identity
+but copies and verifies exact bytes into the root-owned transaction before any
+root service or worker executes them. A separately authorized baseline stage
+seals same-host zram evidence before loader, unit, swapfile or zswap mutation.
+Activation has durable boot-detected, parameter, enable, swap and terminal
+sub-stages with bounded current-boot rollback. Post-boot collection uses an
+exact staged worker handshake, PID/start-ticks and cgroup identity, independent
+`oom`/`oom_kill` events, zswap deltas, content/refault proof and explicitly
+typed physical-counter confidence. Runtime evidence inspects the actual nemord
+process and production-unit absence. Recovery reconciles only a valid
+monotonic atomic successor and preserves the original error. Terminal ledgers
+require exact file membership and metadata.
+
+V1 and V2 remain readable only as historical, non-authorizing evidence. V3 has
+not prepared or mutated this host; independent static acceptance is required
+before any manifest preparation or boot mutation.
 
 Checkpoint 3A Experiment 1 execution attempt 1 was rejected before run 0 due
 to privilege-sensitive environment fingerprinting. The performance path now

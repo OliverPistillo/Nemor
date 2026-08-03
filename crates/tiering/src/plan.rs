@@ -1,6 +1,6 @@
 use crate::{
-    matching_same_host_evidence_v2, BudgetDecision, SameHostProfileEvidenceV2,
-    SameHostZramBaselineEvidenceV1, StorageProfile, StorageTopology, SwapfilePlan, ZswapInventory,
+    matching_same_host_evidence_v3, BudgetDecision, SameHostProfileEvidenceV3,
+    SameHostZramBaselineEvidenceV2, StorageProfile, StorageTopology, SwapfilePlan, ZswapInventory,
 };
 use common::TieringConfig;
 use policy_engine::PressureState;
@@ -266,8 +266,8 @@ pub struct RecommendationInput<'a> {
     /// V1 generic evidence is retained for report compatibility but cannot
     /// authorize the storage-backed backend. These two sealed, same-host
     /// records are the sole v2 authorization path.
-    pub same_host_zram_baseline: Option<&'a SameHostZramBaselineEvidenceV1>,
-    pub same_host_profile_evidence: Option<&'a SameHostProfileEvidenceV2>,
+    pub same_host_zram_baseline: Option<&'a SameHostZramBaselineEvidenceV2>,
+    pub same_host_profile_evidence: Option<&'a SameHostProfileEvidenceV3>,
     pub budget: &'a BudgetDecision,
     pub safety_events: usize,
     pub source_state: &'a str,
@@ -303,7 +303,7 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
             .same_host_profile_evidence
             .is_some_and(|profile_evidence| {
                 profile.is_some_and(|profile| {
-                    matching_same_host_evidence_v2(baseline, profile_evidence, profile)
+                    matching_same_host_evidence_v3(baseline, profile_evidence, profile)
                 })
             })
     });
