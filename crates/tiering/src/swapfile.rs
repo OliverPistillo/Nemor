@@ -116,8 +116,18 @@ pub fn plan_swapfile(context: &SwapfileContext<'_>, config: &TieringConfig) -> S
         .physical
         .as_ref()
         .map_or(StorageClass::Unknown, |device| device.class);
-    if config.require_nvme && class != StorageClass::Nvme {
-        blocked.push("nvme_required_but_not_proven".to_owned());
+    let profile_name = context
+        .topology
+        .profile
+        .and_then(|profile| serde_json::to_value(profile).ok())
+        .and_then(|value| value.as_str().map(str::to_owned));
+    if profile_name.as_ref().is_none_or(|profile| {
+        !config
+            .supported_storage_profiles
+            .iter()
+            .any(|allowed| allowed == profile)
+    }) {
+        blocked.push("storage_profile_not_authorized".to_owned());
     }
     if context.gaming {
         blocked.push("gaming_defers_structural_io".to_owned());

@@ -902,10 +902,12 @@ dependencies = [
 name = "nemor-tiering"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "nemor-common",
  "nemor-policy-engine",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

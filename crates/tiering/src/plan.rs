@@ -1,16 +1,18 @@
-use crate::{BudgetDecision, StorageTopology, SwapfilePlan, ZswapInventory};
+use crate::{BudgetDecision, StorageProfile, StorageTopology, SwapfilePlan, ZswapInventory};
 use common::TieringConfig;
 use policy_engine::PressureState;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const TIERING_RULE_VERSION: &str = "tiering-rules-v1";
+pub const TIERING_RULE_VERSION: &str = "tiering-rules-v2-storage-profile";
 pub const TIERING_AUDIT_REASON: &str = "tiering_observe_audit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Zram,
+    ZswapStorageBacked,
+    /// Historical v1 evidence only. It never authorizes a v2 profile.
     ZswapNvme,
     External,
     Mixed,
@@ -39,6 +41,24 @@ pub struct BenchmarkEvidence {
     pub real: bool,
     pub cpu_time_ns: u64,
     pub wall_time_ns: u64,
+    pub compression_ratio: Option<f64>,
+    pub swap_latency_ns: Option<u64>,
+    pub backing_write_bytes: Option<u64>,
+    pub oom: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileBenchmarkEvidence {
+    pub contract_version: String,
+    pub profile: StorageProfile,
+    pub device_identity: String,
+    pub filesystem_identity: String,
+    pub source_state: String,
+    pub environment_identity: String,
+    pub real: bool,
+    pub cleanup_passed: bool,
+    pub restore_passed: bool,
+    pub safety_failure: bool,
     pub compression_ratio: Option<f64>,
     pub swap_latency_ns: Option<u64>,
     pub backing_write_bytes: Option<u64>,
@@ -164,10 +184,17 @@ pub fn boot_plan(inventory: &ZswapInventory, swapfile: &SwapfilePlan) -> BootTie
     if !swapfile.allowed {
         blocked.push("swapfile_plan_blocked".to_owned());
     }
+    if !matches!(
+        swapfile.physical_device_class,
+        StorageClass::Nvme | StorageClass::SolidStateNonNvme
+    ) {
+        blocked.push("storage_profile_unsupported".to_owned());
+    }
     let cmdline_path = match inventory.provider.bootloader.as_deref() {
         Some("grub") => Some(PathBuf::from("/etc/default/grub")),
         Some("systemd-boot") => Some(PathBuf::from("/boot/loader/loader.conf")),
         Some("kernel-install/uki") => Some(PathBuf::from("/etc/kernel/cmdline")),
+        Some("systemd-boot/kernel-install-uki") => None,
         _ => None,
     };
     let mut files = Vec::new();
@@ -178,6 +205,9 @@ pub fn boot_plan(inventory: &ZswapInventory, swapfile: &SwapfilePlan) -> BootTie
             backup_required: true,
             checksum_required: true,
         });
+    }
+    if inventory.provider.bootloader.as_deref() == Some("systemd-boot/kernel-install-uki") {
+        blocked.push("validation_only_manifest_required".to_owned());
     }
     let override_path = inventory
         .provider
@@ -207,7 +237,7 @@ pub fn boot_plan(inventory: &ZswapInventory, swapfile: &SwapfilePlan) -> BootTie
         files,
         post_reboot_validation: vec![
             "verify zswap parameter readback".to_owned(),
-            "verify NVMe-backed swapfile".to_owned(),
+            "verify exact profile-bound storage-backed swapfile".to_owned(),
             "verify daemon remains observe-only".to_owned(),
         ],
         rollback: vec![
@@ -229,8 +259,11 @@ pub struct RecommendationInput<'a> {
     pub storage: &'a StorageTopology,
     pub zram_benchmark: Option<&'a BenchmarkEvidence>,
     pub zswap_benchmark: Option<&'a BenchmarkEvidence>,
+    pub profile_evidence: Option<&'a ProfileBenchmarkEvidence>,
     pub budget: &'a BudgetDecision,
     pub safety_events: usize,
+    pub source_state: &'a str,
+    pub environment_identity: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +276,8 @@ pub struct BackendRecommendation {
     pub blocked: bool,
     pub requires_reboot: bool,
     pub rule_version: String,
+    #[serde(default)]
+    pub production_activation: bool,
 }
 
 #[must_use]
@@ -253,13 +288,23 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
         input.pressure,
         PressureState::Critical | PressureState::Emergency
     );
-    let nvme = input
-        .storage
-        .physical
-        .as_ref()
-        .is_some_and(|device| device.class == StorageClass::Nvme);
-    let zswap_evidence = input.zswap_benchmark.is_some_and(|value| {
-        value.real
+    let profile = input.storage.profile;
+    let supported = profile.is_some_and(StorageProfile::boot_supported);
+    let baseline_ready = input
+        .zram_benchmark
+        .is_some_and(|value| value.real && !value.oom);
+    let zswap_evidence = input.profile_evidence.is_some_and(|value| {
+        value.contract_version == TIERING_RULE_VERSION
+            && Some(value.profile) == profile
+            && input.storage.device_identity.as_deref() == Some(value.device_identity.as_str())
+            && input.storage.filesystem_identity.as_deref()
+                == Some(value.filesystem_identity.as_str())
+            && value.source_state == input.source_state
+            && value.environment_identity == input.environment_identity
+            && value.real
+            && value.cleanup_passed
+            && value.restore_passed
+            && !value.safety_failure
             && !value.oom
             && value.compression_ratio.is_some()
             && value.swap_latency_ns.is_some()
@@ -274,14 +319,20 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
         reasons.push("recent_safety_event".to_owned());
     } else if !input.budget.allowed {
         reasons.push("write_budget_exceeded".to_owned());
-    } else if !nvme {
-        reasons.push("nvme_not_proven".to_owned());
+    } else if !supported {
+        reasons.push("storage_profile_unsupported".to_owned());
+    } else if !baseline_ready {
+        reasons.push("same_host_zram_baseline_missing".to_owned());
     } else if !zswap_evidence {
-        reasons.push("real_zswap_nvme_benchmark_missing".to_owned());
+        reasons.push(match profile {
+            Some(StorageProfile::SataSsd) => "sata_boot_validation_missing".to_owned(),
+            Some(StorageProfile::NvmeSsd) => "nvme_boot_validation_missing".to_owned(),
+            _ => "profile_boot_validation_missing".to_owned(),
+        });
     } else {
-        selected = BackendKind::ZswapNvme;
-        reasons.push("real_benchmark_and_budget_favor_zswap_nvme".to_owned());
-        evidence.push("zswap_nvme_real".to_owned());
+        selected = BackendKind::ZswapStorageBacked;
+        reasons.push("matching_same_host_profile_evidence".to_owned());
+        evidence.push(format!("profile={:?}", profile.expect("supported profile")));
     }
     if input.zram_benchmark.is_some_and(|value| value.real) {
         evidence.push("zram_real_baseline".to_owned());
@@ -289,11 +340,11 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
     BackendRecommendation {
         selected,
         alternative: if selected == BackendKind::Zram {
-            BackendKind::ZswapNvme
+            BackendKind::ZswapStorageBacked
         } else {
             BackendKind::Zram
         },
-        confidence: if selected == BackendKind::ZswapNvme {
+        confidence: if selected == BackendKind::ZswapStorageBacked {
             "measured".to_owned()
         } else if input.current == BackendKind::Zram {
             "conservative".to_owned()
@@ -305,5 +356,6 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
         reasons,
         evidence,
         rule_version: TIERING_RULE_VERSION.to_owned(),
+        production_activation: false,
     }
 }

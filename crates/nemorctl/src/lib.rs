@@ -326,6 +326,35 @@ pub fn tiering_report_latest(config_path: &Path) -> Result<tiering::TieringAudit
     serde_json::from_str(&snapshot.system_values_json).context("invalid stored tiering audit JSON")
 }
 
+pub fn tiering_boot_contract() -> serde_json::Value {
+    use tiering::BootValidationCommand as Command;
+    let commands = [
+        Command::Prepare,
+        Command::UserPreflight,
+        Command::RootPreflight,
+        Command::Apply,
+        Command::VerifyApplied,
+        Command::SelectOneShot,
+        Command::PostBootValidate,
+        Command::SelectBaselineRollback,
+        Command::VerifyFinalRestore,
+        Command::Recover,
+        Command::VerifyIdempotence,
+    ];
+    serde_json::json!({
+        "contract_version": tiering::BOOT_VALIDATION_CONTRACT_VERSION,
+        "rule_version": tiering::TIERING_RULE_VERSION,
+        "normal_cli_mutation": false,
+        "production_activation_command": false,
+        "commands": commands.into_iter().map(|command| serde_json::json!({
+            "name": command,
+            "mutating": command.mutating(),
+            "authenticated_root": command.requires_authenticated_root(),
+            "separately_authorized": command.mutating(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 pub fn damon_status(config_path: &Path) -> Result<damon::DamonReport> {
     let loaded = LoadedConfig::load(config_path).context("invalid DAMON status configuration")?;
     Ok(damon::observe_report(

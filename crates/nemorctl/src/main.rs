@@ -8,8 +8,9 @@ use nemorctl::{
     doctor, ksm_history, ksm_plan_latest, ksm_processes, ksm_report_latest, ksm_status,
     policy_latest, policy_status, render_cgroups_status, render_doctor, render_policy_latest,
     render_policy_status, render_report, render_status, render_workload, render_zram,
-    report_latest, status, tiering_recommend, tiering_report_latest, tiering_status,
-    workload_latest, zram_profiles, zram_report_latest, zram_status, DoctorEnvironment,
+    report_latest, status, tiering_boot_contract, tiering_recommend, tiering_report_latest,
+    tiering_status, workload_latest, zram_profiles, zram_report_latest, zram_status,
+    DoctorEnvironment,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -144,6 +145,11 @@ enum TieringCommand {
         json: bool,
     },
     Recommend {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the validation-only lifecycle and authorization boundaries.
+    BootContract {
         #[arg(long)]
         json: bool,
     },
@@ -396,6 +402,12 @@ fn run() -> anyhow::Result<i32> {
             command: TieringCommand::Recommend { json },
         } => {
             print!("{}", render_zram(&tiering_recommend(&cli.config)?, json)?);
+            Ok(0)
+        }
+        Command::Tiering {
+            command: TieringCommand::BootContract { json },
+        } => {
+            print!("{}", render_zram(&tiering_boot_contract(), json)?);
             Ok(0)
         }
         Command::Tiering {

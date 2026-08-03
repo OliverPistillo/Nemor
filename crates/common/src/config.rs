@@ -138,7 +138,7 @@ pub struct TieringConfig {
     pub allow_runtime_reconfigure: bool,
     pub allow_persistent_reconfigure: bool,
     pub allow_swapfile_create: bool,
-    pub require_nvme: bool,
+    pub supported_storage_profiles: Vec<String>,
     pub max_swapfile_percent_disk: u8,
     pub min_free_disk_gib: u64,
     pub max_write_mib_per_second: u64,
@@ -583,11 +583,30 @@ impl Config {
         }
         if !matches!(
             self.tiering.preferred_backend.as_str(),
-            "detect" | "zram" | "zswap_nvme"
+            "detect" | "zram" | "zswap_storage_backed"
         ) {
             return Err(validation(
                 "tiering.preferred_backend",
-                "must be detect, zram, or zswap_nvme",
+                "must be detect, zram, or zswap_storage_backed",
+            ));
+        }
+        if self.tiering.supported_storage_profiles.is_empty()
+            || self
+                .tiering
+                .supported_storage_profiles
+                .iter()
+                .any(|profile| !matches!(profile.as_str(), "sata_ssd" | "nvme_ssd"))
+            || self
+                .tiering
+                .supported_storage_profiles
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.tiering.supported_storage_profiles.len()
+        {
+            return Err(validation(
+                "tiering.supported_storage_profiles",
+                "must contain only explicitly supported sata_ssd or nvme_ssd profiles",
             ));
         }
         for (field, value) in [

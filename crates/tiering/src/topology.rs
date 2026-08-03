@@ -3,6 +3,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+pub const STORAGE_PROFILE_VERSION: &str = "nemor-storage-profile-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageProfile {
+    NvmeSsd,
+    SataSsd,
+    SasSsd,
+    UsbSsd,
+    OtherNonRotational,
+    Rotational,
+    Composite,
+    Virtual,
+    Ambiguous,
+}
+
+impl StorageProfile {
+    #[must_use]
+    pub fn boot_supported(self) -> bool {
+        matches!(self, Self::NvmeSsd | Self::SataSsd)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockDevice {
@@ -13,6 +37,14 @@ pub struct BlockDevice {
     pub physical_block_size: Option<u64>,
     pub discard_max_bytes: Option<u64>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub serial: Option<String>,
+    #[serde(default)]
+    pub wwn: Option<String>,
+    #[serde(default)]
+    pub capacity_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +54,18 @@ pub struct StorageTopology {
     pub chain: Vec<String>,
     pub physical: Option<BlockDevice>,
     pub ambiguous: bool,
+    #[serde(default = "default_profile_version")]
+    pub profile_version: String,
+    #[serde(default)]
+    pub profile: Option<StorageProfile>,
+    #[serde(default)]
+    pub device_identity: Option<String>,
+    #[serde(default)]
+    pub filesystem_identity: Option<String>,
+}
+
+fn default_profile_version() -> String {
+    STORAGE_PROFILE_VERSION.to_owned()
 }
 
 pub fn inspect_storage(root: &Path, mount_source: &str, filesystem: &str) -> StorageTopology {
@@ -32,6 +76,7 @@ pub fn inspect_storage(root: &Path, mount_source: &str, filesystem: &str) -> Sto
         .to_owned();
     let mut seen = BTreeSet::new();
     let mut ambiguous = false;
+    let mut composite = false;
     for _ in 0..8 {
         if !valid_block_name(&current) || !seen.insert(current.clone()) {
             ambiguous = true;
@@ -54,6 +99,7 @@ pub fn inspect_storage(root: &Path, mount_source: &str, filesystem: &str) -> Sto
             _ => {
                 chain.extend(slaves);
                 ambiguous = true;
+                composite = true;
                 break;
             }
         }
@@ -62,12 +108,32 @@ pub fn inspect_storage(root: &Path, mount_source: &str, filesystem: &str) -> Sto
         .then(|| chain.last())
         .flatten()
         .and_then(|name| inspect_block(root, name));
+    let profile = if composite {
+        Some(StorageProfile::Composite)
+    } else if ambiguous {
+        Some(StorageProfile::Ambiguous)
+    } else {
+        physical.as_ref().map(profile_for)
+    };
+    let device_identity = physical.as_ref().map(|device| {
+        format!(
+            "{}:{}:{}:{}",
+            device.name,
+            device.serial.as_deref().unwrap_or("unavailable"),
+            device.wwn.as_deref().unwrap_or("unavailable"),
+            device.capacity_bytes.unwrap_or(0)
+        )
+    });
     StorageTopology {
         mount_source: mount_source.to_owned(),
         filesystem: filesystem.to_owned(),
         chain,
         physical,
         ambiguous,
+        profile_version: STORAGE_PROFILE_VERSION.to_owned(),
+        profile,
+        device_identity,
+        filesystem_identity: Some(format!("{filesystem}:{mount_source}")),
     }
 }
 
@@ -81,7 +147,28 @@ fn inspect_block(root: &Path, name: &str) -> Option<BlockDevice> {
         || fs::read_to_string(base.join("device/subsystem"))
             .unwrap_or_default()
             .contains("nvme");
-    let class = if name.starts_with("nvme") && subsystem_is_nvme {
+    let udev = udev_properties(root, name);
+    let transport = udev
+        .get("ID_BUS")
+        .cloned()
+        .or_else(|| read_trimmed(&base.join("device/transport")))
+        .or_else(|| {
+            fs::canonicalize(&base).ok().and_then(|path| {
+                let text = path.to_string_lossy();
+                if text.contains("/nvme/") || text.contains("/nvme") {
+                    Some("nvme".to_owned())
+                } else if text.contains("/ata") {
+                    Some("sata".to_owned())
+                } else if text.contains("/usb") {
+                    Some("usb".to_owned())
+                } else if text.contains("/virtual/") {
+                    Some("virtual".to_owned())
+                } else {
+                    None
+                }
+            })
+        });
+    let class = if subsystem_is_nvme && transport.as_deref() == Some("nvme") {
         StorageClass::Nvme
     } else if rotational == Some(false) {
         StorageClass::SolidStateNonNvme
@@ -101,7 +188,69 @@ fn inspect_block(root: &Path, name: &str) -> Option<BlockDevice> {
             .ok()
             .map(|value| value.trim().chars().take(80).collect())
             .filter(|value: &String| !value.is_empty()),
+        transport,
+        serial: udev
+            .get("ID_SERIAL_SHORT")
+            .cloned()
+            .or_else(|| read_trimmed(&base.join("device/serial"))),
+        wwn: udev
+            .get("ID_WWN")
+            .cloned()
+            .or_else(|| read_trimmed(&base.join("device/wwid"))),
+        capacity_bytes: read_u64(&base.join("size")).map(|sectors| sectors.saturating_mul(512)),
     })
+}
+
+fn udev_properties(root: &Path, name: &str) -> std::collections::BTreeMap<String, String> {
+    if root != Path::new("/") || !valid_block_name(name) {
+        return std::collections::BTreeMap::new();
+    }
+    let Ok(output) = Command::new("/usr/bin/udevadm")
+        .args([
+            "info",
+            "--query=property",
+            "--name",
+            &format!("/dev/{name}"),
+        ])
+        .output()
+    else {
+        return std::collections::BTreeMap::new();
+    };
+    if !output.status.success() {
+        return std::collections::BTreeMap::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| matches!(*key, "ID_BUS" | "ID_SERIAL_SHORT" | "ID_WWN"))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn profile_for(device: &BlockDevice) -> StorageProfile {
+    if device.transport.as_deref() == Some("virtual") {
+        return StorageProfile::Virtual;
+    }
+    if device.rotational == Some(true) {
+        return StorageProfile::Rotational;
+    }
+    if device.rotational != Some(false) {
+        return StorageProfile::Ambiguous;
+    }
+    match device.transport.as_deref() {
+        Some("nvme") if device.class == StorageClass::Nvme => StorageProfile::NvmeSsd,
+        Some("sata" | "ata") => StorageProfile::SataSsd,
+        Some("sas") => StorageProfile::SasSsd,
+        Some("usb") => StorageProfile::UsbSsd,
+        _ => StorageProfile::OtherNonRotational,
+    }
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn partition_parent(path: &Path) -> Option<String> {

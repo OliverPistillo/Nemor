@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DEFAULT: &str = include_str!("../../../config/default.toml");
 
@@ -132,6 +132,12 @@ fn tbw_never_invents_rating_and_labels_noise() {
 }
 
 fn topology(class: StorageClass) -> StorageTopology {
+    let profile = match class {
+        StorageClass::Nvme => StorageProfile::NvmeSsd,
+        StorageClass::SolidStateNonNvme => StorageProfile::SataSsd,
+        StorageClass::Rotational => StorageProfile::Rotational,
+        StorageClass::Unknown => StorageProfile::Ambiguous,
+    };
     StorageTopology {
         mount_source: "/dev/test".to_owned(),
         filesystem: "ext4".to_owned(),
@@ -144,8 +150,23 @@ fn topology(class: StorageClass) -> StorageTopology {
             physical_block_size: Some(4096),
             discard_max_bytes: Some(1),
             model: None,
+            transport: Some(
+                match class {
+                    StorageClass::Nvme => "nvme",
+                    StorageClass::SolidStateNonNvme => "sata",
+                    StorageClass::Rotational | StorageClass::Unknown => "unknown",
+                }
+                .to_owned(),
+            ),
+            serial: Some("serial".to_owned()),
+            wwn: Some("wwn".to_owned()),
+            capacity_bytes: Some(1_000_000),
         }),
         ambiguous: false,
+        profile_version: STORAGE_PROFILE_VERSION.to_owned(),
+        profile: Some(profile),
+        device_identity: Some("test:serial:wwn:1000000".to_owned()),
+        filesystem_identity: Some("ext4:/dev/test".to_owned()),
     }
 }
 
@@ -224,9 +245,9 @@ fn swapfile_requires_nvme_space_and_non_external_ownership() {
     context.ownership = SwapfileOwnership::External;
     let plan = plan_swapfile(&context, &cfg);
     assert!(!plan.allowed);
-    assert!(plan
+    assert!(!plan
         .blocked_reasons
-        .contains(&"nvme_required_but_not_proven".to_owned()));
+        .contains(&"storage_profile_not_authorized".to_owned()));
     assert!(plan
         .blocked_reasons
         .contains(&"insufficient_disk_headroom".to_owned()));
@@ -274,18 +295,37 @@ fn selector_defaults_to_zram_for_missing_or_unsafe_evidence() {
             storage: &storage,
             zram_benchmark: None,
             zswap_benchmark: None,
+            profile_evidence: None,
             budget: &budget(allowed),
             safety_events: 0,
+            source_state: "clean",
+            environment_identity: "same-host",
         });
         assert_eq!(decision.selected, BackendKind::Zram);
     }
 }
 
 #[test]
-fn selector_chooses_only_favorable_real_zswap_nvme_deterministically() {
+fn selector_chooses_only_matching_profile_evidence_deterministically() {
     let storage = topology(StorageClass::Nvme);
     let zram = benchmark(BackendKind::Zram);
-    let zswap = benchmark(BackendKind::ZswapNvme);
+    let zswap = benchmark(BackendKind::ZswapStorageBacked);
+    let profile = ProfileBenchmarkEvidence {
+        contract_version: TIERING_RULE_VERSION.to_owned(),
+        profile: StorageProfile::NvmeSsd,
+        device_identity: "test:serial:wwn:1000000".to_owned(),
+        filesystem_identity: "ext4:/dev/test".to_owned(),
+        source_state: "clean".to_owned(),
+        environment_identity: "same-host".to_owned(),
+        real: true,
+        cleanup_passed: true,
+        restore_passed: true,
+        safety_failure: false,
+        compression_ratio: Some(2.0),
+        swap_latency_ns: Some(3),
+        backing_write_bytes: Some(4),
+        oom: false,
+    };
     let input = RecommendationInput {
         current: BackendKind::Zram,
         gaming: false,
@@ -293,15 +333,21 @@ fn selector_chooses_only_favorable_real_zswap_nvme_deterministically() {
         storage: &storage,
         zram_benchmark: Some(&zram),
         zswap_benchmark: Some(&zswap),
+        profile_evidence: Some(&profile),
         budget: &budget(true),
         safety_events: 0,
+        source_state: "clean",
+        environment_identity: "same-host",
     };
     assert_eq!(
         recommend_backend(&input),
         recommend_backend(&input),
         "tie and evidence handling must be deterministic"
     );
-    assert_eq!(recommend_backend(&input).selected, BackendKind::ZswapNvme);
+    assert_eq!(
+        recommend_backend(&input).selected,
+        BackendKind::ZswapStorageBacked
+    );
 }
 
 #[test]
@@ -358,10 +404,409 @@ fn boot_plan_requires_approval_and_never_targets_usr_lib() {
 fn observe_configuration_forbids_every_mutating_capability() {
     let cfg = config();
     assert!(cfg.dry_run);
+    assert_eq!(cfg.supported_storage_profiles, ["nvme_ssd", "sata_ssd"]);
     assert!(!cfg.allow_runtime_reconfigure);
     assert!(!cfg.allow_persistent_reconfigure);
     assert!(!cfg.allow_swapfile_create);
     assert!(!cfg.allow_shrinker);
+}
+
+#[test]
+fn legacy_zswap_nvme_is_readable_but_cannot_authorize_sata() {
+    let legacy: BackendKind = serde_json::from_str("\"zswap_nvme\"").expect("legacy");
+    assert_eq!(legacy, BackendKind::ZswapNvme);
+    let storage = topology(StorageClass::SolidStateNonNvme);
+    let zram = benchmark(BackendKind::Zram);
+    let legacy_benchmark = benchmark(BackendKind::ZswapNvme);
+    let decision = recommend_backend(&RecommendationInput {
+        current: BackendKind::Zram,
+        gaming: false,
+        pressure: PressureState::Normal,
+        storage: &storage,
+        zram_benchmark: Some(&zram),
+        zswap_benchmark: Some(&legacy_benchmark),
+        profile_evidence: None,
+        budget: &budget(true),
+        safety_events: 0,
+        source_state: "clean",
+        environment_identity: "same-host",
+    });
+    assert_eq!(decision.selected, BackendKind::Zram);
+    assert!(decision
+        .reasons
+        .contains(&"sata_boot_validation_missing".to_owned()));
+}
+
+fn profile_evidence(profile: StorageProfile) -> ProfileBenchmarkEvidence {
+    ProfileBenchmarkEvidence {
+        contract_version: TIERING_RULE_VERSION.to_owned(),
+        profile,
+        device_identity: "test:serial:wwn:1000000".to_owned(),
+        filesystem_identity: "ext4:/dev/test".to_owned(),
+        source_state: "clean".to_owned(),
+        environment_identity: "same-host".to_owned(),
+        real: true,
+        cleanup_passed: true,
+        restore_passed: true,
+        safety_failure: false,
+        compression_ratio: Some(2.0),
+        swap_latency_ns: Some(3),
+        backing_write_bytes: Some(4),
+        oom: false,
+    }
+}
+
+#[test]
+fn sata_and_nvme_evidence_bind_only_the_exact_profile() {
+    let zram = benchmark(BackendKind::Zram);
+    for (class, profile) in [
+        (StorageClass::SolidStateNonNvme, StorageProfile::SataSsd),
+        (StorageClass::Nvme, StorageProfile::NvmeSsd),
+    ] {
+        let storage = topology(class);
+        let matching = profile_evidence(profile);
+        let selected = recommend_backend(&RecommendationInput {
+            current: BackendKind::Zram,
+            gaming: false,
+            pressure: PressureState::Normal,
+            storage: &storage,
+            zram_benchmark: Some(&zram),
+            zswap_benchmark: None,
+            profile_evidence: Some(&matching),
+            budget: &budget(true),
+            safety_events: 0,
+            source_state: "clean",
+            environment_identity: "same-host",
+        });
+        assert_eq!(selected.selected, BackendKind::ZswapStorageBacked);
+        let wrong = profile_evidence(if profile == StorageProfile::SataSsd {
+            StorageProfile::NvmeSsd
+        } else {
+            StorageProfile::SataSsd
+        });
+        let rejected = recommend_backend(&RecommendationInput {
+            current: BackendKind::Zram,
+            gaming: false,
+            pressure: PressureState::Normal,
+            storage: &storage,
+            zram_benchmark: Some(&zram),
+            zswap_benchmark: None,
+            profile_evidence: Some(&wrong),
+            budget: &budget(true),
+            safety_events: 0,
+            source_state: "clean",
+            environment_identity: "same-host",
+        });
+        assert_eq!(rejected.selected, BackendKind::Zram);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn transport_profiles_require_transport_evidence_not_model_spoofing() {
+    for (transport, expected) in [
+        ("sata", StorageProfile::SataSsd),
+        ("sas", StorageProfile::SasSsd),
+        ("usb", StorageProfile::UsbSsd),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        write(fixture.path(), "/sys/class/block/sda/queue/rotational", "0");
+        write(
+            fixture.path(),
+            "/sys/class/block/sda/device/transport",
+            transport,
+        );
+        write(
+            fixture.path(),
+            "/sys/class/block/sda/device/model",
+            "NVMe spoof",
+        );
+        write(fixture.path(), "/sys/class/block/sda/size", "2048");
+        let found = inspect_storage(fixture.path(), "/dev/sda", "btrfs");
+        assert_eq!(found.profile, Some(expected));
+        assert_ne!(found.profile, Some(StorageProfile::NvmeSsd));
+    }
+}
+
+#[test]
+fn rotational_virtual_composite_and_ambiguous_profiles_fail_closed() {
+    let rotational = topology(StorageClass::Rotational);
+    assert_eq!(rotational.profile, Some(StorageProfile::Rotational));
+    assert!(!rotational.profile.unwrap().boot_supported());
+    let fixture = tempfile::tempdir().unwrap();
+    write(fixture.path(), "/sys/class/block/dm-0/slaves/a/marker", "");
+    write(fixture.path(), "/sys/class/block/dm-0/slaves/b/marker", "");
+    let composite = inspect_storage(fixture.path(), "/dev/dm-0", "btrfs");
+    assert_eq!(composite.profile, Some(StorageProfile::Composite));
+    let missing = inspect_storage(fixture.path(), "/dev/missing", "btrfs");
+    assert_eq!(missing.profile, Some(StorageProfile::Ambiguous));
+}
+
+#[derive(Default)]
+struct FakeBootBackend {
+    artifacts: std::collections::BTreeSet<PathBuf>,
+    one_shot: Option<String>,
+    booted: Option<String>,
+    mutate_calls: usize,
+    unsafe_path: bool,
+}
+
+impl BootValidationBackend for FakeBootBackend {
+    fn source_matches(&self, _: &TieringBootValidationManifest) -> bool {
+        true
+    }
+    fn storage_matches(&self, _: &TieringBootValidationManifest) -> bool {
+        true
+    }
+    fn bootloader_matches(&self, _: &TieringBootValidationManifest) -> bool {
+        true
+    }
+    fn entries_preserved(&self, _: &TieringBootValidationManifest) -> bool {
+        true
+    }
+    fn boot_order_matches(&self, _: &TieringBootValidationManifest) -> bool {
+        true
+    }
+    fn artifact_absent_and_safe(&self, artifact: &BootArtifact) -> bool {
+        !self.unsafe_path && !self.artifacts.contains(&artifact.path)
+    }
+    fn package_update_absent(&self) -> bool {
+        true
+    }
+    fn secure_boot_compatible(&self) -> bool {
+        true
+    }
+    fn create_new_artifact(&mut self, artifact: &BootArtifact) -> bool {
+        self.mutate_calls += 1;
+        self.artifacts.insert(artifact.path.clone())
+    }
+    fn artifact_matches(&self, artifact: &BootArtifact) -> bool {
+        self.artifacts.contains(&artifact.path)
+    }
+    fn sync_artifact_parents(&mut self) -> bool {
+        self.mutate_calls += 1;
+        true
+    }
+    fn set_one_shot(&mut self, entry: &str) -> bool {
+        self.mutate_calls += 1;
+        self.one_shot = Some(entry.to_owned());
+        true
+    }
+    fn booted_entry(&self) -> Option<String> {
+        self.booted.clone()
+    }
+    fn remove_exact_artifact(&mut self, artifact: &BootArtifact) -> bool {
+        self.mutate_calls += 1;
+        self.artifacts.remove(&artifact.path)
+    }
+    fn temporary_swapfile_absent(&self, _: &TieringBootValidationManifest) -> bool {
+        true
+    }
+    fn baseline_zswap_restored(&self, _: &TieringBootValidationManifest) -> bool {
+        true
+    }
+    fn baseline_zram_restored(&self, _: &TieringBootValidationManifest) -> bool {
+        true
+    }
+}
+
+fn boot_manifest(profile: StorageProfile) -> TieringBootValidationManifest {
+    let validation_id = "phase6-sata-1".to_owned();
+    let path = PathBuf::from("/boot/loader/entries/nemor-validation-phase6-sata-1.conf");
+    TieringBootValidationManifest {
+        contract_version: BOOT_VALIDATION_CONTRACT_VERSION.to_owned(),
+        rule_version: TIERING_RULE_VERSION.to_owned(),
+        validation_id: validation_id.clone(),
+        source_commit: "a".repeat(40),
+        source_state: "clean".to_owned(),
+        binary_identities: Default::default(),
+        config_sha256: "b".repeat(64),
+        environment_identity: "host".to_owned(),
+        storage_profile: profile,
+        physical_device_identity: "test:serial:wwn:1000000".to_owned(),
+        filesystem_identity: "btrfs:uuid".to_owned(),
+        swapfile_path: PathBuf::from("/var/lib/nemor/swap/nemor-tiering.swap"),
+        swapfile_size: 64 * 1024 * 1024,
+        swap_priority: 9,
+        protected_zram_active: true,
+        protected_zram_priority: Some(100),
+        baseline_zswap_enabled: false,
+        experimental_zswap_parameters: [("enabled".to_owned(), "1".to_owned())].into(),
+        bootloader: "systemd-boot/kernel-install-uki".to_owned(),
+        current_entry: "linux-cachyos.conf".to_owned(),
+        default_entry: "linux-cachyos.conf".to_owned(),
+        boot_order: vec!["0003".to_owned(), "0004".to_owned()],
+        esp_identity: "esp".to_owned(),
+        kernel_identity: "kernel".to_owned(),
+        initrd_or_uki_identities: Default::default(),
+        current_command_line: "zswap.enabled=0".to_owned(),
+        experimental_command_line: "zswap.enabled=1 root=uuid".to_owned(),
+        experimental_entry: "nemor-validation-phase6-sata-1.conf".to_owned(),
+        owned_artifacts: vec![BootArtifact {
+            content: "title Nemor Phase 6 validation\nlinux /EFI/Linux/nemor-validation.efi\n"
+                .to_owned(),
+            sha256: crate::boot_validation::sha256_bytes(
+                b"title Nemor Phase 6 validation\nlinux /EFI/Linux/nemor-validation.efi\n",
+            ),
+            path,
+            mode: 0o600,
+            owner_uid: 0,
+            owner_gid: 0,
+        }],
+        one_shot_method: "bootctl-set-oneshot".to_owned(),
+        rollback_entry: "linux-cachyos.conf".to_owned(),
+        maximum_write_bytes: 64 * 1024 * 1024,
+        timeout_seconds: 300,
+        recovery_plan: vec!["select baseline one-shot".to_owned()],
+        production_activation: false,
+    }
+}
+
+#[test]
+fn boot_preflights_are_non_mutating_and_apply_is_exact_owned() {
+    let manifest = boot_manifest(StorageProfile::SataSsd);
+    let mut backend = FakeBootBackend::default();
+    let user = user_preflight(&manifest, &backend);
+    let root = root_preflight(&manifest, &backend);
+    assert!(user.ready && root.ready && user.non_mutating && root.non_mutating);
+    assert_eq!(backend.mutate_calls, 0);
+    let mut applied = apply_boot_validation(&manifest, &root, &mut backend).unwrap();
+    verify_applied(&manifest, &applied, &backend).unwrap();
+    assert!(!applied.one_shot_selected);
+    select_one_shot(&manifest, &mut applied, &mut backend).unwrap();
+    assert_eq!(
+        backend.one_shot.as_deref(),
+        Some(manifest.experimental_entry.as_str())
+    );
+    assert_eq!(manifest.default_entry, "linux-cachyos.conf");
+}
+
+#[test]
+fn boot_command_surface_separates_authorization_and_has_no_production_command() {
+    assert!(!BootValidationCommand::Prepare.mutating());
+    assert!(!BootValidationCommand::UserPreflight.mutating());
+    assert!(BootValidationCommand::RootPreflight.requires_authenticated_root());
+    assert!(BootValidationCommand::Apply.mutating());
+    let json = serde_json::to_string(&[
+        BootValidationCommand::Prepare,
+        BootValidationCommand::UserPreflight,
+        BootValidationCommand::RootPreflight,
+        BootValidationCommand::Apply,
+        BootValidationCommand::VerifyApplied,
+        BootValidationCommand::SelectOneShot,
+        BootValidationCommand::PostBootValidate,
+        BootValidationCommand::SelectBaselineRollback,
+        BootValidationCommand::VerifyFinalRestore,
+        BootValidationCommand::Recover,
+        BootValidationCommand::VerifyIdempotence,
+    ])
+    .unwrap();
+    assert!(!json.contains("production"));
+}
+
+#[test]
+fn boot_paths_existing_symlink_equivalent_and_vendor_paths_fail_closed() {
+    let mut manifest = boot_manifest(StorageProfile::SataSsd);
+    manifest.owned_artifacts[0].path = PathBuf::from("/usr/lib/nemor-validation-x");
+    assert_eq!(
+        manifest.validate(),
+        Err(BootValidationError::PathOutsideNamespace)
+    );
+    let manifest = boot_manifest(StorageProfile::SataSsd);
+    let mut backend = FakeBootBackend {
+        unsafe_path: true,
+        ..Default::default()
+    };
+    let preflight = root_preflight(&manifest, &backend);
+    assert!(!preflight.ready);
+    assert_eq!(
+        apply_boot_validation(&manifest, &preflight, &mut backend),
+        Err(BootValidationError::PreflightRejected)
+    );
+}
+
+#[test]
+fn boot_artifact_owner_mode_and_checksum_are_integrity_bound() {
+    let mut manifest = boot_manifest(StorageProfile::SataSsd);
+    manifest.owned_artifacts[0].owner_uid = 1000;
+    assert_eq!(
+        manifest.validate(),
+        Err(BootValidationError::InvalidArtifactIdentity)
+    );
+    let mut manifest = boot_manifest(StorageProfile::SataSsd);
+    manifest.owned_artifacts[0].mode = 0o666;
+    assert_eq!(
+        manifest.validate(),
+        Err(BootValidationError::InvalidArtifactIdentity)
+    );
+    let mut manifest = boot_manifest(StorageProfile::SataSsd);
+    manifest.owned_artifacts[0].content.push_str("tampered");
+    assert_eq!(
+        manifest.validate(),
+        Err(BootValidationError::InvalidArtifactIdentity)
+    );
+}
+
+#[test]
+fn post_boot_profile_oom_and_write_budget_are_mandatory() {
+    let manifest = boot_manifest(StorageProfile::NvmeSsd);
+    let complete = TieringPostBootEvidence {
+        stage: BootValidationStage::OneShotSelected,
+        profile: StorageProfile::NvmeSsd,
+        booted_entry: manifest.experimental_entry.clone(),
+        kernel_matches: true,
+        command_line_matches: true,
+        zswap_readback_matches: true,
+        swapfile_identity_matches: true,
+        swap_priority_matches: true,
+        zram_policy_matches: true,
+        storage_identity_matches: true,
+        counters_available: true,
+        backing_write_bytes: Some(4096),
+        latency_ns: Some(1),
+        throughput_bytes_per_second: Some(1),
+        compression_ratio_milli: Some(2000),
+        refault_passed: true,
+        write_budget_passed: true,
+        host_oom: false,
+        oom_kill: false,
+        daemon_observe_only: true,
+        production_activation: false,
+        valid: false,
+    };
+    assert!(
+        post_boot_validate(&manifest, complete.clone())
+            .unwrap()
+            .valid
+    );
+    let mut oom = complete.clone();
+    oom.host_oom = true;
+    assert_eq!(
+        post_boot_validate(&manifest, oom),
+        Err(BootValidationError::PostBootRejected)
+    );
+    let mut wrong = complete;
+    wrong.profile = StorageProfile::SataSsd;
+    assert_eq!(
+        post_boot_validate(&manifest, wrong),
+        Err(BootValidationError::PostBootRejected)
+    );
+}
+
+#[test]
+fn rollback_waits_for_baseline_then_recovery_is_idempotent() {
+    let manifest = boot_manifest(StorageProfile::SataSsd);
+    let mut backend = FakeBootBackend::default();
+    let preflight = root_preflight(&manifest, &backend);
+    let _ = apply_boot_validation(&manifest, &preflight, &mut backend).unwrap();
+    let rollback = prepare_baseline_rollback(&manifest, &mut backend).unwrap();
+    assert!(rollback.experimental_artifacts_preserved_until_baseline);
+    assert!(backend.artifact_matches(&manifest.owned_artifacts[0]));
+    backend.booted = Some(manifest.rollback_entry.clone());
+    let restored = verify_final_restore(&manifest, &mut backend).unwrap();
+    assert!(restored.exact_owned_artifacts_absent);
+    let recovered = recover_boot_validation(&manifest, &mut backend).unwrap();
+    assert!(recovered.idempotent);
 }
 
 #[test]

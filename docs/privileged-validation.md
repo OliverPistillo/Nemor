@@ -181,9 +181,9 @@ resource was touched.
 The validation proves the privileged primitives through a dedicated test
 harness; it does not enable general daemon mutation. The default service has
 no cgroup or zram mutation privileges. Live Steam/Proton/Wine/Gamescope
-coverage remains separate. Phase 6 development and live-safe validation are
-complete, while dedicated boot validation with real zswap+NVMe remains
-pending.
+coverage remains separate. Phase 6 core development and SATA live-safe
+validation are complete. The versioned profile contract keeps SATA and NVMe
+evidence separate; both dedicated boot profiles remain pending.
 
 ## Phase 6 live-safe validation
 
@@ -195,9 +195,11 @@ physical block write delta, recovered with a fresh backend, rolled back twice
 idempotently and removed all resources. Baseline and final swap topology and
 protected zram structure were identical.
 
-This proves the live-safe swapfile lifecycle and accounting path, not the full
-zswap+NVMe backend. Dedicated boot validation remains pending and requires
-separate explicit approval.
+This proves the SATA live-safe swapfile lifecycle and accounting path, not a
+zswap boot profile. The validation-only systemd-boot/UKI contract separates
+preflight, exact-owned apply, one-shot selection, post-boot evidence, baseline
+rollback and final restore. Dedicated boot validation remains pending and
+requires separate explicit approval.
 
 ## Phase 7 monitor-only validation
 
@@ -274,7 +276,7 @@ workloads will bind to an owned cgroup v2 with a measured bounded
 `memory.max`, host-headroom guard, watchdog, timeout, audit, rollback,
 recovery and before/after structural snapshots. It must never intentionally
 trigger host OOM. Real application scenarios remain manual/cooperative and
-the zswap/NVMe variant remains pending Phase 6 boot validation.
+the profile-bound zswap/storage variant remains pending Phase 6 boot validation.
 
 The first Phase 10 privileged checkpoint is only
 `nemor-benchmark validate-cgroup`. It validates a 64 MiB owned steady worker
@@ -366,8 +368,8 @@ preserved, and exact bounded offline revalidation returned
 observer-overhead comparison is comparable, with no significance claim from
 only three repetitions. The bridge hardening also requires a read-only manifest host
 preflight before authorization, exact transaction/output roles, and execution
-via `sudo` by the preparing user identity. Phase 6 zswap+NVMe boot
-validation remains pending on dedicated hardware.
+via `sudo` by the preparing user identity. Phase 6 SATA and NVMe boot
+validation remain pending on matching hardware.
 
 Checkpoint 3A Experiment 1 execution attempt 1 was rejected before run 0 due
 to privilege-sensitive environment fingerprinting. The performance path now

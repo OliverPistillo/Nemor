@@ -31,6 +31,10 @@ pub struct ProviderState {
     pub persistence_sources: Vec<PathBuf>,
     pub conflict: bool,
     pub bootloader: Option<String>,
+    #[serde(default)]
+    pub command_line_source: Option<PathBuf>,
+    #[serde(default)]
+    pub systemd_boot: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,7 +157,16 @@ fn inspect_provider(root: &Path) -> ProviderState {
     .filter(|path| path.exists())
     .collect::<Vec<_>>();
     persistence_sources.sort();
-    let bootloader = if resolve(root, "/etc/kernel/cmdline").exists() {
+    let kernel_cmdline_path = resolve(root, "/etc/kernel/cmdline");
+    let systemd_boot = resolve(root, "/boot/loader/loader.conf").exists()
+        || resolve(
+            root,
+            "/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f",
+        )
+        .exists();
+    let bootloader = if kernel_cmdline_path.exists() && systemd_boot {
+        Some("systemd-boot/kernel-install-uki".to_owned())
+    } else if kernel_cmdline_path.exists() {
         Some("kernel-install/uki".to_owned())
     } else if resolve(root, "/etc/default/grub").exists() {
         Some("grub".to_owned())
@@ -174,6 +187,8 @@ fn inspect_provider(root: &Path) -> ProviderState {
         persistence_sources,
         conflict: systemd_zram && (cmdline_disabled || cachyos_zswap_disable_rule),
         bootloader,
+        command_line_source: kernel_cmdline_path.exists().then_some(kernel_cmdline_path),
+        systemd_boot,
     }
 }
 

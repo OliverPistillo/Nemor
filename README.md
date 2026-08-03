@@ -16,7 +16,7 @@ not AI.
 | Phase 3 | cgroup v2 protection primitives | ✅ Validated on CachyOS |
 | Phase 4 | deterministic policy engine | ✅ Validated on CachyOS |
 | Phase 5 | safe zram backend and profiles | ✅ Validated on CachyOS |
-| Phase 6 | zswap + NVMe tiering backend | 🟡 Dev complete / boot validation pending |
+| Phase 6 | zswap + storage-backed SSD tiering | 🟡 Generalized contract / boot validation pending |
 | Phase 7 | DAMON monitor-only telemetry | ✅ Validated on CachyOS |
 | Phase 8 | controlled DAMOS reclaim | ✅ Validated on CachyOS |
 | Phase 9 | selective KSM | ✅ Validated on CachyOS |
@@ -45,7 +45,7 @@ development; ⚪ planned.
 | Host zram | `/dev/zram0`, `zstd`, systemd generator, external/protected |
 | Host zswap | supported, disabled by kernel/provider configuration |
 | Host storage | Btrfs, non-rotational SATA SSD; no NVMe evidence |
-| Phase 6 validation | read-only + live-safe swapfile; dedicated boot pending |
+| Phase 6 validation | SATA read-only + live-safe PASS; SATA boot and NVMe validation pending |
 | Phase 7 validation | real `vaddr` monitor-only session; 30/30 gates; host unchanged |
 | Phase 8 validation | owned-target DAMOS pageout; 8 MiB COLD reclaimed; host unchanged |
 | Phase 9 validation | profitable and inefficient auto-disable paths validated on owned synthetic targets; host unchanged |
@@ -133,7 +133,8 @@ production performance claims.
 - zswap capability/provider inventory, swapfile filesystem and topology
   validation, pool planning, block-I/O accounting, write budgets and TBW
   estimates without invented endurance ratings;
-- deterministic zram versus zswap+NVMe recommendation, boot-plan generation,
+- deterministic zram versus profile-bound zswap+storage recommendation,
+  versioned validation-only systemd-boot/UKI lifecycle,
   owned swapfile rollback/recovery and live-safe privileged validation.
 - DAMON capability discovery, `vaddr` monitor-only planning, dynamic tracepoint
   parsing, overlap-aware region normalization, hot/warm/cold observational
@@ -412,8 +413,8 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 - no ML or GUI exists;
 - the current host has no NVMe backing device and zswap is disabled by its
   CachyOS boot/provider configuration;
-- full zswap+NVMe pool, writeback and comparative benchmark validation requires
-  a separately approved dedicated boot;
+- full zswap+SATA boot evidence and any NVMe evidence require separately
+  approved profile-matching dedicated boots;
 - the daemon and normal CLI intentionally expose no tiering apply command.
 - small synthetic DAMON access-frequency tests can be distorted by THP/TLB
   behavior; the validation harness uses mapping-local `MADV_NOHUGEPAGE` only
@@ -433,8 +434,9 @@ The daemon stays in the foreground. SIGINT or SIGTERM commits `ended_at` and
 ## Roadmap
 
 - Completed and validated on CachyOS: Phases 0–5 and Phases 7–9.
-- Phase 6 implementation and live-safe swapfile validation are complete;
-  dedicated zswap+NVMe boot validation remains pending.
+- Phase 6 core storage-backed implementation and SATA live-safe swapfile
+  validation are complete; SATA boot validation and NVMe validation remain
+  pending, and production activation remains false.
 - The runtime default remains observe-only despite isolated privileged
   validation of Phases 3, 5, 6, 7 and 8.
 - Phase 9 validated both profitable selective KSM and real ineffective-workload

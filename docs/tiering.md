@@ -6,7 +6,7 @@ default remains `mode = "observe"` and `[tiering].dry_run = true`.
 
 ## Backend model
 
-`ZRAM` and `ZSWAP_NVME` are different backends. Zram is compressed RAM acting
+`ZRAM` and `ZSWAP_STORAGE_BACKED` are different backends. Zram is compressed RAM acting
 as swap; zswap is a compressed cache in front of a real backing swap device.
 Eviction from zswap writes to backing swap. Disabling new zswap stores does not
 empty the existing pool, and changing compressor does not recompress pages
@@ -29,7 +29,12 @@ The live root is Btrfs on a non-rotational SATA SSD. It is not classified as
 NVMe. `/dev/zram0` is an external, protected systemd-generator device and is
 never used as proof of the requested NVMe tier.
 
-No hardware serial, machine identifier, hostname or user name is persisted.
+The v1 storage-profile contract distinguishes NVMe, SATA, SAS, USB, other
+non-rotational, rotational, composite, virtual and ambiguous storage from
+transport, rotational, complete parent/slave-chain and filesystem evidence.
+Model or device-name strings alone never establish a profile. Device identity
+is evidence-bound for validation; normal telemetry does not persist machine or
+user identity.
 
 ## Swapfile safety
 
@@ -70,10 +75,14 @@ bounds are configuration-controlled. The shrinker defaults to preserved/off
 and requires a real zswap+NVMe backend, metrics, budget headroom, benchmark
 evidence, non-severe pressure, no gaming and rollback readiness.
 
-The selector compares the validated zram baseline with real zswap+NVMe
-evidence. Missing evidence, gaming, severe pressure, unknown or slow storage,
+The v2 selector compares a same-host validated zram baseline with real
+profile-bound zswap+storage evidence. Missing evidence, gaming, severe
+pressure, unsupported storage,
 or excessive writes select the current zram backend. A zswap candidate requires
-measured NVMe-backed evidence and safety headroom. No machine learning is used.
+measured latency, backing writes, cleanup and restore, matching source and
+environment identity, and safety headroom. SATA and NVMe evidence are not
+interchangeable. Historical serialized `zswap_nvme` values remain readable but
+cannot authorize a v2 decision. No machine learning is used.
 
 ## Observe mode and CLI
 
@@ -87,6 +96,7 @@ Read-only commands:
 nemorctl tiering status [--json]
 nemorctl tiering recommend [--json]
 nemorctl tiering report latest [--json]
+nemorctl tiering boot-contract [--json]
 ```
 
 There is intentionally no normal `tiering apply` command.
@@ -103,15 +113,39 @@ The report recorded exit code zero, no errors, no swap/cgroup/process residue,
 and structurally identical protected zram state. It did not enable zswap or
 change boot configuration.
 
-## Boot plan and remaining validation
+## Validation-only boot contract
 
-Boot plans are serializable recommendations only. They identify the provider,
-backing swapfile, kernel parameters, `/etc` overrides, checksums, backups,
-post-reboot checks and rollback. They always require explicit user approval,
-never target `/usr/lib`, and are not applied by the daemon.
+`tiering-boot-validation-v1` is separate from production recommendation. It
+freezes source, binaries, configuration, storage profile and physical and
+filesystem identities, current/default/rollback entry, BootOrder, ESP, kernel,
+UKI/initrd, command lines, exact create-new artifacts, protected zram fallback,
+zswap parameters, swapfile, write budget, timeout and recovery. The command
+contract separates prepare, user/root preflight, exact apply, readback,
+one-shot selection, post-boot validation, baseline rollback, final restore and
+idempotent recovery. Normal `nemorctl` only prints this contract.
 
-A real zswap+NVMe benchmark cannot be demonstrated on the current SATA host or
-inside the current desktop boot. Dedicated boot validation remains pending. It
+The separately compiled `nemor-tiering-boot-validation` binary exposes
+`prepare`, user/root preflight, apply/readback, one-shot selection, post-boot
+validation, baseline selection, final restore, recovery and idempotence as
+distinct `--command` values. It requires an integrity-bound manifest and
+create-new evidence output. Root preflight evidence is required by apply;
+every mutating stage writes a durable pre-mutation record and a separate
+completed record. Root-only stages are not reachable through `nemorctl` or
+`nemord` and remain separately authorized.
+
+Artifacts are restricted to validation-ID-bound systemd-boot entry or UKI
+paths, may not target `/usr/lib`, must be absent and non-symlink before apply,
+and require exact owner/mode/hash readback. Permanent default and firmware
+BootOrder are immutable. Experimental artifacts remain until a verified
+baseline boot; only then may exact-owned removal occur.
+
+The CachyOS provider disables zswap when generated zram appears. The manifest
+requires protected zram to remain an active fallback and post-boot zswap
+readback to prove that an entry-scoped profile worked. It never authorizes a
+global `/etc/kernel/cmdline` or vendor-rule edit; provider conflict fails closed.
+
+A real zswap+SATA boot benchmark has not yet been performed, and this host
+cannot demonstrate NVMe. Dedicated profile-specific boot validation remains pending. It
 requires separate approval before any persistent change and must validate pool
 readback, zswap writeback, bounded workload evidence, rollback and restoration
 of the CachyOS baseline.
