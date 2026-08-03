@@ -8,6 +8,7 @@ pub mod boot_validation_v2;
 mod boot_validation_v3;
 pub mod boot_validation_v4;
 pub mod boot_validation_v5;
+pub mod boot_validation_v6;
 mod inventory;
 mod metrics;
 mod plan;

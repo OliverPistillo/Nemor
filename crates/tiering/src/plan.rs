@@ -1,13 +1,13 @@
-use crate::{
-    matching_same_host_evidence_v3, BudgetDecision, SameHostProfileEvidenceV3,
-    SameHostZramBaselineEvidenceV2, StorageProfile, StorageTopology, SwapfilePlan, ZswapInventory,
+use crate::boot_validation_v6::{
+    matching_same_host_evidence_v6, SameHostProfileEvidenceV6, SameHostZramBaselineEvidenceV6,
 };
+use crate::{BudgetDecision, StorageProfile, StorageTopology, SwapfilePlan, ZswapInventory};
 use common::TieringConfig;
 use policy_engine::PressureState;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const TIERING_RULE_VERSION: &str = "tiering-rules-v4-storage-profile-comparison";
+pub const TIERING_RULE_VERSION: &str = "tiering-rules-v5-storage-profile-comparison";
 pub const TIERING_AUDIT_REASON: &str = "tiering_observe_audit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,8 +266,8 @@ pub struct RecommendationInput<'a> {
     /// V1 generic evidence is retained for report compatibility but cannot
     /// authorize the storage-backed backend. These two sealed, same-host
     /// records are the sole v2 authorization path.
-    pub same_host_zram_baseline: Option<&'a SameHostZramBaselineEvidenceV2>,
-    pub same_host_profile_evidence: Option<&'a SameHostProfileEvidenceV3>,
+    pub same_host_zram_baseline: Option<&'a SameHostZramBaselineEvidenceV6>,
+    pub same_host_profile_evidence: Option<&'a SameHostProfileEvidenceV6>,
     pub budget: &'a BudgetDecision,
     pub safety_events: usize,
     pub source_state: &'a str,
@@ -303,7 +303,7 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
             .same_host_profile_evidence
             .is_some_and(|profile_evidence| {
                 profile.is_some_and(|profile| {
-                    matching_same_host_evidence_v3(baseline, profile_evidence, profile)
+                    matching_same_host_evidence_v6(baseline, profile_evidence, profile)
                 })
             })
     });
@@ -359,6 +359,9 @@ pub fn recommend_backend(input: &RecommendationInput<'_>) -> BackendRecommendati
 }
 
 fn comparison_policy_passes(input: &RecommendationInput<'_>) -> bool {
+    // The legacy recommendation input has no configuration handle; retain a
+    // conservative named policy until a caller supplies the validated policy.
+    const MAX_LATENCY_REGRESSION_PERCENT: u64 = 10;
     let (Some(zram), Some(profile)) = (input.zram_benchmark, input.zswap_benchmark) else {
         return false;
     };
@@ -371,7 +374,8 @@ fn comparison_policy_passes(input: &RecommendationInput<'_>) -> bool {
     let Some(profile_latency) = profile.swap_latency_ns else {
         return false;
     };
-    let latency_ok = profile_latency <= base_latency.saturating_mul(110) / 100;
+    let latency_ok =
+        profile_latency <= base_latency.saturating_mul(100 + MAX_LATENCY_REGRESSION_PERCENT) / 100;
     let benefit = match (zram.compression_ratio, profile.compression_ratio) {
         (Some(base), Some(candidate)) => candidate > base,
         _ => false,

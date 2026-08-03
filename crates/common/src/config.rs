@@ -336,6 +336,41 @@ impl Config {
         if self.general.database_path.as_os_str().is_empty() {
             return Err(validation("general.database_path", "must not be empty"));
         }
+        for (field, value) in [
+            (
+                "tiering.comparison_max_latency_regression_percent",
+                self.tiering.comparison_max_latency_regression_percent,
+            ),
+            (
+                "tiering.comparison_min_useful_benefit_percent",
+                self.tiering.comparison_min_useful_benefit_percent,
+            ),
+        ] {
+            if value > 100 {
+                return Err(validation(field, "must be between 0 and 100"));
+            }
+        }
+        if let Some(confidence) = &self.tiering.comparison_accepted_confidence {
+            if !matches!(
+                confidence.as_str(),
+                "bounded-physical-device-attributed" | "physical-device-host-wide-noisy"
+            ) {
+                return Err(validation(
+                    "tiering.comparison_accepted_confidence",
+                    "unsupported confidence vocabulary",
+                ));
+            }
+        }
+        if self.tiering.comparison_enabled
+            && (self.tiering.comparison_max_latency_regression_percent == 0
+                || self.tiering.comparison_min_useful_benefit_percent == 0
+                || self.tiering.comparison_accepted_confidence.is_none())
+        {
+            return Err(validation(
+                "tiering.comparison_enabled",
+                "enabled comparison requires non-zero bounds and accepted confidence",
+            ));
+        }
         if self.general.sample_interval_ms < 100 {
             return Err(validation(
                 "general.sample_interval_ms",

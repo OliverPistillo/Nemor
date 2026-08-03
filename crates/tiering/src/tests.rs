@@ -1,5 +1,9 @@
 use super::*;
 use crate::boot_validation::*;
+use crate::boot_validation_v6::{
+    SameHostProfileEvidenceV6, SameHostZramBaselineEvidenceV6, PROFILE_BENCHMARK_EVIDENCE_V6,
+    WORKLOAD_PROTOCOL_V6, ZRAM_BASELINE_EVIDENCE_V6,
+};
 use common::Config;
 use policy_engine::PressureState;
 use std::collections::BTreeMap;
@@ -470,9 +474,9 @@ fn profile_evidence(profile: StorageProfile) -> ProfileBenchmarkEvidence {
 
 fn same_host_evidence(
     profile: StorageProfile,
-) -> (SameHostZramBaselineEvidenceV2, SameHostProfileEvidenceV3) {
-    let baseline = SameHostZramBaselineEvidenceV2 {
-        schema: ZRAM_BASELINE_EVIDENCE_V2.to_owned(),
+) -> (SameHostZramBaselineEvidenceV6, SameHostProfileEvidenceV6) {
+    let baseline = SameHostZramBaselineEvidenceV6 {
+        schema: ZRAM_BASELINE_EVIDENCE_V6.to_owned(),
         validation_id: "same-host-validation".to_owned(),
         source_commit: "a".repeat(40),
         source_state_sha256: "1".repeat(64),
@@ -486,10 +490,10 @@ fn same_host_evidence(
         final_restore_passed: true,
         archive_sha256: "5".repeat(64),
         raw_evidence_sha256: "7".repeat(64),
-        workload_protocol: WORKLOAD_PROTOCOL_V1.to_owned(),
+        workload_protocol: WORKLOAD_PROTOCOL_V6.to_owned(),
     };
-    let evidence = SameHostProfileEvidenceV3 {
-        schema: PROFILE_BENCHMARK_EVIDENCE_V3.to_owned(),
+    let evidence = SameHostProfileEvidenceV6 {
+        schema: PROFILE_BENCHMARK_EVIDENCE_V6.to_owned(),
         validation_id: baseline.validation_id.clone(),
         profile,
         source_commit: baseline.source_commit.clone(),
@@ -507,7 +511,7 @@ fn same_host_evidence(
         latency_ns: Some(3),
         archive_sha256: "6".repeat(64),
         raw_evidence_sha256: "8".repeat(64),
-        workload_protocol: WORKLOAD_PROTOCOL_V1.to_owned(),
+        workload_protocol: WORKLOAD_PROTOCOL_V6.to_owned(),
         backing_write_confidence: "bounded-physical-device-attributed".to_owned(),
     };
     (baseline, evidence)

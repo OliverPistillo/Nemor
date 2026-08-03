@@ -13,11 +13,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
-use tiering::boot_validation_v5::*;
+use tiering::boot_validation_v6::*;
 use tiering::*;
 
 #[derive(Debug, Parser)]
-#[command(about = "Validation-only Phase 6 systemd-boot Type #1 lifecycle v5")]
+#[command(about = "Validation-only Phase 6 systemd-boot Type #1 lifecycle v6")]
 struct Cli {
     #[command(subcommand)]
     command: LifecycleCommand,
@@ -89,14 +89,14 @@ fn main() -> Result<()> {
         LifecycleCommand::UserPreflight(args) => {
             let manifest = read_manifest(&args.manifest)?;
             let observation = collect_preflight(&manifest, false)?;
-            validate_preflight_v5(&manifest, &observation, false)?;
+            validate_preflight_v6(&manifest, &observation, false)?;
             print_json(&observation)
         }
         LifecycleCommand::RootPreflight(args) => {
             require_authenticated_root(&read_manifest(&args.manifest)?)?;
             let manifest = read_manifest(&args.manifest)?;
             let observation = collect_preflight(&manifest, true)?;
-            validate_preflight_v5(&manifest, &observation, true)?;
+            validate_preflight_v6(&manifest, &observation, true)?;
             print_json(&observation)
         }
         LifecycleCommand::MeasureBaseline(args) => {
@@ -105,15 +105,15 @@ fn main() -> Result<()> {
             let root = collect_preflight(&manifest, true)?;
             let boot_id = read_trimmed(Path::new("/proc/sys/kernel/random/boot_id"))?;
             let mut backend = LinuxLifecycleBackend::new(&manifest)?;
-            let tx = initialize_and_measure_baseline_v5(&manifest, &root, boot_id, &mut backend)?;
+            let tx = initialize_and_measure_baseline_v6(&manifest, &root, boot_id, &mut backend)?;
             print_json(&tx)
         }
         LifecycleCommand::Apply(args) => with_transaction_mut(&args, |m, t, b| {
-            apply_exact_transaction_v5(m, t, b)?;
+            apply_exact_transaction_v6(m, t, b)?;
             print_json(t)
         }),
         LifecycleCommand::VerifyApplied(args) => with_transaction(&args, |m, t, b| {
-            require_stage(t, TransactionStageV5::Applied)?;
+            require_stage(t, TransactionStageV6::Applied)?;
             if m.payload
                 .owned_artifacts
                 .iter()
@@ -125,19 +125,19 @@ fn main() -> Result<()> {
             }
         }),
         LifecycleCommand::SelectOneShot(args) => with_transaction_mut(&args, |m, t, b| {
-            select_exact_one_shot_v5(m, t, b)?;
+            select_exact_one_shot_v6(m, t, b)?;
             print_json(t)
         }),
         LifecycleCommand::PostBootValidate(args) => with_transaction_mut(&args, |m, t, b| {
-            let evidence = collect_and_validate_post_boot_v5(m, t, b)?;
+            let evidence = collect_and_validate_post_boot_v6(m, t, b)?;
             print_json(&evidence)
         }),
         LifecycleCommand::SelectBaselineRollback(args) => with_transaction_mut(&args, |m, t, b| {
-            select_baseline_rollback_v5(m, t, b)?;
+            select_baseline_rollback_v6(m, t, b)?;
             print_json(t)
         }),
         LifecycleCommand::VerifyFinalRestore(args) => with_transaction_mut(&args, |m, t, b| {
-            verify_then_cleanup_v5(m, t, b)?;
+            verify_then_cleanup_v6(m, t, b)?;
             print_json(t)
         }),
         LifecycleCommand::Recover(args) => recover(args, false),
@@ -164,18 +164,18 @@ fn prepare(args: PrepareArgs) -> Result<()> {
         .context("prepared-root parent")?;
     require_private_owned_parent(parent, current_uid()?)?;
     let payload = collect_prepared_payload(&args)?;
-    let manifest = TieringBootValidationPreparedManifestV5::seal(payload);
+    let manifest = TieringBootValidationPreparedManifestV6::seal(payload);
     manifest.validate()?;
     fs::create_dir(&args.prepared_root).context("create fresh prepared root")?;
     fs::set_permissions(&args.prepared_root, fs::Permissions::from_mode(0o700))?;
-    let path = args.prepared_root.join("prepared-manifest-v5.json");
+    let path = args.prepared_root.join("prepared-manifest-v6.json");
     write_new_json(&path, &manifest, 0o600)?;
     print_json(
-        &serde_json::json!({"manifest":path,"sha256":canonical_json_sha256_v5(&manifest),"mutation":false}),
+        &serde_json::json!({"manifest":path,"sha256":canonical_json_sha256_v6(&manifest),"mutation":false}),
     )
 }
 
-fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloadV5> {
+fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloadV6> {
     if !(8..=64).contains(&args.validation_id.len()) {
         bail!("invalid validation id");
     }
@@ -224,7 +224,7 @@ fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloa
     let boot = collect_boot_identity()?;
     let marker = format!("nemor.phase6_validation={}", args.validation_id);
     let unit_name = format!("nemor-phase6-{}.service", args.validation_id);
-    let mut experimental_entry = BootEntryIdentityV5 {
+    let mut experimental_entry = BootEntryIdentityV6 {
         id: format!("nemor-phase6-{}.conf", args.validation_id),
         path: Path::new("/boot/loader/entries")
             .join(format!("nemor-phase6-{}.conf", args.validation_id)),
@@ -234,7 +234,7 @@ fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloa
         initrds: boot.current_entry.initrds.clone(),
         options: String::new(),
     };
-    let tx_root = Path::new(TRANSACTION_ROOT_V5).join(&args.validation_id);
+    let tx_root = Path::new(TRANSACTION_ROOT_V6).join(&args.validation_id);
     let mut experimental_zswap = baseline_zswap.parameters.clone();
     experimental_zswap.insert("enabled".into(), "Y".into());
     experimental_entry.options = build_experimental_options(
@@ -243,8 +243,8 @@ fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloa
         &unit_name,
         &experimental_zswap,
     );
-    let mut payload = PreparedManifestPayloadV5 {
-        contract_version: BOOT_VALIDATION_CONTRACT_VERSION_V5.into(),
+    let mut payload = PreparedManifestPayloadV6 {
+        contract_version: BOOT_VALIDATION_CONTRACT_VERSION_V6.into(),
         rule_version: TIERING_RULE_VERSION.into(),
         validation_id: args.validation_id.clone(),
         prepared_uid: uid,
@@ -253,7 +253,7 @@ fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloa
         source_state_sha256,
         binaries: BTreeMap::from([(
             "nemor-tiering-boot-validation".into(),
-            BinaryIdentityV5 {
+            BinaryIdentityV6 {
                 path: validator.clone(),
                 sha256: validator_hash.clone(),
                 embedded_commit: embedded_commit.clone(),
@@ -270,7 +270,7 @@ fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloa
         boot,
         experimental_entry,
         validation_marker: marker,
-        swapfile: SwapIdentityV5 {
+        swapfile: SwapIdentityV6 {
             path: tx_root.join("backing.swap"),
             kind: "file".into(),
             size_bytes: args.swap_size_bytes,
@@ -280,16 +280,16 @@ fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloa
         },
         owned_artifacts: Vec::new(),
         transaction_root: tx_root.clone(),
-        workload: WorkloadContractV5 {
-            protocol: WORKLOAD_PROTOCOL_V5.into(),
+        workload: WorkloadContractV6 {
+            protocol: WORKLOAD_PROTOCOL_V6.into(),
             seed: 0x4e454d4f52,
             bytes: 32 * 1024 * 1024,
             iterations: 2,
             timeout_seconds: args.timeout_seconds,
             maximum_write_bytes: args.maximum_write_bytes,
         },
-        staged_helper: StagedBinaryPlanV5 {
-            source: BinaryIdentityV5 {
+        staged_helper: StagedBinaryPlanV6 {
+            source: BinaryIdentityV6 {
                 path: validator.clone(),
                 sha256: validator_hash.clone(),
                 embedded_commit: embedded_commit.clone(),
@@ -310,25 +310,25 @@ fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloa
         production_activation: false,
     };
     payload.recovery_entry = payload.boot.current_entry.id.clone();
-    let entry_content = render_type1_entry_v5(&payload.experimental_entry).into_bytes();
+    let entry_content = render_type1_entry_v6(&payload.experimental_entry).into_bytes();
     payload.experimental_entry.sha256 = sha256(&entry_content);
     let unit_content =
-        render_validation_unit_v5(&payload, &payload.staged_helper.destination).into_bytes();
+        render_validation_unit_v6(&payload, &payload.staged_helper.destination).into_bytes();
     payload.owned_artifacts = vec![
         artifact(
-            OwnedArtifactKindV5::Type1Entry,
+            OwnedArtifactKindV6::Type1Entry,
             payload.experimental_entry.path.clone(),
             entry_content,
             0o600,
         ),
         artifact(
-            OwnedArtifactKindV5::ValidationUnit,
+            OwnedArtifactKindV6::ValidationUnit,
             Path::new("/etc/systemd/system").join(unit_name),
             unit_content,
             0o644,
         ),
-        OwnedArtifactV5 {
-            kind: OwnedArtifactKindV5::HelperBinary,
+        OwnedArtifactV6 {
+            kind: OwnedArtifactKindV6::HelperBinary,
             path: payload.staged_helper.destination.clone(),
             sha256: payload.staged_helper.source.sha256.clone(),
             mode: 0o755,
@@ -341,12 +341,12 @@ fn collect_prepared_payload(args: &PrepareArgs) -> Result<PreparedManifestPayloa
 }
 
 fn artifact(
-    kind: OwnedArtifactKindV5,
+    kind: OwnedArtifactKindV6,
     path: PathBuf,
     content: Vec<u8>,
     mode: u32,
-) -> OwnedArtifactV5 {
-    OwnedArtifactV5 {
+) -> OwnedArtifactV6 {
+    OwnedArtifactV6 {
         kind,
         path,
         sha256: sha256(&content),
@@ -393,7 +393,7 @@ fn build_experimental_options(
     options.join(" ")
 }
 
-fn collect_topology() -> Result<StorageTopologyIdentityV5> {
+fn collect_topology() -> Result<StorageTopologyIdentityV6> {
     let line = command_output("/usr/bin/findmnt", &["-nro", "SOURCE,FSTYPE", "/"])?;
     let mut f = line.split_whitespace();
     let source = f.next().context("root source")?;
@@ -413,7 +413,7 @@ fn collect_topology() -> Result<StorageTopologyIdentityV5> {
             .get(index + 1)
             .map(|n| PathBuf::from(format!("/dev/{n}")));
         let kind = if parent.is_some() { "part" } else { "disk" };
-        chain.push(BlockLayerIdentityV5 {
+        chain.push(BlockLayerIdentityV6 {
             path,
             kind: kind.into(),
             major: major(md.rdev()) as u32,
@@ -437,11 +437,11 @@ fn collect_topology() -> Result<StorageTopologyIdentityV5> {
         .context("root mount id")?;
     let uuid = command_output("/usr/bin/blkid", &["-s", "UUID", "-o", "value", source])
         .or_else(|_| command_output("/usr/bin/btrfs", &["filesystem", "show", "/"]))?;
-    Ok(StorageTopologyIdentityV5 {
+    Ok(StorageTopologyIdentityV6 {
         storage_profile_version: STORAGE_PROFILE_VERSION.into(),
         profile,
         chain,
-        physical: PhysicalDeviceIdentityV5 {
+        physical: PhysicalDeviceIdentityV6 {
             path: physical_path,
             major: major(md.rdev()) as u32,
             minor: minor(md.rdev()) as u32,
@@ -456,7 +456,7 @@ fn collect_topology() -> Result<StorageTopologyIdentityV5> {
                 .physical_block_size
                 .context("physical block size")?,
         },
-        filesystem: FilesystemIdentityV5 {
+        filesystem: FilesystemIdentityV6 {
             filesystem: filesystem.into(),
             uuid_or_fsid: uuid.trim().to_owned(),
             mount_source: PathBuf::from(source),
@@ -471,7 +471,7 @@ fn collect_topology() -> Result<StorageTopologyIdentityV5> {
     })
 }
 
-fn collect_swaps() -> Result<Vec<SwapIdentityV5>> {
+fn collect_swaps() -> Result<Vec<SwapIdentityV6>> {
     let text = fs::read_to_string("/proc/swaps")?;
     text.lines()
         .skip(1)
@@ -480,7 +480,7 @@ fn collect_swaps() -> Result<Vec<SwapIdentityV5>> {
             if f.len() < 5 {
                 bail!("malformed /proc/swaps")
             };
-            Ok(SwapIdentityV5 {
+            Ok(SwapIdentityV6 {
                 path: PathBuf::from(f[0]),
                 kind: f[1].into(),
                 size_bytes: f[2].parse::<u64>()?.saturating_mul(1024),
@@ -492,12 +492,12 @@ fn collect_swaps() -> Result<Vec<SwapIdentityV5>> {
         .collect()
 }
 
-fn collect_zram(swaps: &[SwapIdentityV5]) -> Result<ZramIdentityV5> {
+fn collect_zram(swaps: &[SwapIdentityV6]) -> Result<ZramIdentityV6> {
     let swap = swaps
         .iter()
         .find(|s| s.path == Path::new("/dev/zram0"))
         .context("protected zram0 swap")?;
-    Ok(ZramIdentityV5 {
+    Ok(ZramIdentityV6 {
         device: swap.path.clone(),
         provider: "systemd-zram-generator".into(),
         active: true,
@@ -509,7 +509,7 @@ fn collect_zram(swaps: &[SwapIdentityV5]) -> Result<ZramIdentityV5> {
     })
 }
 
-fn collect_zswap() -> Result<ZswapIdentityV5> {
+fn collect_zswap() -> Result<ZswapIdentityV6> {
     let mut parameters = BTreeMap::new();
     for name in [
         "enabled",
@@ -521,7 +521,7 @@ fn collect_zswap() -> Result<ZswapIdentityV5> {
     ] {
         parameters.insert(name.into(), read_zswap_parameter(name)?);
     }
-    Ok(ZswapIdentityV5 { parameters })
+    Ok(ZswapIdentityV6 { parameters })
 }
 
 fn read_zswap_parameter(name: &str) -> Result<String> {
@@ -535,7 +535,7 @@ fn read_zswap_parameter(name: &str) -> Result<String> {
     }
 }
 
-fn collect_boot_identity() -> Result<BootIdentityV5> {
+fn collect_boot_identity() -> Result<BootIdentityV6> {
     let status = command_output("/usr/bin/bootctl", &["status"])?;
     if !status.contains("Secure Boot: disabled") {
         bail!("Secure Boot is not disabled")
@@ -559,7 +559,7 @@ fn collect_boot_identity() -> Result<BootIdentityV5> {
         if !actual.is_file() {
             bail!("Type #1 referenced boot file missing: {}", actual.display())
         };
-        referenced.push(ReferencedBootFileV5 {
+        referenced.push(ReferencedBootFileV6 {
             path: path.clone(),
             sha256: sha256_file(&actual)?,
         });
@@ -586,7 +586,7 @@ fn collect_boot_identity() -> Result<BootIdentityV5> {
         .context("ESP major:minor")?
         .split_once(':')
         .context("ESP major:minor grammar")?;
-    Ok(BootIdentityV5 {
+    Ok(BootIdentityV6 {
         bootloader: "systemd-boot-type1".into(),
         bootloader_version: command_output("/usr/bin/bootctl", &["--version"])?,
         current_entry: current.clone(),
@@ -607,7 +607,7 @@ fn collect_boot_identity() -> Result<BootIdentityV5> {
     })
 }
 
-fn parse_type1_entry(id: &str) -> Result<BootEntryIdentityV5> {
+fn parse_type1_entry(id: &str) -> Result<BootEntryIdentityV6> {
     if !id.ends_with(".conf") || id.contains('/') || id.contains("..") {
         bail!("Type #2 UKI or ambiguous entry is unsupported")
     };
@@ -624,7 +624,7 @@ fn parse_type1_entry(id: &str) -> Result<BootEntryIdentityV5> {
         .map(PathBuf::from)
         .collect();
     let options = entry_value(&text, "options").context("entry options")?;
-    Ok(BootEntryIdentityV5 {
+    Ok(BootEntryIdentityV6 {
         id: id.into(),
         path,
         sha256: sha256(text.as_bytes()),
@@ -657,9 +657,9 @@ fn material_environment_hash() -> Result<String> {
 }
 
 fn collect_preflight(
-    m: &TieringBootValidationPreparedManifestV5,
+    m: &TieringBootValidationPreparedManifestV6,
     root: bool,
-) -> Result<PreflightObservationV5> {
+) -> Result<PreflightObservationV6> {
     m.validate()?;
     let topology_matches = collect_topology().is_ok_and(|v| v == m.payload.topology);
     let boot = collect_boot_identity();
@@ -705,8 +705,8 @@ fn collect_preflight(
     let default_entry_matches = boot
         .as_ref()
         .is_ok_and(|v| v.default_entry == m.payload.boot.default_entry);
-    let mut observation = PreflightObservationV5 {
-        schema: PREFLIGHT_SCHEMA_V5.into(),
+    let mut observation = PreflightObservationV6 {
+        schema: PREFLIGHT_SCHEMA_V6.into(),
         uid: current_uid()?,
         gid: current_gid()?,
         sudo_uid: root.then(|| env_u32("SUDO_UID")).transpose()?,
@@ -785,11 +785,11 @@ fn collect_preflight(
         mutation_count: 0,
         ready: false,
     };
-    observation.ready = derived_preflight_ready_v5(m, &observation);
+    observation.ready = derived_preflight_ready_v6(m, &observation);
     Ok(observation)
 }
 
-fn require_authenticated_root(m: &TieringBootValidationPreparedManifestV5) -> Result<()> {
+fn require_authenticated_root(m: &TieringBootValidationPreparedManifestV6) -> Result<()> {
     if current_uid()? != 0
         || env_u32("SUDO_UID")? != m.payload.prepared_uid
         || env_u32("SUDO_GID")? != m.payload.prepared_gid
@@ -800,10 +800,10 @@ fn require_authenticated_root(m: &TieringBootValidationPreparedManifestV5) -> Re
 }
 
 struct LinuxLifecycleBackend {
-    manifest: TieringBootValidationPreparedManifestV5,
+    manifest: TieringBootValidationPreparedManifestV6,
 }
 impl LinuxLifecycleBackend {
-    fn new(m: &TieringBootValidationPreparedManifestV5) -> Result<Self> {
+    fn new(m: &TieringBootValidationPreparedManifestV6) -> Result<Self> {
         m.validate()?;
         Ok(Self {
             manifest: m.clone(),
@@ -813,25 +813,25 @@ impl LinuxLifecycleBackend {
         self.manifest
             .payload
             .transaction_root
-            .join("transaction-v5.json")
+            .join("transaction-v6.json")
     }
 }
 
-impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
+impl BootLifecycleBackendV6 for LinuxLifecycleBackend {
     fn persist_transaction(
         &mut self,
-        tx: &DurableTransactionV5,
+        tx: &DurableTransactionV6,
     ) -> std::result::Result<(), String> {
         atomic_replace_json(&self.tx_path(), tx).map_err(|e| e.to_string())
     }
     fn create_transaction_root(
         &mut self,
-        m: &TieringBootValidationPreparedManifestV5,
+        m: &TieringBootValidationPreparedManifestV6,
     ) -> std::result::Result<(), String> {
         let components = [
             PathBuf::from("/var/lib/nemor"),
             PathBuf::from("/var/lib/nemor/validation"),
-            PathBuf::from(TRANSACTION_ROOT_V5),
+            PathBuf::from(TRANSACTION_ROOT_V6),
             m.payload.transaction_root.clone(),
         ];
         let mut created = Vec::new();
@@ -871,10 +871,10 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
     }
     fn copy_prepared_manifest(
         &mut self,
-        m: &TieringBootValidationPreparedManifestV5,
+        m: &TieringBootValidationPreparedManifestV6,
     ) -> std::result::Result<(), String> {
         write_new_json(
-            &m.payload.transaction_root.join("prepared-manifest-v5.json"),
+            &m.payload.transaction_root.join("prepared-manifest-v6.json"),
             m,
             0o600,
         )
@@ -893,8 +893,8 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
     }
     fn create_swapfile(
         &mut self,
-        m: &TieringBootValidationPreparedManifestV5,
-    ) -> std::result::Result<SwapIdentityV5, String> {
+        m: &TieringBootValidationPreparedManifestV6,
+    ) -> std::result::Result<SwapIdentityV6, String> {
         let mut b = LinuxSwapfileBackend::default();
         SwapfileBackend::create_owned(
             &mut b,
@@ -920,15 +920,15 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
         if kind != "swap" || uuid.is_empty() {
             return Err("mkswap identity readback mismatch".into());
         }
-        Ok(SwapIdentityV5 {
+        Ok(SwapIdentityV6 {
             uuid: Some(uuid),
             ..m.payload.swapfile.clone()
         })
     }
-    fn create_artifact(&mut self, a: &OwnedArtifactV5) -> std::result::Result<(), String> {
+    fn create_artifact(&mut self, a: &OwnedArtifactV6) -> std::result::Result<(), String> {
         write_new_bytes(&a.path, &a.content, a.mode).map_err(|e| e.to_string())
     }
-    fn stage_helper(&mut self, plan: &StagedBinaryPlanV5) -> std::result::Result<(), String> {
+    fn stage_helper(&mut self, plan: &StagedBinaryPlanV6) -> std::result::Result<(), String> {
         if !staged_source_matches(plan) {
             return Err("staged-helper source changed before copy".into());
         }
@@ -960,7 +960,7 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
         }
         Ok(())
     }
-    fn staged_helper_matches(&self, plan: &StagedBinaryPlanV5) -> bool {
+    fn staged_helper_matches(&self, plan: &StagedBinaryPlanV6) -> bool {
         let metadata = match fs::symlink_metadata(&plan.destination) {
             Ok(metadata) => metadata,
             Err(_) => return false,
@@ -980,15 +980,15 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
             .as_deref()
                 == Some(&plan.source.embedded_commit)
     }
-    fn artifact_matches(&self, a: &OwnedArtifactV5) -> bool {
+    fn artifact_matches(&self, a: &OwnedArtifactV6) -> bool {
         exact_file_matches(a)
     }
-    fn artifact_absent(&self, a: &OwnedArtifactV5) -> bool {
+    fn artifact_absent(&self, a: &OwnedArtifactV6) -> bool {
         matches!(fs::symlink_metadata(&a.path), Err(error) if error.kind()==std::io::ErrorKind::NotFound)
     }
     fn sync_parents(
         &mut self,
-        m: &TieringBootValidationPreparedManifestV5,
+        m: &TieringBootValidationPreparedManifestV6,
     ) -> std::result::Result<(), String> {
         for p in m
             .payload
@@ -1002,7 +1002,7 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
         }
         Ok(())
     }
-    fn remove_artifact(&mut self, a: &OwnedArtifactV5) -> std::result::Result<(), String> {
+    fn remove_artifact(&mut self, a: &OwnedArtifactV6) -> std::result::Result<(), String> {
         if matches!(fs::symlink_metadata(&a.path), Err(error) if error.kind()==std::io::ErrorKind::NotFound)
         {
             return Ok(());
@@ -1015,13 +1015,13 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
     }
     fn remove_swapfile(
         &mut self,
-        m: &TieringBootValidationPreparedManifestV5,
+        m: &TieringBootValidationPreparedManifestV6,
     ) -> std::result::Result<(), String> {
         let p = &m.payload.swapfile.path;
         if !p.exists() {
             return Ok(());
         }
-        let tx: DurableTransactionV5 = read_json(&self.tx_path()).map_err(|e| e.to_string())?;
+        let tx: DurableTransactionV6 = read_json(&self.tx_path()).map_err(|e| e.to_string())?;
         let expected = tx
             .payload
             .applied_swap_identity
@@ -1046,12 +1046,12 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
         b.resume_owned(p).map_err(|e| e.to_string())?;
         SwapfileBackend::remove_owned(&mut b, p).map_err(|e| e.to_string())
     }
-    fn swapfile_absent(&self, m: &TieringBootValidationPreparedManifestV5) -> bool {
+    fn swapfile_absent(&self, m: &TieringBootValidationPreparedManifestV6) -> bool {
         matches!(fs::symlink_metadata(&m.payload.swapfile.path), Err(error) if error.kind()==std::io::ErrorKind::NotFound)
     }
     fn finalize_runtime_cleanup(
         &mut self,
-        m: &TieringBootValidationPreparedManifestV5,
+        m: &TieringBootValidationPreparedManifestV6,
     ) -> std::result::Result<(), String> {
         run_exact("/usr/bin/systemctl", &["daemon-reload"])?;
         let unit = format!("nemor-phase6-{}.service", m.payload.validation_id);
@@ -1109,26 +1109,26 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
             .map(|s| s.split(',').map(str::trim).map(str::to_owned).collect())
             .unwrap_or_default())
     }
-    fn current_boot_is_experimental(&self, m: &TieringBootValidationPreparedManifestV5) -> bool {
+    fn current_boot_is_experimental(&self, m: &TieringBootValidationPreparedManifestV6) -> bool {
         read_trimmed(Path::new("/proc/cmdline"))
             .is_ok_and(|v| v.contains(&m.payload.validation_marker))
     }
     fn collect_zram_baseline(
         &mut self,
-        m: &TieringBootValidationPreparedManifestV5,
-    ) -> std::result::Result<BaselineMeasurementObservationV5, String> {
+        m: &TieringBootValidationPreparedManifestV6,
+    ) -> std::result::Result<BaselineMeasurementObservationV6, String> {
         let worker = run_bounded_workload_scope(m).map_err(|e| e.to_string())?;
         let swaps = collect_swaps().map_err(|e| e.to_string())?;
-        Ok(BaselineMeasurementObservationV5 {
-            schema: ZRAM_BASELINE_EVIDENCE_V5.into(),
+        Ok(BaselineMeasurementObservationV6 {
+            schema: ZRAM_BASELINE_EVIDENCE_V6.into(),
             validation_id: m.payload.validation_id.clone(),
             boot_id: read_trimmed(Path::new("/proc/sys/kernel/random/boot_id"))
                 .map_err(|e| e.to_string())?,
             zram: collect_zram(&swaps).map_err(|e| e.to_string())?,
             zswap: collect_zswap().map_err(|e| e.to_string())?,
             swaps,
-            workload_protocol: WORKLOAD_PROTOCOL_V5.into(),
-            workload_sha256: canonical_json_sha256_v5(&m.payload.workload),
+            workload_protocol: WORKLOAD_PROTOCOL_V6.into(),
+            workload_sha256: canonical_json_sha256_v6(&m.payload.workload),
             bytes_touched: worker.bytes_touched,
             latency_ns: Some(worker.service_latency_ns),
             cgroup_oom_delta: counter_delta_named(
@@ -1149,32 +1149,32 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
     }
     fn collect_post_boot(
         &mut self,
-        m: &TieringBootValidationPreparedManifestV5,
-    ) -> std::result::Result<ActualPostBootObservationV5, String> {
+        m: &TieringBootValidationPreparedManifestV6,
+    ) -> std::result::Result<ActualPostBootObservationV6, String> {
         collect_post_boot(m).map_err(|e| e.to_string())
     }
     fn collect_baseline(
         &self,
-        m: &TieringBootValidationPreparedManifestV5,
-    ) -> std::result::Result<BaselineRestoreObservationV5, String> {
+        m: &TieringBootValidationPreparedManifestV6,
+    ) -> std::result::Result<BaselineRestoreObservationV6, String> {
         collect_baseline(m).map_err(|e| e.to_string())
     }
-    fn seal_archive(&mut self, tx: &DurableTransactionV5) -> std::result::Result<(), String> {
+    fn seal_archive(&mut self, tx: &DurableTransactionV6) -> std::result::Result<(), String> {
         let root = &self.manifest.payload.transaction_root;
         if !matches!(
             tx.payload.stage,
-            TransactionStageV5::Restored | TransactionStageV5::Recovered
+            TransactionStageV6::Restored | TransactionStageV6::Recovered
         ) {
             return Err("archive may be sealed only for an immutable terminal class".into());
         }
         let status = root.join("STATUS");
         let status_bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema":"tiering-boot-validation-status-v5",
+            "schema":"tiering-boot-validation-status-v6",
             "validation_id":tx.payload.validation_id,
             "stage":tx.payload.stage,
             "production_activation":false,
             "complete":true,
-            "terminal_class":if tx.payload.stage==TransactionStageV5::Restored {
+            "terminal_class":if tx.payload.stage==TransactionStageV6::Restored {
                 "baseline-restored"
             } else {
                 "recovered-before-reboot"
@@ -1195,20 +1195,20 @@ impl BootLifecycleBackendV5 for LinuxLifecycleBackend {
             return verify_sha256sums(root).map_err(|e| e.to_string());
         }
         let mut required = std::collections::BTreeSet::from([
-            "prepared-manifest-v5.json".to_owned(),
-            "transaction-v5.json".to_owned(),
-            "root-preflight-v5.json".to_owned(),
+            "prepared-manifest-v6.json".to_owned(),
+            "transaction-v6.json".to_owned(),
+            "root-preflight-v6.json".to_owned(),
             "STATUS".to_owned(),
         ]);
         required.extend(tx.payload.evidence_hashes.keys().cloned());
-        if tx.payload.stage == TransactionStageV5::Restored {
+        if tx.payload.stage == TransactionStageV6::Restored {
             required.extend([
-                "one-shot-evidence-v5.json".to_owned(),
-                "post-boot-evidence-v5.json".to_owned(),
-                "baseline-restore-evidence-v5.json".to_owned(),
+                "one-shot-evidence-v6.json".to_owned(),
+                "post-boot-evidence-v6.json".to_owned(),
+                "baseline-restore-evidence-v6.json".to_owned(),
             ]);
         } else {
-            required.insert("recovery-evidence-v5.json".to_owned());
+            required.insert("recovery-evidence-v6.json".to_owned());
         }
         let mut files = Vec::new();
         for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
@@ -1294,8 +1294,8 @@ fn verify_sha256sums(root: &Path) -> Result<()> {
 fn with_transaction<F>(a: &TransactionArgs, f: F) -> Result<()>
 where
     F: FnOnce(
-        &TieringBootValidationPreparedManifestV5,
-        &DurableTransactionV5,
+        &TieringBootValidationPreparedManifestV6,
+        &DurableTransactionV6,
         &LinuxLifecycleBackend,
     ) -> Result<()>,
 {
@@ -1307,8 +1307,8 @@ where
 fn with_transaction_mut<F>(a: &TransactionArgs, f: F) -> Result<()>
 where
     F: FnOnce(
-        &TieringBootValidationPreparedManifestV5,
-        &mut DurableTransactionV5,
+        &TieringBootValidationPreparedManifestV6,
+        &mut DurableTransactionV6,
         &mut LinuxLifecycleBackend,
     ) -> Result<()>,
 {
@@ -1320,21 +1320,21 @@ where
 fn load_transaction(
     id: &str,
 ) -> Result<(
-    TieringBootValidationPreparedManifestV5,
-    DurableTransactionV5,
+    TieringBootValidationPreparedManifestV6,
+    DurableTransactionV6,
 )> {
     require_validation_id(id)?;
-    let root = Path::new(TRANSACTION_ROOT_V5).join(id);
-    let m: TieringBootValidationPreparedManifestV5 =
-        read_json(&root.join("prepared-manifest-v5.json"))?;
-    let transaction_path = root.join("transaction-v5.json");
+    let root = Path::new(TRANSACTION_ROOT_V6).join(id);
+    let m: TieringBootValidationPreparedManifestV6 =
+        read_json(&root.join("prepared-manifest-v6.json"))?;
+    let transaction_path = root.join("transaction-v6.json");
     reconcile_transaction_new(&transaction_path)?;
-    let t: DurableTransactionV5 = read_json(&transaction_path)?;
+    let t: DurableTransactionV6 = read_json(&transaction_path)?;
     m.validate()?;
     t.validate()?;
     if m.payload.validation_id != id
         || t.payload.validation_id != id
-        || t.payload.manifest_sha256 != canonical_json_sha256_v5(&m)
+        || t.payload.manifest_sha256 != canonical_json_sha256_v6(&m)
     {
         bail!("transaction identity mismatch")
     };
@@ -1346,18 +1346,18 @@ fn reconcile_transaction_new(path: &Path) -> Result<()> {
     if !candidate_path.exists() {
         return Ok(());
     }
-    let candidate: DurableTransactionV5 = read_json(&candidate_path)?;
+    let candidate: DurableTransactionV6 = read_json(&candidate_path)?;
     candidate.validate()?;
     if !path.exists() {
         let manifest_path = path
             .parent()
             .context("transaction parent")?
-            .join("prepared-manifest-v5.json");
-        let manifest: TieringBootValidationPreparedManifestV5 = read_json(&manifest_path)?;
+            .join("prepared-manifest-v6.json");
+        let manifest: TieringBootValidationPreparedManifestV6 = read_json(&manifest_path)?;
         manifest.validate()?;
         if candidate.payload.validation_id != manifest.payload.validation_id
-            || candidate.payload.manifest_sha256 != canonical_json_sha256_v5(&manifest)
-            || candidate.payload.stage != TransactionStageV5::Prepared
+            || candidate.payload.manifest_sha256 != canonical_json_sha256_v6(&manifest)
+            || candidate.payload.stage != TransactionStageV6::Prepared
             || !candidate.payload.mutation_records.is_empty()
         {
             bail!("orphan transaction .new is not the initial exact candidate")
@@ -1365,7 +1365,7 @@ fn reconcile_transaction_new(path: &Path) -> Result<()> {
         fs::rename(&candidate_path, path)?;
         return sync_parent(path);
     }
-    let old: DurableTransactionV5 = read_json(path)?;
+    let old: DurableTransactionV6 = read_json(path)?;
     old.validate()?;
     let identity_matches = old.payload.validation_id == candidate.payload.validation_id
         && old.payload.manifest_sha256 == candidate.payload.manifest_sha256
@@ -1375,14 +1375,14 @@ fn reconcile_transaction_new(path: &Path) -> Result<()> {
         .mutation_records
         .starts_with(&old.payload.mutation_records);
     let monotonic = candidate.payload.stage == old.payload.stage
-        || legal_transition_v5(old.payload.stage, candidate.payload.stage);
+        || legal_transition_v6(old.payload.stage, candidate.payload.stage);
     if !identity_matches || !records_extend || !monotonic {
         bail!("stale transaction .new is not a valid monotonic successor")
     }
     fs::rename(&candidate_path, path)?;
     sync_parent(path)
 }
-fn require_stage(t: &DurableTransactionV5, s: TransactionStageV5) -> Result<()> {
+fn require_stage(t: &DurableTransactionV6, s: TransactionStageV6) -> Result<()> {
     if t.payload.stage != s {
         bail!("illegal stage")
     };
@@ -1394,7 +1394,7 @@ fn experimental_activate(a: TransactionArgs) -> Result<()> {
     if current_uid()? != 0 {
         bail!("root required")
     };
-    require_stage(&t, TransactionStageV5::OneShotSelected)?;
+    require_stage(&t, TransactionStageV6::OneShotSelected)?;
     let mut backend = LinuxLifecycleBackend::new(&m)?;
     let boot_id = read_trimmed(Path::new("/proc/sys/kernel/random/boot_id"))?;
     if boot_id == t.payload.baseline_boot_id {
@@ -1465,16 +1465,16 @@ fn experimental_activate(a: TransactionArgs) -> Result<()> {
         bail!("validation swap identity or inactive baseline mismatch")
     }
     t.payload.current_boot_id = boot_id;
-    t.transition(TransactionStageV5::ExperimentalBootDetected)?;
+    t.transition(TransactionStageV6::ExperimentalBootDetected)?;
     backend
         .persist_transaction(&t)
         .map_err(anyhow::Error::msg)?;
-    t.transition(TransactionStageV5::ActivationPreparing)?;
+    t.transition(TransactionStageV6::ActivationPreparing)?;
     backend
         .persist_transaction(&t)
         .map_err(anyhow::Error::msg)?;
     let enabled_path = Path::new("/sys/module/zswap/parameters/enabled");
-    t.transition(TransactionStageV5::ZswapDisabling)?;
+    t.transition(TransactionStageV6::ZswapDisabling)?;
     t.record_intent("disable_zswap", enabled_path.to_path_buf());
     backend
         .persist_transaction(&t)
@@ -1486,7 +1486,7 @@ fn experimental_activate(a: TransactionArgs) -> Result<()> {
     backend
         .persist_transaction(&t)
         .map_err(anyhow::Error::msg)?;
-    t.transition(TransactionStageV5::ZswapParametersApplying)?;
+    t.transition(TransactionStageV6::ZswapParametersApplying)?;
     backend
         .persist_transaction(&t)
         .map_err(anyhow::Error::msg)?;
@@ -1517,7 +1517,7 @@ fn experimental_activate(a: TransactionArgs) -> Result<()> {
             .persist_transaction(&t)
             .map_err(anyhow::Error::msg)?;
     }
-    t.transition(TransactionStageV5::ZswapEnabling)?;
+    t.transition(TransactionStageV6::ZswapEnabling)?;
     t.record_intent("enable_zswap", enabled_path.to_path_buf());
     backend
         .persist_transaction(&t)
@@ -1537,7 +1537,7 @@ fn experimental_activate(a: TransactionArgs) -> Result<()> {
     backend
         .persist_transaction(&t)
         .map_err(anyhow::Error::msg)?;
-    t.transition(TransactionStageV5::SwapActivating)?;
+    t.transition(TransactionStageV6::SwapActivating)?;
     t.record_intent("activate_validation_swap", m.payload.swapfile.path.clone());
     backend
         .persist_transaction(&t)
@@ -1564,9 +1564,9 @@ fn experimental_activate(a: TransactionArgs) -> Result<()> {
             "validation swap readback mismatch".into(),
         );
     };
-    t.complete_last(canonical_json_sha256_v5(&applied))?;
+    t.complete_last(canonical_json_sha256_v6(&applied))?;
     let activation_evidence = serde_json::to_vec_pretty(&serde_json::json!({
-        "schema":ACTIVATION_EVIDENCE_SCHEMA_V5,
+        "schema":ACTIVATION_EVIDENCE_SCHEMA_V6,
         "validation_id":m.payload.validation_id,
         "boot_id":t.payload.current_boot_id,
         "entry":m.payload.experimental_entry.id,
@@ -1581,20 +1581,20 @@ fn experimental_activate(a: TransactionArgs) -> Result<()> {
         "production_activation":false
     }))?;
     backend
-        .persist_evidence("activation-evidence-v5.json", &activation_evidence)
+        .persist_evidence("activation-evidence-v6.json", &activation_evidence)
         .map_err(anyhow::Error::msg)?;
     t.payload.evidence_hashes.insert(
-        "activation-evidence-v5.json".into(),
+        "activation-evidence-v6.json".into(),
         sha256(&activation_evidence),
     );
-    t.payload_sha256 = canonical_json_sha256_v5(&t.payload);
-    t.transition(TransactionStageV5::ActivationVerified)?;
+    t.payload_sha256 = canonical_json_sha256_v6(&t.payload);
+    t.transition(TransactionStageV6::ActivationVerified)?;
     backend.persist_transaction(&t).map_err(anyhow::Error::msg)
 }
 
 fn activation_failure(
-    m: &TieringBootValidationPreparedManifestV5,
-    tx: &mut DurableTransactionV5,
+    m: &TieringBootValidationPreparedManifestV6,
+    tx: &mut DurableTransactionV6,
     backend: &mut LinuxLifecycleBackend,
     primary: String,
 ) -> Result<()> {
@@ -1686,12 +1686,12 @@ fn activation_failure(
     if let Err(error) = backend.set_one_shot(&m.payload.recovery_entry) {
         secondary.push(error);
     } else if backend.read_one_shot().ok().flatten().as_deref() == Some(&m.payload.recovery_entry) {
-        tx.complete_last(canonical_json_sha256_v5(&m.payload.recovery_entry))?;
+        tx.complete_last(canonical_json_sha256_v6(&m.payload.recovery_entry))?;
     } else {
         secondary.push("baseline one-shot readback mismatch".into());
     }
     tx.payload.secondary_errors.extend(secondary);
-    tx.transition(TransactionStageV5::ActivationFailed)?;
+    tx.transition(TransactionStageV6::ActivationFailed)?;
     backend
         .persist_transaction(tx)
         .map_err(anyhow::Error::msg)?;
@@ -1699,8 +1699,8 @@ fn activation_failure(
 }
 
 fn collect_post_boot(
-    m: &TieringBootValidationPreparedManifestV5,
-) -> Result<ActualPostBootObservationV5> {
+    m: &TieringBootValidationPreparedManifestV6,
+) -> Result<ActualPostBootObservationV6> {
     let boot_id = read_trimmed(Path::new("/proc/sys/kernel/random/boot_id"))?;
     let status = command_output("/usr/bin/bootctl", &["status"])?;
     let booted_entry = parse_field(&status, "Current Boot Loader Entry:")
@@ -1734,8 +1734,8 @@ fn collect_post_boot(
     } else {
         "physical-device-host-wide-noisy"
     };
-    Ok(ActualPostBootObservationV5 {
-        schema: POST_BOOT_EVIDENCE_SCHEMA_V5.into(),
+    Ok(ActualPostBootObservationV6 {
+        schema: POST_BOOT_EVIDENCE_SCHEMA_V6.into(),
         boot_id,
         booted_entry,
         command_line: read_trimmed(Path::new("/proc/cmdline"))?,
@@ -1852,7 +1852,7 @@ struct WorkerReportV1 {
 }
 
 fn run_bounded_workload_scope(
-    m: &TieringBootValidationPreparedManifestV5,
+    m: &TieringBootValidationPreparedManifestV6,
 ) -> Result<WorkerReportV1> {
     let binary = &m.payload.staged_helper.destination;
     let unit = format!("nemor-phase6-workload-{}.scope", m.payload.validation_id);
@@ -1916,7 +1916,7 @@ fn run_bounded_workload_scope(
                 let mut report = String::new();
                 stdout.read_line(&mut report)?;
                 let report: WorkerReportV1 = serde_json::from_str(report.trim())?;
-                if report.protocol != WORKLOAD_PROTOCOL_V5
+                if report.protocol != WORKLOAD_PROTOCOL_V6
                     || report.validation_id != m.payload.validation_id
                     || !report.ready
                     || !report.started
@@ -1944,7 +1944,7 @@ fn bounded_workload(a: TransactionArgs) -> Result<()> {
     if current_uid()? != 0
         || !matches!(
             t.payload.stage,
-            TransactionStageV5::BaselineMeasuring | TransactionStageV5::PostBootMeasuring
+            TransactionStageV6::BaselineMeasuring | TransactionStageV6::PostBootMeasuring
         )
     {
         bail!("bounded workload is authorized only by the measuring transaction")
@@ -1956,7 +1956,7 @@ fn bounded_workload(a: TransactionArgs) -> Result<()> {
         bail!("bounded worker is not the exact staged helper")
     }
     let command_line = read_trimmed(Path::new("/proc/cmdline"))?;
-    if t.payload.stage == TransactionStageV5::PostBootMeasuring
+    if t.payload.stage == TransactionStageV6::PostBootMeasuring
         && !command_line
             .split_whitespace()
             .any(|item| item == m.payload.validation_marker)
@@ -1977,7 +1977,7 @@ fn bounded_workload(a: TransactionArgs) -> Result<()> {
         "{}",
         serde_json::json!({
             "event":"ready",
-            "protocol":WORKLOAD_PROTOCOL_V5,
+            "protocol":WORKLOAD_PROTOCOL_V6,
             "validation_id":m.payload.validation_id,
             "pid":pid,
             "start_ticks":start_ticks,
@@ -2022,7 +2022,7 @@ fn bounded_workload(a: TransactionArgs) -> Result<()> {
     std::hint::black_box(&primary);
     let after = read_memory_events(&cgroup_root.join("memory.events"));
     let report = WorkerReportV1 {
-        protocol: WORKLOAD_PROTOCOL_V5.into(),
+        protocol: WORKLOAD_PROTOCOL_V6.into(),
         validation_id: m.payload.validation_id,
         pid,
         start_ticks,
@@ -2138,8 +2138,8 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
 }
 
 fn collect_runtime_observe_only(
-    m: &TieringBootValidationPreparedManifestV5,
-) -> Result<RuntimeObserveOnlyEvidenceV5> {
+    m: &TieringBootValidationPreparedManifestV6,
+) -> Result<RuntimeObserveOnlyEvidenceV6> {
     let (configured_observe_only, production_activation) =
         production_state(&m.payload.config_path)?;
     let nemord_active = command_output("/usr/bin/systemctl", &["is-active", "nemord.service"])
@@ -2151,7 +2151,7 @@ fn collect_runtime_observe_only(
         )?
         .parse()?;
         let path = fs::read_link(format!("/proc/{pid}/exe"))?;
-        Some(RuntimeBinaryIdentityV5 {
+        Some(RuntimeBinaryIdentityV6 {
             sha256: sha256_file(&path)?,
             path,
             pid,
@@ -2204,7 +2204,7 @@ fn collect_runtime_observe_only(
         .filter(|name| name.contains("nemor"))
         .filter(|name| name != "nemord.service" && name != &validation_unit)
         .collect();
-    Ok(RuntimeObserveOnlyEvidenceV5 {
+    Ok(RuntimeObserveOnlyEvidenceV6 {
         config_sha256: sha256_file(&m.payload.config_path)?,
         configured_observe_only,
         nemord_active,
@@ -2218,8 +2218,8 @@ fn collect_runtime_observe_only(
 }
 
 fn collect_baseline(
-    m: &TieringBootValidationPreparedManifestV5,
-) -> Result<BaselineRestoreObservationV5> {
+    m: &TieringBootValidationPreparedManifestV6,
+) -> Result<BaselineRestoreObservationV6> {
     let status = command_output("/usr/bin/bootctl", &["status"])?;
     let booted = parse_field(&status, "Current Boot Loader Entry:")
         .or_else(|| parse_field(&status, "Current Entry:"))
@@ -2230,8 +2230,8 @@ fn collect_baseline(
     let one = parse_field(&status, "One Shot Boot Loader Entry:")
         .or_else(|| parse_field(&status, "One-shot Boot Loader Entry:"));
     let swaps = collect_swaps()?;
-    Ok(BaselineRestoreObservationV5 {
-        schema: FINAL_RESTORE_SCHEMA_V5.into(),
+    Ok(BaselineRestoreObservationV6 {
+        schema: FINAL_RESTORE_SCHEMA_V6.into(),
         boot_id: read_trimmed(Path::new("/proc/sys/kernel/random/boot_id"))?,
         booted_entry: booted,
         command_line: read_trimmed(Path::new("/proc/cmdline"))?,
@@ -2253,14 +2253,14 @@ fn recover(a: TransactionArgs, idempotence: bool) -> Result<()> {
     let mut b = LinuxLifecycleBackend::new(&m)?;
     let experimental = b.current_boot_is_experimental(&m);
     let recovery_stage = t.payload.failed_from_stage.unwrap_or(t.payload.stage);
-    match recovery_action_v5(recovery_stage, experimental) {
+    match recovery_action_v6(recovery_stage, experimental) {
         "no_op" => {
             if !idempotence {
                 print_json(&t)
             } else {
                 verify_sha256sums(&m.payload.transaction_root)?;
                 print_json(&serde_json::json!({
-                    "schema":"tiering-idempotence-verification-v5",
+                    "schema":"tiering-idempotence-verification-v6",
                     "validation_id":m.payload.validation_id,
                     "stage":t.payload.stage,
                     "mutation_count":0,
@@ -2269,18 +2269,18 @@ fn recover(a: TransactionArgs, idempotence: bool) -> Result<()> {
             }
         }
         "select_exact_baseline_oneshot_preserve_artifacts" => {
-            select_baseline_rollback_v5(&m, &mut t, &mut b)?;
+            select_baseline_rollback_v6(&m, &mut t, &mut b)?;
             print_json(&t)
         }
         "verify_baseline_preserve_artifacts" | "resume_exact_cleanup" => {
-            verify_then_cleanup_v5(&m, &mut t, &mut b)?;
+            verify_then_cleanup_v6(&m, &mut t, &mut b)?;
             print_json(&t)
         }
         "remove_exact_owned_before_reboot" | "clear_exact_owned_oneshot_then_remove" => {
             if idempotence {
                 bail!("idempotence verification cannot mutate")
             };
-            if recovery_action_v5(recovery_stage, experimental)
+            if recovery_action_v6(recovery_stage, experimental)
                 == "clear_exact_owned_oneshot_then_remove"
             {
                 if b.read_one_shot().map_err(anyhow::Error::msg)?.as_deref()
@@ -2317,12 +2317,12 @@ fn recover(a: TransactionArgs, idempotence: bool) -> Result<()> {
             b.remove_swapfile(&m).map_err(anyhow::Error::msg)?;
             t.complete_last(sha256(b"absent"))?;
             b.finalize_runtime_cleanup(&m).map_err(anyhow::Error::msg)?;
-            t.transition(TransactionStageV5::Recovered)?;
+            t.transition(TransactionStageV6::Recovered)?;
             t.payload.recovery_state = "recovered_before_reboot".into();
-            t.payload_sha256 = canonical_json_sha256_v5(&t.payload);
+            t.payload_sha256 = canonical_json_sha256_v6(&t.payload);
             b.persist_transaction(&t).map_err(anyhow::Error::msg)?;
             let recovery = serde_json::to_vec_pretty(&serde_json::json!({
-                "schema": RECOVERY_EVIDENCE_SCHEMA_V5,
+                "schema": RECOVERY_EVIDENCE_SCHEMA_V6,
                 "validation_id": t.payload.validation_id,
                 "terminal_stage": t.payload.stage,
                 "original_primary_error": t.payload.original_primary_error,
@@ -2332,12 +2332,12 @@ fn recover(a: TransactionArgs, idempotence: bool) -> Result<()> {
                 "idempotent": true,
                 "production_activation": false
             }))?;
-            b.persist_evidence("recovery-evidence-v5.json", &recovery)
+            b.persist_evidence("recovery-evidence-v6.json", &recovery)
                 .map_err(anyhow::Error::msg)?;
             t.payload
                 .evidence_hashes
-                .insert("recovery-evidence-v5.json".into(), sha256(&recovery));
-            t.payload_sha256 = canonical_json_sha256_v5(&t.payload);
+                .insert("recovery-evidence-v6.json".into(), sha256(&recovery));
+            t.payload_sha256 = canonical_json_sha256_v6(&t.payload);
             b.persist_transaction(&t).map_err(anyhow::Error::msg)?;
             b.seal_archive(&t).map_err(anyhow::Error::msg)?;
             print_json(&t)
@@ -2346,8 +2346,8 @@ fn recover(a: TransactionArgs, idempotence: bool) -> Result<()> {
     }
 }
 
-fn read_manifest(path: &Path) -> Result<TieringBootValidationPreparedManifestV5> {
-    let m: TieringBootValidationPreparedManifestV5 = read_json(path)?;
+fn read_manifest(path: &Path) -> Result<TieringBootValidationPreparedManifestV6> {
+    let m: TieringBootValidationPreparedManifestV6 = read_json(path)?;
     m.validate()?;
     let md = fs::symlink_metadata(path)?;
     if !md.file_type().is_file()
@@ -2394,7 +2394,7 @@ fn sync_parent(p: &Path) -> Result<()> {
     fs::File::open(p.parent().context("parent")?)?.sync_all()?;
     Ok(())
 }
-fn exact_file_matches(a: &OwnedArtifactV5) -> bool {
+fn exact_file_matches(a: &OwnedArtifactV6) -> bool {
     fs::symlink_metadata(&a.path).ok().is_some_and(|m| {
         m.file_type().is_file()
             && !m.file_type().is_symlink()
@@ -2520,7 +2520,7 @@ fn path_absent_and_parent_safe(p: &Path) -> bool {
     true
 }
 fn transaction_hierarchy_safe(root: &Path) -> bool {
-    if !root.starts_with(TRANSACTION_ROOT_V5) || root.exists() {
+    if !root.starts_with(TRANSACTION_ROOT_V6) || root.exists() {
         return false;
     }
     let mut cursor = root.parent();
@@ -2547,7 +2547,7 @@ fn transaction_hierarchy_safe(root: &Path) -> bool {
     }
     false
 }
-fn staged_source_matches(plan: &StagedBinaryPlanV5) -> bool {
+fn staged_source_matches(plan: &StagedBinaryPlanV6) -> bool {
     let Ok(metadata) = fs::symlink_metadata(&plan.source.path) else {
         return false;
     };
@@ -2745,7 +2745,7 @@ mod tests {
             "validator",
             "measure-baseline",
             "--manifest",
-            "/tmp/prepared-manifest-v5.json",
+            "/tmp/prepared-manifest-v6.json",
         ])
         .unwrap();
         assert!(matches!(
@@ -2794,7 +2794,7 @@ mod tests {
     #[test]
     fn worker_report_freezes_attributable_protocol_fields() {
         let report = WorkerReportV1 {
-            protocol: WORKLOAD_PROTOCOL_V5.into(),
+            protocol: WORKLOAD_PROTOCOL_V6.into(),
             validation_id: "phase6-test-1".into(),
             pid: 42,
             start_ticks: 99,
@@ -2826,10 +2826,10 @@ mod tests {
 
     #[test]
     fn atomic_new_suffix_is_exact_and_not_caller_selected() {
-        let path = Path::new("/var/lib/nemor/validation/phase6/id/transaction-v5.json");
+        let path = Path::new("/var/lib/nemor/validation/phase6/id/transaction-v6.json");
         assert_eq!(
             path.with_extension("new"),
-            PathBuf::from("/var/lib/nemor/validation/phase6/id/transaction-v5.new")
+            PathBuf::from("/var/lib/nemor/validation/phase6/id/transaction-v6.new")
         );
     }
 }
